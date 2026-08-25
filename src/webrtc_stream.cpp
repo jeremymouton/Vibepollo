@@ -1508,7 +1508,20 @@ namespace webrtc_stream {
       if (!input_ctx) {
         return;
       }
-      const auto input_permission = crypto::PERM::_all_inputs;
+      // This was hardcoded to _all_inputs, so every WebRTC client got
+      // keyboard and mouse no matter what it had been granted. Vibepollo
+      // already has a granular PERM enum and input::passthrough already
+      // enforces it — this path simply never consulted it.
+      auto input_permission = crypto::PERM::_all_inputs;
+      int gamepad_base = 0;
+      if (!session_id.empty()) {
+        std::lock_guard lg {session_mutex};
+        auto it = sessions.find(std::string {session_id});
+        if (it != sessions.end()) {
+          input_permission = it->second.input_permission;
+          gamepad_base = it->second.gamepad_base_slot;
+        }
+      }
 
       if (type == "mouse_move") {
         const double x = message.value("x", 0.0);
@@ -1557,7 +1570,11 @@ namespace webrtc_stream {
         return;
       }
       if (type == "gamepad_connect") {
-        const int controller = message.value("id", -1);
+        // Offset by the session base so player 2 lands on a different host
+        // pad than player 1. Each browser numbers its own gamepads from 0,
+        // so without this every guest drives controller 0.
+        const int raw_controller = message.value("id", -1);
+        const int controller = raw_controller < 0 ? -1 : raw_controller + gamepad_base;
         if (controller < 0 || controller >= 16) {
           return;
         }
@@ -1579,7 +1596,11 @@ namespace webrtc_stream {
         return;
       }
       if (type == "gamepad_state") {
-        const int controller = message.value("id", -1);
+        // Offset by the session base so player 2 lands on a different host
+        // pad than player 1. Each browser numbers its own gamepads from 0,
+        // so without this every guest drives controller 0.
+        const int raw_controller = message.value("id", -1);
+        const int controller = raw_controller < 0 ? -1 : raw_controller + gamepad_base;
         if (controller < 0 || controller >= 16) {
           return;
         }
@@ -1633,7 +1654,11 @@ namespace webrtc_stream {
         return;
       }
       if (type == "gamepad_disconnect") {
-        const int controller = message.value("id", -1);
+        // Offset by the session base so player 2 lands on a different host
+        // pad than player 1. Each browser numbers its own gamepads from 0,
+        // so without this every guest drives controller 0.
+        const int raw_controller = message.value("id", -1);
+        const int controller = raw_controller < 0 ? -1 : raw_controller + gamepad_base;
         if (controller < 0 || controller >= 16) {
           return;
         }
@@ -1650,7 +1675,11 @@ namespace webrtc_stream {
         return;
       }
       if (type == "gamepad_motion") {
-        const int controller = message.value("id", -1);
+        // Offset by the session base so player 2 lands on a different host
+        // pad than player 1. Each browser numbers its own gamepads from 0,
+        // so without this every guest drives controller 0.
+        const int raw_controller = message.value("id", -1);
+        const int controller = raw_controller < 0 ? -1 : raw_controller + gamepad_base;
         if (controller < 0 || controller >= 16) {
           return;
         }
@@ -1730,6 +1759,11 @@ namespace webrtc_stream {
 
     struct Session {
       SessionState state;
+
+      // Guest access control (see SessionOptions). Defaults keep an
+      // unrestricted session behaving exactly as before.
+      crypto::PERM input_permission = crypto::PERM::_all_inputs;
+      int gamepad_base_slot = 0;
       video::config_t video_config;
       ring_buffer_t<EncodedVideoFrame> video_frames {kMaxVideoFrames};
       ring_buffer_t<EncodedAudioFrame> audio_frames {kMaxAudioFrames};
@@ -3548,7 +3582,17 @@ namespace webrtc_stream {
       if (!input_ctx) {
         return;
       }
-      const auto input_permission = crypto::PERM::_all_inputs;
+      // Same grant as the JSON path. Without this a gamepad-only guest
+      // could still move the host mouse by sending binary input, which
+      // would defeat the permission entirely.
+      auto input_permission = crypto::PERM::_all_inputs;
+      if (ctx && !ctx->id.empty()) {
+        std::lock_guard lg {session_mutex};
+        auto it = sessions.find(ctx->id);
+        if (it != sessions.end()) {
+          input_permission = it->second.input_permission;
+        }
+      }
 
       const auto type = buffer[0];
       if (type != kInputBinaryMouseMove || length < kInputBinaryMouseMoveSize) {
