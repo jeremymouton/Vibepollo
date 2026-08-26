@@ -177,6 +177,17 @@ function Resolve-PrebuiltPackageRoot {
 function Resolve-PackageVersionFromGit {
     param([Parameter(Mandatory = $true)][string]$Path)
 
+    # This function is written to degrade gracefully -- it returns '' on any
+    # failure and the caller falls back to '0.0.0'. But the script sets
+    # $ErrorActionPreference = 'Stop' at the top, and under Stop a native
+    # command writing to stderr raises a terminating NativeCommandError that
+    # '2>$null' does not suppress. So on a checkout with no matching tag,
+    # 'git describe' aborted the whole packaging target instead of returning ''.
+    # That is the normal case for a fork (no upstream tags) or any shallow
+    # checkout -- CI uses fetch-depth: 1. Scoped to this function, so the rest
+    # of the script keeps Stop.
+    $ErrorActionPreference = 'SilentlyContinue'
+
     $git = Get-Command git -ErrorAction SilentlyContinue
     if (-not $git) {
         return ''
