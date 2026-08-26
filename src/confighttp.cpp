@@ -2073,6 +2073,67 @@ namespace confighttp {
 #endif
 
   /**
+   * @brief Apply a new encoder bitrate to live streaming session(s) without relaunching them.
+   *
+   * stream::set_bitrate_for_sessions() has been implemented and declared (stream.h)
+   * but had no callers, so the runtime bitrate path was unreachable from outside.
+   * A client wanting to adapt quality mid-stream therefore had only one option:
+   * tear the session down and launch a new one. That destroys the session's
+   * input_t, whose ~gamepad_t() calls free_gamepad() -> platf::free_gamepad()
+   * (src/input.cpp), removing the virtual controller from the OS and dropping the
+   * player's gamepad mid-game. Exposing the runtime path avoids that entirely.
+   *
+   * Body: {"client_uuid": "<uuid or omitted for all>", "bitrate_kbps": 9000}
+   *
+   * @api_examples{/api/session/bitrate| POST| {"client_uuid":"","bitrate_kbps":9000}}
+   */
+  void setSessionBitrate(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    std::stringstream ss;
+    ss << request->content.rdbuf();
+    try {
+      nlohmann::json input_tree = nlohmann::json::parse(ss);
+      if (!input_tree.is_object()) {
+        bad_request(response, request, "Request body must be a JSON object");
+        return;
+      }
+
+      const int requested_kbps = input_tree.value("bitrate_kbps", 0);
+      if (requested_kbps <= 0) {
+        bad_request(response, request, "bitrate_kbps must be a positive integer");
+        return;
+      }
+
+      // set_bitrate_for_sessions() documents clamping as the caller's job.
+      constexpr int kAbsoluteMaxBitrateKbps = 500000;
+      const int max_bitrate_kbps = config::video.max_bitrate > 0 ?
+                                     std::min(config::video.max_bitrate, kAbsoluteMaxBitrateKbps) :
+                                     kAbsoluteMaxBitrateKbps;
+      const int applied_kbps = std::min(requested_kbps, max_bitrate_kbps);
+
+      // An empty client_uuid means "every active session" — see stream.h.
+      const std::string client_uuid = input_tree.value("client_uuid", "");
+
+      nlohmann::json output_tree;
+      output_tree["status"] = true;
+      output_tree["bitrate_kbps"] = applied_kbps;
+      output_tree["sessions_updated"] = stream::set_bitrate_for_sessions(client_uuid, applied_kbps);
+      send_response(response, output_tree);
+    } catch (std::exception &e) {
+      BOOST_LOG(warning) << "SetSessionBitrate: "sv << e.what();
+      bad_request(response, request, e.what());
+    }
+  }
+
+  /**
    * @brief Serve a specific application's cover image by UUID.
    *        Looks for files named @c uuid with a supported image extension in the covers directory.
    * @api_examples{/api/apps/@c uuid/cover| GET| null}
@@ -5768,6 +5829,7 @@ namespace confighttp {
     register_api_route("^/api/apps/rtx_hdr/live$", "POST", updateAppRtxHdrLive);
 #endif
     register_api_route("^/api/logs$", "GET", getLogs);
+    register_api_route("^/api/session/bitrate$", "POST", setSessionBitrate);
     register_api_route("^/api/config$", "GET", getConfig);
     register_api_route("^/api/config$", "POST", saveConfig);
     // Partial updates for config settings; merges with existing file and
