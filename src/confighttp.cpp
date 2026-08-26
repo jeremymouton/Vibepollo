@@ -3610,6 +3610,31 @@ namespace confighttp {
         if (input.contains("resume")) {
           options.resume = input.at("resume").get<bool>();
         }
+        // Guest access control. Both optional; omitting them keeps the
+        // historical behaviour of full input on controller slot 0. Validated
+        // here rather than taken on trust: input_permission is a security
+        // grant, and create_session clamps an out-of-range slot, which would
+        // silently move a guest's pad instead of telling the caller it asked
+        // for something impossible.
+        if (input.contains("input_permission")) {
+          if (!input.at("input_permission").is_number_unsigned()) {
+            bad_request(response, request, "input_permission must be an unsigned integer");
+            return;
+          }
+          options.input_permission = input.at("input_permission").get<std::uint32_t>();
+        }
+        if (input.contains("gamepad_base_slot")) {
+          if (!input.at("gamepad_base_slot").is_number_integer()) {
+            bad_request(response, request, "gamepad_base_slot must be an integer");
+            return;
+          }
+          const auto gamepad_base_slot = input.at("gamepad_base_slot").get<int>();
+          if (gamepad_base_slot < 0 || gamepad_base_slot > 15) {
+            bad_request(response, request, "gamepad_base_slot must be between 0 and 15");
+            return;
+          }
+          options.gamepad_base_slot = gamepad_base_slot;
+        }
         if (input.contains("video_pacing_mode")) {
           options.video_pacing_mode = input.at("video_pacing_mode").get<std::string>();
         }
