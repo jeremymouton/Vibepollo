@@ -1483,6 +1483,17 @@ namespace webrtc_stream {
     void request_webrtc_latency_resync(std::string_view session_id);
 #endif
 
+    // What a session is allowed to inject, and where its pads land on the host.
+    struct SessionInputGrant {
+      crypto::PERM permission = crypto::PERM::_all_inputs;
+      int gamepad_base = 0;
+    };
+
+    // Defined below, after the session registry. The input handlers are
+    // compiled ahead of `sessions` / `session_mutex` in this translation unit,
+    // so they cannot touch the map directly.
+    SessionInputGrant session_input_grant(std::string_view session_id);
+
     void handle_input_message(std::string_view payload, std::string_view session_id = {}) {
       if (payload.empty()) {
         return;
@@ -1512,16 +1523,9 @@ namespace webrtc_stream {
       // keyboard and mouse no matter what it had been granted. Vibepollo
       // already has a granular PERM enum and input::passthrough already
       // enforces it — this path simply never consulted it.
-      auto input_permission = crypto::PERM::_all_inputs;
-      int gamepad_base = 0;
-      if (!session_id.empty()) {
-        std::lock_guard lg {session_mutex};
-        auto it = sessions.find(std::string {session_id});
-        if (it != sessions.end()) {
-          input_permission = it->second.input_permission;
-          gamepad_base = it->second.gamepad_base_slot;
-        }
-      }
+      const auto grant = session_input_grant(session_id);
+      const auto input_permission = grant.permission;
+      const int gamepad_base = grant.gamepad_base;
 
       if (type == "mouse_move") {
         const double x = message.value("x", 0.0);
@@ -1841,6 +1845,20 @@ namespace webrtc_stream {
 
     std::mutex session_mutex;
     std::unordered_map<std::string, Session> sessions;
+
+    SessionInputGrant session_input_grant(std::string_view session_id) {
+      SessionInputGrant grant;
+      if (session_id.empty()) {
+        return grant;
+      }
+      std::lock_guard lg {session_mutex};
+      auto it = sessions.find(std::string {session_id});
+      if (it != sessions.end()) {
+        grant.permission = it->second.input_permission;
+        grant.gamepad_base = it->second.gamepad_base_slot;
+      }
+      return grant;
+    }
     std::condition_variable local_answer_cv;
     std::atomic_uint active_sessions {0};
     std::atomic_uint teardown_sessions {0};
@@ -3585,14 +3603,7 @@ namespace webrtc_stream {
       // Same grant as the JSON path. Without this a gamepad-only guest
       // could still move the host mouse by sending binary input, which
       // would defeat the permission entirely.
-      auto input_permission = crypto::PERM::_all_inputs;
-      if (ctx && !ctx->id.empty()) {
-        std::lock_guard lg {session_mutex};
-        auto it = sessions.find(ctx->id);
-        if (it != sessions.end()) {
-          input_permission = it->second.input_permission;
-        }
-      }
+      const auto input_permission = ctx ? session_input_grant(ctx->id).permission : crypto::PERM::_all_inputs;
 
       const auto type = buffer[0];
       if (type != kInputBinaryMouseMove || length < kInputBinaryMouseMoveSize) {
@@ -5478,6 +5489,17 @@ namespace webrtc_stream {
     session.state.profile = options.profile;
     session.state.client_name = options.client_name;
     session.state.client_uuid = options.client_uuid;
+    // Without this the grant fields stay at their defaults and the whole
+    // per-session permission / slot mechanism is inert.
+    if (options.input_permission) {
+      session.input_permission = static_cast<crypto::PERM>(*options.input_permission);
+    }
+    if (options.gamepad_base_slot) {
+      // Indices are bounds-checked against 16 after the offset is applied;
+      // clamping here keeps an out-of-range request from silently dropping
+      // every gamepad packet the session sends.
+      session.gamepad_base_slot = std::clamp(*options.gamepad_base_slot, 0, 15);
+    }
     session.video_config = build_video_config(options);
     apply_rtsp_video_overrides(session.video_config, rtsp_config);
     apply_rtx_hdr_stream_policy(session.video_config);

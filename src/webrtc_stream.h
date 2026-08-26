@@ -41,13 +41,13 @@ namespace webrtc_stream {
       std::optional<bool> resume;
 
       // Guest access control. Both default to today's behaviour when unset:
-    // full input, controller slot 0. A guest is created with a narrower
-    // grant — crypto::PERM::input_controller alone yields a gamepad-only
-    // player — and a slot offset so players do not share a virtual pad.
-    std::optional<std::uint32_t> input_permission;
-    std::optional<int> gamepad_base_slot;
+      // full input, controller slot 0. A guest is created with a narrower
+      // grant — crypto::PERM::input_controller alone yields a gamepad-only
+      // player — and a slot offset so players do not share a virtual pad.
+      std::optional<std::uint32_t> input_permission;
+      std::optional<int> gamepad_base_slot;
 
-    std::optional<std::string> video_pacing_mode;
+      std::optional<std::string> video_pacing_mode;
       std::optional<int> video_pacing_slack_ms;
       std::optional<int> video_max_frame_age_ms;
   };
