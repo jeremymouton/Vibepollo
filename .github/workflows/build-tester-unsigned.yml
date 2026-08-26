@@ -1,0 +1,43 @@
+---
+# Unsigned Windows installer for testing fork branches.
+#
+# tester-windows-installer.yml exists but passes require_signpath_signing: true
+# and require_truehdr_runtime: true, which need upstream's SignPath and TrueHDR
+# secrets. A fork does not have those, so that workflow cannot succeed here.
+#
+# ci-windows.yml declares all three secrets as required: false and both gates
+# default to false, so calling it directly produces an installable, unsigned
+# build. Windows SmartScreen will warn on first run — expected for unsigned.
+name: Build Windows Installer (unsigned)
+
+permissions: {}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: Version string embedded in the installer.
+        required: false
+        type: string
+        default: 0.0.0-dev
+
+run-name: Unsigned Windows Installer — ${{ github.ref_name }}
+
+jobs:
+  build-windows:
+    name: Build unsigned installer
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/ci-windows.yml
+    with:
+      release_commit: ${{ github.sha }}
+      release_version: ${{ inputs.build_version || '0.0.0-dev' }}
+      release_tag: ''
+      symbol_product_name: Vibepollo
+      symbol_release_prefix: polo
+      publish_symbols: false
+      upload_symbols_artifact: false
+      build_tests: false
+      require_signpath_signing: false
+      require_truehdr_runtime: false
