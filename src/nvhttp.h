@@ -132,6 +132,18 @@ namespace nvhttp {
      * @brief used as a security measure to prevent out of order calls
      */
     PAIR_PHASE last_phase = PAIR_PHASE::NONE;
+
+    /**
+     * @brief Permission to grant this client when the pairing completes.
+     *
+     * Unset for the ordinary flow, where the owner types the PIN in the admin UI and the
+     * new client lands on PERM::_default. Set when a guest completed the pairing through
+     * an invite, and then it is authoritative — including over the "first client gets
+     * everything" rule, which must never fire for someone who arrived on an invite link.
+     *
+     * See docs/guest-invites.md.
+     */
+    std::optional<crypto::PERM> granted_perm = std::nullopt;
   };
 
   /**
@@ -207,7 +219,13 @@ namespace nvhttp {
    * bool pin_status = nvhttp::pin("1234", "laptop");
    * @examples_end
    */
-  bool pin(std::string pin, std::string name);
+  /**
+   * @brief Complete a pending pairing with the submitted PIN.
+   * @param granted_perm Permission for the resulting client. Unset keeps the historical
+   *   behaviour (PERM::_default, or PERM::_all for the very first client). Set by the
+   *   invite flow, where it is authoritative — see docs/guest-invites.md.
+   */
+  bool pin(std::string pin, std::string name, std::optional<crypto::PERM> granted_perm = std::nullopt);
 
   /**
    * @brief Pick the client label used for display-facing behavior.

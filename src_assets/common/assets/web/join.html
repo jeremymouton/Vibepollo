@@ -169,7 +169,21 @@
         </button>
         <div class="choice hidden" id="choice-pair">
           <b>Use your Moonlight client</b>
-          <span id="pair-hint">Pair with the PIN shown in Moonlight.</span>
+          <span
+            >In Moonlight, add this host and start pairing. Moonlight will show you a
+            four-digit PIN — type it here.</span
+          >
+          <form id="pair-form" style="margin-top: 12px">
+            <input
+              id="moonlight-pin"
+              type="text"
+              inputmode="numeric"
+              maxlength="4"
+              pattern="[0-9]*"
+              aria-label="PIN shown in Moonlight"
+            />
+            <button type="submit" id="pair-submit">Pair</button>
+          </form>
         </div>
       </div>
 
@@ -269,6 +283,13 @@
 
           el('submit').disabled = false;
 
+          if (ok) {
+            // Held in memory for the pairing call below, which needs it again.
+            // Never stored and never put in the URL — the page is thrown away on
+            // reload and the guest simply re-enters it.
+            window.__pin = pin;
+          }
+
           if (!ok) {
             let text = body.error || 'That did not work.';
             if (body.retry_after_seconds) {
@@ -297,6 +318,46 @@
             // session without any further credential.
             window.location.href = '/webrtc';
           });
+
+          el('pair-form').addEventListener('submit', pair);
+        }
+
+        // The native path needs BOTH secrets: the invite PIN we already used, and
+        // the one Moonlight is showing right now. The second is what proves the
+        // caller is the client at the door, so it is asked for here rather than
+        // being something the link could carry.
+        async function pair(event) {
+          event.preventDefault();
+          const moonlightPin = el('moonlight-pin').value.trim();
+          if (!moonlightPin) {
+            note('Enter the PIN Moonlight is showing.');
+            return;
+          }
+
+          el('pair-submit').disabled = true;
+          note('');
+
+          const { ok, body } = await json('/api/join/' + encodeURIComponent(token) + '/pair', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-CSRF-Token': await csrfToken(),
+            },
+            body: JSON.stringify({ pin: window.__pin, moonlight_pin: moonlightPin }),
+          });
+
+          el('pair-submit').disabled = false;
+
+          if (!ok || !body.status) {
+            note(body.error || 'Pairing did not work.');
+            el('moonlight-pin').select();
+            return;
+          }
+
+          el('title').textContent = 'Paired';
+          el('subtitle').textContent =
+            'Your Moonlight client can now connect to this host. You can close this page.';
+          el('choices').style.display = 'none';
         }
 
         el('pin-form').addEventListener('submit', redeem);

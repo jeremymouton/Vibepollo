@@ -2380,16 +2380,26 @@ namespace nvhttp {
         }
         named_cert_p->cert = std::move(client.cert);
         named_cert_p->uuid = uuid_util::uuid_t::generate().string();
-        // If the device is the first one paired with the server, assign full permission.
-        bool first_client = false;
-        {
-          std::lock_guard<std::mutex> lock(client_mutex);
-          first_client = client_root.named_devices.empty();
-        }
-        if (first_client) {
-          named_cert_p->perm = PERM::_all;
+        // An invite decides the permission outright. It wins over the "first client
+        // gets everything" rule below on purpose: a guest who happens to be the first
+        // device ever paired must still get only what their invite granted.
+        if (sess.granted_perm) {
+          named_cert_p->perm = *sess.granted_perm;
+          BOOST_LOG(info) << "Pairing '"sv << named_cert_p->name
+                          << "' from an invite, permission "sv
+                          << static_cast<std::uint32_t>(named_cert_p->perm);
         } else {
-          named_cert_p->perm = PERM::_default;
+          // If the device is the first one paired with the server, assign full permission.
+          bool first_client = false;
+          {
+            std::lock_guard<std::mutex> lock(client_mutex);
+            first_client = client_root.named_devices.empty();
+          }
+          if (first_client) {
+            named_cert_p->perm = PERM::_all;
+          } else {
+            named_cert_p->perm = PERM::_default;
+          }
         }
 
         named_cert_p->enable_legacy_ordering = true;
@@ -2694,7 +2704,7 @@ namespace nvhttp {
       }
     }
 
-    bool pin(std::string pin, std::string name) {
+    bool pin(std::string pin, std::string name, std::optional<crypto::PERM> granted_perm) {
       pt::ptree tree;
       if (map_id_sess.empty()) {
         BOOST_LOG(warning) << "PIN submitted but no pending pairing session exists";
@@ -2748,6 +2758,10 @@ namespace nvhttp {
         remove_session(sess);
         return false;
       }
+
+      // Recorded before the handshake proceeds, because the permission is applied at
+      // its far end in clientpairingsecret, several round trips from here.
+      sess.granted_perm = granted_perm;
 
       getservercert(sess, tree, pin);
 
