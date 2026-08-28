@@ -170,8 +170,9 @@
         <div class="choice hidden" id="choice-pair">
           <b>Use your Moonlight client</b>
           <span
-            >In Moonlight, add this host and start pairing. Moonlight will show you a
-            four-digit PIN — type it here.</span
+            >In Moonlight, choose <b>Add PC</b> and enter
+            <code id="pair-host">this host</code>. Moonlight will show you a four-digit
+            PIN — type it here.</span
           >
           <form id="pair-form" style="margin-top: 12px">
             <input
@@ -320,6 +321,12 @@
           });
 
           el('pair-form').addEventListener('submit', pair);
+
+          // The address to type into Moonlight is simply wherever this page was
+          // reached. The guest got here somehow, and GameStream is relayed on the
+          // same hostname — so the page never has to be told its own address, and
+          // cannot be told a stale one.
+          el('pair-host').textContent = window.location.hostname;
         }
 
         // The native path needs BOTH secrets: the invite PIN we already used, and
