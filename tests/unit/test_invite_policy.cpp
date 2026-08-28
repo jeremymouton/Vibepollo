@@ -234,6 +234,106 @@ namespace {
     EXPECT_TRUE(policy::is_live(invite, at(11)));
   }
 
+  // ── Persistence round-trip ─────────────────────────────────────────────────
+  // Data loss here means the owner silently loses every link they have handed out,
+  // so the round-trip is worth pinning field by field.
+
+  TEST(InvitePolicy, RoundTripsEveryFieldThroughJson) {
+    auto original = make_invite();
+    original.perm = 0x12345u;
+    original.app_id = 7;
+    original.allow_pairing = true;
+    original.revoked = true;
+    original.max_uses = 3;
+    original.uses = 2;
+    original.failed_attempts = 4;
+    original.locked_until = at(500);
+
+    const auto restored = policy::from_json(policy::to_json(original));
+    ASSERT_TRUE(restored.has_value());
+
+    EXPECT_EQ(restored->id, original.id);
+    EXPECT_EQ(restored->label, original.label);
+    EXPECT_EQ(restored->token, original.token);
+    EXPECT_EQ(restored->pin, original.pin);
+    EXPECT_EQ(restored->perm, original.perm);
+    EXPECT_EQ(restored->gamepad_base_slot, original.gamepad_base_slot);
+    EXPECT_EQ(restored->app_id, original.app_id);
+    EXPECT_EQ(restored->allow_browser, original.allow_browser);
+    EXPECT_EQ(restored->allow_pairing, original.allow_pairing);
+    EXPECT_EQ(restored->revoked, original.revoked);
+    EXPECT_EQ(restored->created_at, original.created_at);
+    EXPECT_EQ(restored->expires_at, original.expires_at);
+    EXPECT_EQ(restored->locked_until, original.locked_until);
+    EXPECT_EQ(restored->max_uses, original.max_uses);
+    EXPECT_EQ(restored->uses, original.uses);
+    EXPECT_EQ(restored->failed_attempts, original.failed_attempts);
+  }
+
+  TEST(InvitePolicy, RoundTripsAnInviteThatNeverExpires) {
+    auto original = make_invite();
+    original.expires_at = {};
+    const auto restored = policy::from_json(policy::to_json(original));
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->expires_at, policy::time_point_t {});
+    EXPECT_TRUE(policy::is_live(*restored, at(999999)));
+  }
+
+  TEST(InvitePolicy, KeepsAnInviteWhoseFieldsAreMissing) {
+    // A file written by an older build. Everything but id and token may be absent.
+    nlohmann::json node = nlohmann::json::object();
+    node["id"] = "abc";
+    node["token"] = "def";
+    const auto restored = policy::from_json(node);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->id, "abc");
+    EXPECT_TRUE(restored->allow_browser);
+    EXPECT_FALSE(restored->allow_pairing);
+    EXPECT_EQ(restored->uses, 0);
+  }
+
+  TEST(InvitePolicy, IgnoresFieldsItDoesNotKnow) {
+    // A file written by a NEWER build must not cost the owner the invite.
+    auto node = policy::to_json(make_invite());
+    node["something_from_the_future"] = 42;
+    const auto restored = policy::from_json(node);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->id, make_invite().id);
+  }
+
+  TEST(InvitePolicy, RejectsARecordThatCanNeverBeUsed) {
+    // No id means it cannot be addressed; no token means it cannot be redeemed.
+    nlohmann::json no_id = nlohmann::json::object();
+    no_id["token"] = "def";
+    EXPECT_FALSE(policy::from_json(no_id).has_value());
+
+    nlohmann::json no_token = nlohmann::json::object();
+    no_token["id"] = "abc";
+    EXPECT_FALSE(policy::from_json(no_token).has_value());
+
+    EXPECT_FALSE(policy::from_json(nlohmann::json::array()).has_value());
+    EXPECT_FALSE(policy::from_json(nlohmann::json("a string")).has_value());
+  }
+
+  TEST(InvitePolicy, SurvivesTheRoundTripWithItsAdmissionDecisionIntact) {
+    // The property that actually matters: a reloaded invite admits exactly who the
+    // original did.
+    auto original = make_invite();
+    policy::apply(original, result_e::bad_pin, at(10));
+    policy::apply(original, result_e::ok, at(11));
+
+    const auto restored = policy::from_json(policy::to_json(original));
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(
+      policy::evaluate(*restored, mode_e::browser, "123456", at(20)),
+      policy::evaluate(original, mode_e::browser, "123456", at(20))
+    );
+    EXPECT_EQ(
+      policy::evaluate(*restored, mode_e::browser, "nope", at(20)),
+      policy::evaluate(original, mode_e::browser, "nope", at(20))
+    );
+  }
+
   TEST(InvitePolicy, ComparesEqualStringsAsEqual) {
     EXPECT_TRUE(policy::constant_time_equals("123456", "123456"));
     EXPECT_TRUE(policy::constant_time_equals("", ""));

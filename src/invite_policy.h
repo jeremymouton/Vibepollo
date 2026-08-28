@@ -11,6 +11,8 @@
  */
 #pragma once
 
+#include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -131,5 +133,23 @@ namespace invite::policy {
 
   /// Seconds a locked-out guest must wait, or 0 when not locked.
   int lockout_remaining_seconds(const invite_t &invite, time_point_t now);
+
+  /**
+   * @brief Serialise one invite for the store's JSON file.
+   *
+   * Times are written as epoch seconds rather than a formatted string: the file is only
+   * ever read back by this code, and an integer cannot acquire a timezone.
+   */
+  nlohmann::json to_json(const invite_t &invite);
+
+  /**
+   * @brief Parse one invite from the store's JSON file.
+   *
+   * Tolerant on purpose. Unknown fields are ignored and missing ones take their
+   * defaults, so a file written by a newer build does not cost the owner every link
+   * they have. Only a record with no id or no token is rejected, because it can never
+   * be addressed or redeemed.
+   */
+  std::optional<invite_t> from_json(const nlohmann::json &node);
 
 }  // namespace invite::policy

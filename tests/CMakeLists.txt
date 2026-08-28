@@ -200,6 +200,16 @@ target_include_directories(sunshine_test_simple_web_headers SYSTEM INTERFACE
 target_link_libraries(sunshine_test_simple_web_headers INTERFACE
     OpenSSL::SSL OpenSSL::Crypto)
 
+# nlohmann/json is header-only and comes from the system (Homebrew, apt, vcpkg).
+# Named as a target for the same reason as the others: a component opts in to the
+# one external surface it uses rather than inheriting a process-wide include path.
+add_library(sunshine_test_json_headers INTERFACE)
+find_path(SUNSHINE_TEST_NLOHMANN_INCLUDE_DIR "nlohmann/json.hpp")
+if(SUNSHINE_TEST_NLOHMANN_INCLUDE_DIR)
+    target_include_directories(sunshine_test_json_headers SYSTEM INTERFACE
+        "${SUNSHINE_TEST_NLOHMANN_INCLUDE_DIR}")
+endif()
+
 add_library(sunshine_test_moonlight_headers INTERFACE)
 target_include_directories(sunshine_test_moonlight_headers SYSTEM INTERFACE
     "${SUNSHINE_TEST_REPOSITORY_ROOT}/third-party")
@@ -343,7 +353,8 @@ sunshine_register_component(NAME test_component_file_handler TEST_SOURCE unit/te
 sunshine_register_component(NAME test_component_state_storage TEST_SOURCE unit/test_state_storage.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/state_storage_policy.cpp")
 sunshine_register_component(NAME test_component_invite_policy TEST_SOURCE unit/test_invite_policy.cpp
-    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/invite_policy.cpp")
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/invite_policy.cpp"
+    LINK_LIBRARIES sunshine_test_json_headers)
 sunshine_register_component(NAME test_component_http_auth TEST_SOURCE unit/test_http_auth.cpp
     EXTRA_TEST_SOURCES "${CMAKE_CURRENT_LIST_DIR}/unit/test_confighttp.cpp"
     PRODUCT_SOURCES

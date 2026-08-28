@@ -5,6 +5,9 @@
 #include "invite_policy.h"
 
 #include <algorithm>
+#include <string>
+
+using namespace std::literals;
 
 namespace invite::policy {
 
@@ -150,6 +153,69 @@ namespace invite::policy {
         return "This invite does not allow that way of joining.";
     }
     return "This invite link is no longer valid.";
+  }
+
+  namespace {
+    long long to_epoch(time_point_t t) {
+      return std::chrono::duration_cast<std::chrono::seconds>(t.time_since_epoch()).count();
+    }
+
+    time_point_t from_epoch(long long seconds) {
+      return time_point_t {} + std::chrono::seconds {seconds};
+    }
+  }  // namespace
+
+  nlohmann::json to_json(const invite_t &invite) {
+    nlohmann::json node = nlohmann::json::object();
+    node["id"] = invite.id;
+    node["label"] = invite.label;
+    node["token"] = invite.token;
+    node["pin"] = invite.pin;
+    node["perm"] = invite.perm;
+    node["gamepad_base_slot"] = invite.gamepad_base_slot;
+    node["app_id"] = invite.app_id;
+    node["allow_browser"] = invite.allow_browser;
+    node["allow_pairing"] = invite.allow_pairing;
+    node["revoked"] = invite.revoked;
+    node["created_at"] = to_epoch(invite.created_at);
+    node["expires_at"] = to_epoch(invite.expires_at);
+    node["locked_until"] = to_epoch(invite.locked_until);
+    node["max_uses"] = invite.max_uses;
+    node["uses"] = invite.uses;
+    node["failed_attempts"] = invite.failed_attempts;
+    return node;
+  }
+
+  /// Tolerant by design: a field this build does not know about is ignored, and a
+  /// missing one takes its default. An invite file written by a newer build must not
+  /// cost the owner every link they have.
+  std::optional<invite_t> from_json(const nlohmann::json &node) {
+    if (!node.is_object()) {
+      return std::nullopt;
+    }
+    invite_t invite;
+    invite.id = node.value("id", ""s);
+    invite.token = node.value("token", ""s);
+    // An invite without an id or a token can never be addressed or redeemed; keeping it
+    // would leave an unusable row in the owner's list forever.
+    if (invite.id.empty() || invite.token.empty()) {
+      return std::nullopt;
+    }
+    invite.label = node.value("label", ""s);
+    invite.pin = node.value("pin", ""s);
+    invite.perm = node.value("perm", 0u);
+    invite.gamepad_base_slot = node.value("gamepad_base_slot", 0);
+    invite.app_id = node.value("app_id", -1);
+    invite.allow_browser = node.value("allow_browser", true);
+    invite.allow_pairing = node.value("allow_pairing", false);
+    invite.revoked = node.value("revoked", false);
+    invite.created_at = from_epoch(node.value("created_at", 0LL));
+    invite.expires_at = from_epoch(node.value("expires_at", 0LL));
+    invite.locked_until = from_epoch(node.value("locked_until", 0LL));
+    invite.max_uses = node.value("max_uses", 0);
+    invite.uses = node.value("uses", 0);
+    invite.failed_attempts = node.value("failed_attempts", 0);
+    return invite;
   }
 
 }  // namespace invite::policy
