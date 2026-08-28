@@ -865,7 +865,8 @@
       "maintenance": "Maintenance",
       "overview": "Overview",
       "stats": "Statistics",
-      "settings": "Settings"
+      "settings": "Settings",
+      "invites": "Invites"
     },
     "browser_stream": {
       "capabilities": {
@@ -1951,6 +1952,56 @@
     "system": {
       "host_status_unavailable": "Host status is temporarily unavailable.",
       "unreachable": "Unable to reach Vibepollo."
+    },
+    "invites": {
+      "title": "Guest invites",
+      "description": "Hand a friend a link that lets them join a game — in their browser, or with a Moonlight client they already have. No account, no password.",
+      "new": "New invite",
+      "create": "Create invite",
+      "creating": "Creating…",
+      "error": "Something went wrong",
+      "default_label": "Guest",
+      "field_label": "Who is this for?",
+      "label_hint": "e.g. Brother",
+      "field_access": "What can they do?",
+      "preset_view": "Watch only",
+      "preset_gamepad": "Play with a gamepad",
+      "preset_full": "Full control (keyboard and mouse too)",
+      "field_slot": "Controller slot",
+      "field_expiry": "Expires in (hours, 0 = never)",
+      "field_uses": "Max uses (0 = unlimited)",
+      "allow_browser": "Can play in a browser",
+      "allow_pairing": "Can pair a Moonlight client",
+      "pin_note": "A PIN is generated with the link. Send them through different channels — the link on its own does nothing without the PIN.",
+      "empty_title": "No invites yet",
+      "empty_description": "Create one to let someone join without giving them an account.",
+      "link": "Link",
+      "pin": "PIN",
+      "copy_link": "Copy link",
+      "copy_pin": "Copy PIN",
+      "copied_link": "Link copied. Send the PIN separately.",
+      "copied_pin": "PIN copied.",
+      "copy_failed": "Could not reach the clipboard — select and copy it by hand.",
+      "status_live": "Live",
+      "status_revoked": "Revoked",
+      "status_spent": "Used up",
+      "status_locked": "Locked (too many wrong PINs)",
+      "never_expires": "Never expires",
+      "expires_on": "Expires {when}",
+      "expired_on": "Expired {when}",
+      "uses_unlimited": "Used {used} times",
+      "uses_limited": "Used {used} of {max}",
+      "slot": "Controller slot {slot}",
+      "way_browser": "Browser",
+      "way_pairing": "Moonlight client",
+      "way_none": "No way in enabled — this link cannot be used",
+      "rotate": "New link & PIN",
+      "rotated": "New link and PIN issued. The old ones no longer work.",
+      "revoke": "Revoke",
+      "restore": "Un-revoke",
+      "delete": "Delete",
+      "delete_title": "Delete this invite?",
+      "delete_description": "Anyone using it right now will be disconnected. Revoking instead keeps the record, so a refused link is still explicable."
     }
   }
 }

@@ -5,6 +5,7 @@ import ApiTokensView from '@/views/ApiTokensView.vue';
 import BrowserStreamView from '@/views/BrowserStreamView.vue';
 import DevicesView from '@/views/DevicesView.vue';
 import IntegrationsView from '@/views/IntegrationsView.vue';
+import InvitesView from '@/views/InvitesView.vue';
 import LibraryView from '@/views/LibraryView.vue';
 import LogsView from '@/views/LogsView.vue';
 import MaintenanceView from '@/views/MaintenanceView.vue';
@@ -32,6 +33,12 @@ const router = createRouter({
     {
       path: '/webrtc',
       redirect: '/stream',
+    },
+    {
+      path: '/invites',
+      name: 'invites',
+      component: InvitesView,
+      meta: { titleKey: 'ui.nav.invites' },
     },
     {
       path: '/library',
