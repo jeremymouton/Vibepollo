@@ -62,9 +62,16 @@ namespace invite {
         BOOST_LOG(error) << "Couldn't write "sv << invites_path();
         return;
       }
+#ifndef _WIN32
       // The file holds link tokens and PINs in plaintext so the owner can send them
-      // again — see docs/guest-invites.md — so it must not be world-readable even if the
-      // directory is.
+      // again — see docs/guest-invites.md — so narrow it to the owner even if the
+      // directory is not.
+      //
+      // POSIX only, and deliberately so: on Windows std::filesystem::permissions merely
+      // toggles the read-only attribute and grants no access control whatsoever, so
+      // calling it there would look like protection while providing none. Windows is
+      // handled by statefile::repair_config_permissions(), which puts this file under
+      // the same config-directory ACL as sunshine_state.json.
       std::error_code ec;
       fs::permissions(
         invites_path(),
@@ -72,6 +79,7 @@ namespace invite {
         fs::perm_options::replace,
         ec
       );
+#endif
     }
 
     /// Caller holds g_mutex.

@@ -658,6 +658,10 @@ namespace statefile {
       "vibeshine_state.json"sv,
       "sunshine.conf"sv,
       "apps.json"sv,
+      // Guest invite links and their PINs. Bearer secrets, so it matters that this
+      // is here: std::filesystem::permissions cannot restrict access on Windows, so
+      // the config-directory ACL is the only thing protecting it.
+      "invites.json"sv,
     };
 
     for (const auto &dir : config_roots) {

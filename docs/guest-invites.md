@@ -71,10 +71,26 @@ One invite, persisted in `invites.json` beside the state file, written through
 
 **The token and PIN are stored in plaintext.** The owner has to be able to re-read both
 to send them again, which is the whole point of "make it easy to find and generate the
-links" — a show-once secret fails that. The file sits beside `sunshine_state.json` with
-the same permissions, and anyone who can read it can already read the paired client
-certs, so this is not a new class of exposure. Comparison is still constant-time, because
-the threat is an online guessing attack, not someone with the file.
+links" — a show-once secret fails that. The file sits beside `sunshine_state.json` and is
+protected the same way it is, and anyone who can read it can already read the paired
+client certs, so this is not a new class of exposure. Comparison is still constant-time,
+because the threat is an online guessing attack, not someone with the file.
+
+What "protected the same way" means differs by platform, and the difference is worth
+stating because it is easy to assume otherwise:
+
+- **POSIX** — the file is chmodded to owner-only on every write.
+- **Windows** — `std::filesystem::permissions` cannot restrict access at all there; it
+  only toggles the read-only attribute. So that call is compiled out, and `invites.json`
+  is instead registered in `statefile::repair_config_permissions()`, which puts it under
+  the config directory's ACL alongside `sunshine_state.json` and `sunshine.conf`. That
+  ACL comes from the installer's hardening, **not** from a per-file restriction.
+
+If that is not strong enough for a given deployment, the mechanism to reach for is
+`statefile::secure_private_directory()` — the protected, non-inherited DACL the host TLS
+key already gets — applied to a directory holding this file. That is a deliberate
+non-default: it would put invites under stricter protection than the paired client certs
+next to them, which is a choice about threat model rather than an obvious improvement.
 
 **A revoked or expired invite is kept, not deleted.** A deleted invite is
 indistinguishable from a typo, and both would answer "no such invite". Keeping the record
