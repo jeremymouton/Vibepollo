@@ -4,8 +4,9 @@ Let the host owner hand a friend a link that gets them into a game — in a brow
 with a Moonlight client they already have — without giving them an account, the host
 password, or full control of the machine.
 
-Status: **in progress**. This document is the design the implementation is checked
-against, not a description of finished work. Each stage lists how it is verified.
+Status: **browser path complete; native pairing and owner UI outstanding.** This
+document is the design the implementation is checked against. Each stage lists how it is
+verified.
 
 ## Why this exists here
 
@@ -157,12 +158,21 @@ signature is kept and delegates, so the admin path is unchanged.
 
 ## Stages
 
-| Stage | Contents | Verified by |
+| Stage | Contents | Status |
 |---|---|---|
-| 1 | Invite model, store, persistence, owner CRUD | Unit tests for expiry, lockout, use counting, constant-time compare, round-trip persistence; build; curl each route |
-| 2 | Guest sessions, `/api/join/*`, landing page, browser redeem | Unit tests for the guest store; build; curl a full redeem; browser check of the landing page |
-| 3 | Native pairing with `invite.perm` | Build; a real pairing from a Moonlight client, confirming the cert lands with the invite's permission and not `_default` |
-| 4 | Owner UI — invites page, copy link, PIN, QR | Browser check of create / copy / revoke / rotate |
+| 1 | Invite model, store, persistence, owner CRUD | **Done.** 33 unit tests (expiry, lockout onset/release/escalation/cap, refusal ordering, use limits, permission clamping, constant-time compare, persistence round-trip); every touched translation unit compiles clean |
+| 2 | Guest sessions, `/api/join/*`, landing page, browser redeem | **Done.** Landing page verified in a browser against a stand-in backend across all six paths; guest branch of `createWebRTCSession` compiles but is unreachable in a non-WebRTC build |
+| 3 | Native pairing with `invite.perm` | Outstanding. Needs `nvhttp::pin()` to take an explicit permission, plus `POST /api/join/{token}/pair` |
+| 4 | Owner UI — invites page, copy link, PIN, QR | Outstanding. The API is complete and returns a ready-to-paste `path`, a `permission_summary` phrase, and derived `live` / `locked_for_seconds` so the page needs no bitmask logic |
+
+### Still to check on the Windows host
+
+- A guest session actually reaching `input::passthrough` with the clamped permission —
+  the property the whole feature sells. Compile-verified only; `SUNSHINE_ENABLE_WEBRTC`
+  is off on the macOS build machine.
+- Two simultaneous guests landing on different controller slots.
+- Whether a native GameStream guest gets their own virtual pad, or collides with the
+  owner's the way two `/webrtc` sessions do.
 
 ## What is not verifiable on the build machine
 
