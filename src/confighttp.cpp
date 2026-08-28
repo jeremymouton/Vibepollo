@@ -53,6 +53,7 @@
 #include "globals.h"
 #include "http_auth.h"
 #include "httpcommon.h"
+#include "invites.h"
 #include "platform/common.h"
 #ifdef _WIN32
   #include "src/platform/windows/image_convert.h"
@@ -2131,6 +2132,358 @@ namespace confighttp {
       BOOST_LOG(warning) << "SetSessionBitrate: "sv << e.what();
       bad_request(response, request, e.what());
     }
+  }
+
+  // ── Guest invites ─────────────────────────────────────────────────────────
+  // A link the owner hands a friend that gets them into a game without an
+  // account or the host password. See docs/guest-invites.md.
+
+  namespace invites_api {
+
+    /// Bits an invite may never carry, whatever the caller asks for.
+    ///
+    /// Running commands on the host and moving files off it are owner powers, and
+    /// no combination of "full control" for a guest should reach them. Clamped on
+    /// create and on update, so a preset, a raw bitmask and a later edit are all
+    /// held to the same ceiling.
+    constexpr std::uint32_t forbidden_for_guests =
+      static_cast<std::uint32_t>(crypto::PERM::server_cmd) |
+      static_cast<std::uint32_t>(crypto::PERM::file_upload) |
+      static_cast<std::uint32_t>(crypto::PERM::file_dwnload);
+
+    std::uint32_t sanitize_perm(std::uint32_t requested) {
+      return requested & static_cast<std::uint32_t>(crypto::PERM::_all) & ~forbidden_for_guests;
+    }
+
+    /// Named permission sets, so the UI never has to build a bitmask and a typo in
+    /// one cannot silently widen a grant.
+    std::optional<std::uint32_t> preset_perm(const std::string &name) {
+      const auto view = static_cast<std::uint32_t>(crypto::PERM::view);
+      const auto list = static_cast<std::uint32_t>(crypto::PERM::list);
+      const auto launch = static_cast<std::uint32_t>(crypto::PERM::launch);
+      const auto pad = static_cast<std::uint32_t>(crypto::PERM::input_controller);
+      const auto all_inputs = static_cast<std::uint32_t>(crypto::PERM::_all_inputs);
+
+      if (name == "view") {
+        return view | list;  // watch over someone's shoulder, touch nothing
+      }
+      if (name == "gamepad") {
+        return view | list | launch | pad;  // the one this feature exists for
+      }
+      if (name == "full") {
+        return view | list | launch | all_inputs;  // keyboard and mouse too
+      }
+      return std::nullopt;
+    }
+
+    /// A short phrase for the invite list, so the owner can see at a glance what a
+    /// link hands out without decoding a bitmask.
+    std::string describe_perm(std::uint32_t perm) {
+      const auto has = [perm](crypto::PERM bit) {
+        return (perm & static_cast<std::uint32_t>(bit)) != 0;
+      };
+      const bool kbm = has(crypto::PERM::input_mouse) || has(crypto::PERM::input_kbd);
+      const bool pad = has(crypto::PERM::input_controller);
+
+      if (kbm && pad) {
+        return "Full control (keyboard, mouse and gamepad)";
+      }
+      if (kbm) {
+        return "Keyboard and mouse";
+      }
+      if (pad) {
+        return "Gamepad only";
+      }
+      return "Watch only";
+    }
+
+    long long epoch_seconds(invite::policy::time_point_t t) {
+      return std::chrono::duration_cast<std::chrono::seconds>(t.time_since_epoch()).count();
+    }
+
+    /// The owner's view. Carries the token and PIN — never send this to a guest.
+    nlohmann::json to_owner_json(const invite::invite_t &invite) {
+      const auto now = invite::policy::clock_t::now();
+      nlohmann::json node = nlohmann::json::object();
+      node["id"] = invite.id;
+      node["label"] = invite.label;
+      node["token"] = invite.token;
+      node["pin"] = invite.pin;
+      // Ready to paste. The host cannot know its own public origin, so this stays
+      // relative and the page prepends wherever it is being served from.
+      node["path"] = "/join/" + invite.token;
+      node["perm"] = invite.perm;
+      node["permission_summary"] = describe_perm(invite.perm);
+      node["gamepad_base_slot"] = invite.gamepad_base_slot;
+      node["app_id"] = invite.app_id;
+      node["allow_browser"] = invite.allow_browser;
+      node["allow_pairing"] = invite.allow_pairing;
+      node["revoked"] = invite.revoked;
+      node["created_at"] = epoch_seconds(invite.created_at);
+      node["expires_at"] = epoch_seconds(invite.expires_at);
+      node["max_uses"] = invite.max_uses;
+      node["uses"] = invite.uses;
+      // Derived rather than left to the page: "can this link still be used" is the
+      // question the list is answering, and three clients would each get it subtly
+      // wrong on their own.
+      node["live"] = invite::policy::is_live(invite, now);
+      node["locked_for_seconds"] = invite::policy::lockout_remaining_seconds(invite, now);
+      return node;
+    }
+
+    /// Read a spec from a request body. Absent fields stay unset, which is what
+    /// makes the same parser usable for both create and update.
+    bool parse_spec(const nlohmann::json &input, invite::spec_t &spec, std::string &error) {
+      if (!input.is_object()) {
+        error = "Request body must be a JSON object";
+        return false;
+      }
+
+      if (input.contains("label")) {
+        if (!input["label"].is_string()) {
+          error = "label must be a string";
+          return false;
+        }
+        spec.label = input["label"].get<std::string>();
+      }
+
+      // A preset and a raw mask are both accepted; the preset wins so a client
+      // sending both cannot use the mask to smuggle bits past the named choice.
+      if (input.contains("preset")) {
+        if (!input["preset"].is_string()) {
+          error = "preset must be a string";
+          return false;
+        }
+        const auto name = input["preset"].get<std::string>();
+        const auto perm = preset_perm(name);
+        if (!perm) {
+          error = "Unknown preset: " + name + " (expected view, gamepad or full)";
+          return false;
+        }
+        spec.perm = sanitize_perm(*perm);
+      } else if (input.contains("perm")) {
+        if (!input["perm"].is_number_unsigned()) {
+          error = "perm must be an unsigned integer";
+          return false;
+        }
+        spec.perm = sanitize_perm(input["perm"].get<std::uint32_t>());
+      }
+
+      if (input.contains("gamepad_base_slot")) {
+        if (!input["gamepad_base_slot"].is_number_integer()) {
+          error = "gamepad_base_slot must be an integer";
+          return false;
+        }
+        const auto slot = input["gamepad_base_slot"].get<int>();
+        if (slot < 0 || slot > 15) {
+          error = "gamepad_base_slot must be between 0 and 15";
+          return false;
+        }
+        spec.gamepad_base_slot = slot;
+      }
+
+      if (input.contains("app_id")) {
+        if (!input["app_id"].is_number_integer()) {
+          error = "app_id must be an integer";
+          return false;
+        }
+        spec.app_id = input["app_id"].get<int>();
+      }
+
+      const auto read_bool = [&](const char *key, std::optional<bool> &out) {
+        if (!input.contains(key)) {
+          return true;
+        }
+        if (!input[key].is_boolean()) {
+          error = std::string(key) + " must be a boolean";
+          return false;
+        }
+        out = input[key].get<bool>();
+        return true;
+      };
+      if (!read_bool("allow_browser", spec.allow_browser)) {
+        return false;
+      }
+      if (!read_bool("allow_pairing", spec.allow_pairing)) {
+        return false;
+      }
+      if (!read_bool("revoked", spec.revoked)) {
+        return false;
+      }
+
+      if (input.contains("max_uses")) {
+        if (!input["max_uses"].is_number_integer() || input["max_uses"].get<int>() < 0) {
+          error = "max_uses must be a non-negative integer";
+          return false;
+        }
+        spec.max_uses = input["max_uses"].get<int>();
+      }
+
+      if (input.contains("expires_in_seconds")) {
+        if (!input["expires_in_seconds"].is_number_integer() || input["expires_in_seconds"].get<long long>() < 0) {
+          error = "expires_in_seconds must be a non-negative integer";
+          return false;
+        }
+        spec.expires_in_seconds = input["expires_in_seconds"].get<long long>();
+      }
+
+      return true;
+    }
+
+    std::optional<nlohmann::json> read_body(resp_https_t response, req_https_t request) {
+      std::stringstream ss;
+      ss << request->content.rdbuf();
+      const auto body = ss.str();
+      if (body.empty()) {
+        return nlohmann::json::object();
+      }
+      try {
+        return nlohmann::json::parse(body);
+      } catch (const std::exception &e) {
+        bad_request(response, request, std::string("Invalid JSON: ") + e.what());
+        return std::nullopt;
+      }
+    }
+  }  // namespace invites_api
+
+  /**
+   * @brief List every guest invite, newest first.
+   * @api_examples{/api/invites| GET| null}
+   */
+  void listInvites(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    nlohmann::json items = nlohmann::json::array();
+    for (const auto &invite : invite::list()) {
+      items.push_back(invites_api::to_owner_json(invite));
+    }
+    nlohmann::json output = nlohmann::json::object();
+    output["invites"] = items;
+    send_response(response, output);
+  }
+
+  /**
+   * @brief Create a guest invite, returning its link token and PIN.
+   * @api_examples{/api/invites| POST| {"label":"Brother","preset":"gamepad","allow_pairing":true}}
+   */
+  void createInvite(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    const auto input = invites_api::read_body(response, request);
+    if (!input) {
+      return;
+    }
+
+    invite::spec_t spec;
+    std::string error;
+    if (!invites_api::parse_spec(*input, spec, error)) {
+      bad_request(response, request, error);
+      return;
+    }
+    // An invite that names no permissions would be a link that grants nothing and
+    // look broken rather than safe, so the unspecified case gets the preset this
+    // feature exists for.
+    if (!spec.perm) {
+      spec.perm = invites_api::sanitize_perm(*invites_api::preset_perm("gamepad"));
+    }
+
+    const auto created = invite::create(spec);
+    BOOST_LOG(info) << "Invites: created '"sv << created.label << "' ("sv
+                    << invites_api::describe_perm(created.perm) << ")"sv;
+    send_response(response, invites_api::to_owner_json(created));
+  }
+
+  /**
+   * @brief Change a guest invite — relabel, re-scope, extend, or revoke it.
+   * @api_examples{/api/invites/@c id| PATCH| {"revoked":true}}
+   */
+  void updateInvite(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    if (request->path_match.size() < 2) {
+      bad_request(response, request, "Invite id required");
+      return;
+    }
+    const std::string id = request->path_match[1];
+
+    const auto input = invites_api::read_body(response, request);
+    if (!input) {
+      return;
+    }
+
+    invite::spec_t spec;
+    std::string error;
+    if (!invites_api::parse_spec(*input, spec, error)) {
+      bad_request(response, request, error);
+      return;
+    }
+
+    const auto updated = invite::update(id, spec);
+    if (!updated) {
+      not_found(response, request, "No such invite");
+      return;
+    }
+    send_response(response, invites_api::to_owner_json(*updated));
+  }
+
+  /**
+   * @brief Issue a fresh token and PIN, invalidating the link already sent.
+   * @api_examples{/api/invites/@c id/rotate| POST| null}
+   */
+  void rotateInvite(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    if (request->path_match.size() < 2) {
+      bad_request(response, request, "Invite id required");
+      return;
+    }
+
+    const auto rotated = invite::rotate(std::string(request->path_match[1]));
+    if (!rotated) {
+      not_found(response, request, "No such invite");
+      return;
+    }
+    BOOST_LOG(info) << "Invites: rotated '"sv << rotated->label << "'"sv;
+    send_response(response, invites_api::to_owner_json(*rotated));
+  }
+
+  /**
+   * @brief Forget a guest invite entirely.
+   *
+   * Revoking is usually better: a revoked invite still explains itself, where a
+   * deleted one is indistinguishable from a mistyped link.
+   * @api_examples{/api/invites/@c id| DELETE| null}
+   */
+  void deleteInvite(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    if (request->path_match.size() < 2) {
+      bad_request(response, request, "Invite id required");
+      return;
+    }
+
+    if (!invite::remove(std::string(request->path_match[1]))) {
+      not_found(response, request, "No such invite");
+      return;
+    }
+    nlohmann::json output = nlohmann::json::object();
+    output["status"] = true;
+    send_response(response, output);
   }
 
   /**
@@ -5855,6 +6208,11 @@ namespace confighttp {
 #endif
     register_api_route("^/api/logs$", "GET", getLogs);
     register_api_route("^/api/session/bitrate$", "POST", setSessionBitrate);
+    register_api_route("^/api/invites$", "GET", listInvites);
+    register_api_route("^/api/invites$", "POST", createInvite);
+    register_api_route("^/api/invites/([^/]+)$", "PATCH", updateInvite);
+    register_api_route("^/api/invites/([^/]+)$", "DELETE", deleteInvite);
+    register_api_route("^/api/invites/([^/]+)/rotate$", "POST", rotateInvite);
     register_api_route("^/api/config$", "GET", getConfig);
     register_api_route("^/api/config$", "POST", saveConfig);
     // Partial updates for config settings; merges with existing file and

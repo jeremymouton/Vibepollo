@@ -21,6 +21,7 @@
 #include "globals.h"
 #include "host_stats.h"
 #include "httpcommon.h"
+#include "invites.h"
 #include "logging.h"
 #include "main.h"
 #include "nvhttp.h"
@@ -812,6 +813,11 @@ int main(int argc, char *argv[]) {
   if (shutdown_event->peek()) {
     return lifetime::desired_exit_code;
   }
+
+  // Guest invites must be in memory before the config server answers its first
+  // request, or a link redeemed in the first moments after a restart would be
+  // refused as unknown.
+  invite::load();
 
   std::thread httpThread {nvhttp::start};
   std::thread configThread {confighttp::start};
