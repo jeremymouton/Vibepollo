@@ -91,4 +91,55 @@ namespace invite {
    */
   redemption_t redeem(const std::string &token, mode_e mode, const std::string &pin);
 
+
+  /**
+   * @brief Sessions belonging to redeemed guests.
+   *
+   * The most important property in this whole feature: a guest credential is never
+   * accepted by confighttp's authenticate(). Guests get their own cookie and their own
+   * store, and only the handful of routes that explicitly ask for a guest session accept
+   * one. That is fail-closed by construction — an admin route added later cannot become
+   * reachable by a guest, because a guest credential is not an authentication token
+   * anywhere in the system.
+   *
+   * Reusing the owner's SessionToken with a "guest:" username was considered and
+   * rejected for the mirror-image reason: it would make every existing authenticate()
+   * call site a place a guest might slip through, and keeping that correct would mean
+   * auditing all of them forever.
+   *
+   * In memory only. A guest session that does not survive a restart costs its holder one
+   * re-redeem with a link they already have, which is not worth persisting state for.
+   */
+  namespace guest {
+
+    inline constexpr std::string_view cookie_name {"__Host-apollo_guest"};
+
+    /// How long a redeemed session lasts. Long enough to finish a game, short enough
+    /// that a borrowed laptop does not stay admitted for a week.
+    inline constexpr std::chrono::hours session_ttl {8};
+
+    struct session_t {
+      std::string invite_id;
+      std::string label;  ///< carried for logging, so a guest is nameable in the log
+      std::uint32_t perm = 0;
+      int gamepad_base_slot = 0;
+      int app_id = -1;
+      policy::time_point_t expires_at {};
+    };
+
+    /// Mint a session for a successfully redeemed invite. Returns the cookie value.
+    std::string issue(const invite_t &invite);
+
+    /// Resolve a cookie value, or nothing when unknown or expired.
+    std::optional<session_t> lookup(const std::string &token);
+
+    /// Drop a session early — the guest leaving, or the owner revoking.
+    void revoke(const std::string &token);
+
+    /// Drop every session issued from one invite. Called when the owner revokes it, so
+    /// revoking a link also ejects whoever is already using it.
+    void revoke_for_invite(const std::string &invite_id);
+
+  }  // namespace guest
+
 }  // namespace invite

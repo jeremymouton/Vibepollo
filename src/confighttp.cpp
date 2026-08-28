@@ -2486,6 +2486,124 @@ namespace confighttp {
     send_response(response, output);
   }
 
+
+  // ── Guest join (UNAUTHENTICATED) ──────────────────────────────────────────
+  // The only routes in this file that anyone on the network may call without an
+  // account. Everything they can reach is bounded by the invite named in the
+  // path: they cannot enumerate invites, cannot see another invite, and cannot
+  // widen the one they hold. See docs/guest-invites.md.
+
+  namespace join_api {
+
+    /// The guest's view of an invite. Everything secret is absent by omission
+    /// rather than by filtering, so adding a field to invite_t cannot leak it
+    /// here by default.
+    nlohmann::json to_guest_json(const invite::invite_t &invite) {
+      nlohmann::json node = nlohmann::json::object();
+      node["label"] = invite.label;
+      node["allow_browser"] = invite.allow_browser;
+      node["allow_pairing"] = invite.allow_pairing;
+      node["permission_summary"] = invites_api::describe_perm(invite.perm);
+      node["live"] = invite::policy::is_live(invite, invite::policy::clock_t::now());
+      return node;
+    }
+
+    /// The session cookie a redeemed guest carries.
+    ///
+    /// __Host- requires Secure and Path=/ with no Domain, which is what we want:
+    /// the cookie cannot be set by a subdomain or scoped away from the app.
+    /// SameSite=Strict is doing real work here — it is the CSRF defence for the
+    /// guest routes, which have no CSRF token of their own.
+    std::string build_cookie(const std::string &token) {
+      return std::string(guest_cookie_name) + "=" + http::cookie_escape(token) +
+             "; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=" +
+             std::to_string(std::chrono::duration_cast<std::chrono::seconds>(invite::guest::session_ttl).count());
+    }
+
+    /// Refuse in the guest's language, with the coarse reason the policy allows.
+    void refuse(resp_https_t response, invite::policy::result_e result, int retry_after) {
+      nlohmann::json body = nlohmann::json::object();
+      body["error"] = invite::policy::public_reason(result);
+      if (retry_after > 0) {
+        body["retry_after_seconds"] = retry_after;
+      }
+      // 403 throughout rather than 404 for an unknown token: a different status
+      // for "no such invite" would tell a stranger which of their guesses named a
+      // real link, which is exactly what public_reason exists to avoid.
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/json");
+      response->write(SimpleWeb::StatusCode::client_error_forbidden, body.dump(), headers);
+    }
+  }  // namespace join_api
+
+  /**
+   * @brief What an invite link offers, before anyone types a PIN.
+   *
+   * Unauthenticated by design — this is the page a guest lands on. Returns only
+   * what is needed to render the choice, and the same refusal for an unknown,
+   * revoked or expired link.
+   * @api_examples{/api/join/@c token| GET| null}
+   */
+  void getJoinInfo(resp_https_t response, req_https_t request) {
+    if (request->path_match.size() < 2) {
+      join_api::refuse(response, invite::policy::result_e::unknown, 0);
+      return;
+    }
+
+    const auto found = invite::find_by_token(std::string(request->path_match[1]));
+    if (!found || !invite::policy::is_live(*found, invite::policy::clock_t::now())) {
+      join_api::refuse(response, invite::policy::result_e::unknown, 0);
+      return;
+    }
+    send_response(response, join_api::to_guest_json(*found));
+  }
+
+  /**
+   * @brief Redeem an invite link with its PIN, for the browser path.
+   *
+   * On success the guest gets a session cookie carrying a snapshot of the
+   * invite's grant. Unauthenticated by design.
+   * @api_examples{/api/join/@c token/redeem| POST| {"pin":"123456"}}
+   */
+  void redeemInvite(resp_https_t response, req_https_t request) {
+    if (request->path_match.size() < 2) {
+      join_api::refuse(response, invite::policy::result_e::unknown, 0);
+      return;
+    }
+
+    const auto input = invites_api::read_body(response, request);
+    if (!input) {
+      return;
+    }
+    if (!input->is_object() || !input->contains("pin") || !(*input)["pin"].is_string()) {
+      bad_request(response, request, "pin is required");
+      return;
+    }
+
+    const auto token = std::string(request->path_match[1]);
+    const auto outcome = invite::redeem(token, invite::mode_e::browser, (*input)["pin"].get<std::string>());
+
+    if (outcome.result != invite::policy::result_e::ok) {
+      BOOST_LOG(info) << "Invites: refused a browser redemption ("sv
+                      << static_cast<int>(outcome.result) << ") from "sv
+                      << request->remote_endpoint().address().to_string();
+      join_api::refuse(response, outcome.result, outcome.retry_after_seconds);
+      return;
+    }
+
+    const auto session_token = invite::guest::issue(outcome.invite);
+    BOOST_LOG(info) << "Invites: '"sv << outcome.invite.label << "' joined from "sv
+                    << request->remote_endpoint().address().to_string();
+
+    nlohmann::json body = join_api::to_guest_json(outcome.invite);
+    body["status"] = true;
+
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "application/json");
+    headers.emplace("Set-Cookie", join_api::build_cookie(session_token));
+    response->write(SimpleWeb::StatusCode::success_ok, body.dump(), headers);
+  }
+
   /**
    * @brief Serve a specific application's cover image by UUID.
    *        Looks for files named @c uuid with a supported image extension in the covers directory.
@@ -3876,7 +3994,11 @@ namespace confighttp {
   }
 
   void createWebRTCSession(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
+    // A redeemed guest may start a session without an owner login — but only the
+    // session their invite describes. Their grant is applied further down, after
+    // the body is parsed, by overwriting rather than defaulting.
+    const auto guest = invite::guest::lookup(extract_guest_token_from_cookie(request->header));
+    if (!guest && !authenticate(response, request)) {
       return;
     }
 
@@ -4130,6 +4252,19 @@ namespace confighttp {
       bad_request(response, request, capture_start_error->c_str());
       return;
     }
+    if (guest) {
+      // Overwritten, not validated. Whatever the guest sent in these three fields
+      // is discarded, so asking for more cannot get more — the only way a guest's
+      // grant changes is the owner editing the invite and the guest redeeming again.
+      options.input_permission = guest->perm & static_cast<std::uint32_t>(crypto::PERM::_all_inputs);
+      options.gamepad_base_slot = guest->gamepad_base_slot;
+      if (guest->app_id >= 0) {
+        options.app_id = guest->app_id;
+      }
+      BOOST_LOG(info) << "WebRTC: guest session for '"sv << guest->label << "' (perm "sv
+                      << *options.input_permission << ", pad slot "sv << guest->gamepad_base_slot << ")"sv;
+    }
+
     auto session = webrtc_stream::create_session(options);
     if (!session) {
       webrtc_stream::shutdown_all_sessions();
@@ -6213,6 +6348,9 @@ namespace confighttp {
     register_api_route("^/api/invites/([^/]+)$", "PATCH", updateInvite);
     register_api_route("^/api/invites/([^/]+)$", "DELETE", deleteInvite);
     register_api_route("^/api/invites/([^/]+)/rotate$", "POST", rotateInvite);
+    // Unauthenticated: gated by the token in the path, not by a session.
+    register_api_route("^/api/join/([^/]+)$", "GET", getJoinInfo);
+    register_api_route("^/api/join/([^/]+)/redeem$", "POST", redeemInvite);
     register_api_route("^/api/config$", "GET", getConfig);
     register_api_route("^/api/config$", "POST", saveConfig);
     // Partial updates for config settings; merges with existing file and

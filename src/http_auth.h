@@ -28,6 +28,7 @@
 namespace confighttp {
   inline constexpr std::string_view session_cookie_name {"__Host-apollo_session"};
   inline constexpr std::string_view refresh_cookie_name {"__Host-apollo_refresh"};
+  inline constexpr std::string_view guest_cookie_name {"__Host-apollo_guest"};
   using StatusCode = SimpleWeb::StatusCode;
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
   using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
@@ -474,6 +475,11 @@ namespace confighttp {
    * @return Token string (may be empty if not present).
    */
   std::string extract_session_token_from_cookie(const SimpleWeb::CaseInsensitiveMultimap &headers);
+
+  /// Guest invite session cookie. Deliberately NOT consulted by check_auth: a guest
+  /// credential must never satisfy authentication, only the specific invite routes that
+  /// ask for it by name. See docs/guest-invites.md.
+  std::string extract_guest_token_from_cookie(const SimpleWeb::CaseInsensitiveMultimap &headers);
   /**
    * @brief Extract refresh token from Cookie headers.
    * @param headers Case-insensitive header multimap.

@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <unordered_map>
 
 namespace invite {
 
@@ -193,6 +194,13 @@ namespace invite {
     if (spec.revoked) {
       invite->revoked = *spec.revoked;
     }
+    // Narrowing an invite must not leave a wider session already running on it.
+    // Sessions snapshot their grant at redemption, so the only way to take one
+    // back is to end it; revoking or re-scoping is exactly that intent.
+    const bool narrowed = (spec.revoked && *spec.revoked) || spec.perm || spec.gamepad_base_slot || spec.app_id;
+    if (narrowed) {
+      guest::revoke_for_invite(invite->id);
+    }
     if (spec.max_uses) {
       invite->max_uses = *spec.max_uses;
     }
@@ -222,6 +230,8 @@ namespace invite {
     // whoever was locked out guessing at it.
     invite->locked_until = {};
     invite->failed_attempts = 0;
+    // The old link is dead, so anything holding a session from it is too.
+    guest::revoke_for_invite(invite->id);
 
     const auto copy = *invite;
     save_locked();
@@ -240,6 +250,7 @@ namespace invite {
     if (g_invites.size() == before) {
       return false;
     }
+    guest::revoke_for_invite(id);
     save_locked();
     return true;
   }
@@ -282,5 +293,76 @@ namespace invite {
     }
     return out;
   }
+
+
+  namespace guest {
+
+    namespace {
+      /// Lock ordering: the invite list's g_mutex is always taken BEFORE this one
+      /// — update(), rotate() and remove() all call into here while holding it.
+      /// Nothing in this namespace takes g_mutex, which is what keeps that safe.
+      std::mutex g_guest_mutex;
+      std::unordered_map<std::string, session_t> g_sessions;
+
+      /// Same alphabet and length as a link token: this cookie is the whole credential
+      /// for a session, so it gets the same 192 bits.
+      constexpr std::size_t guest_token_length = 32;
+
+      /// Caller holds g_guest_mutex. Expired sessions are dropped lazily rather than on a
+      /// timer — the map only grows when someone redeems, and every lookup prunes.
+      void sweep_locked(policy::time_point_t now) {
+        for (auto it = g_sessions.begin(); it != g_sessions.end();) {
+          it = it->second.expires_at <= now ? g_sessions.erase(it) : std::next(it);
+        }
+      }
+    }  // namespace
+
+    std::string issue(const invite_t &invite) {
+      session_t session;
+      session.invite_id = invite.id;
+      session.label = invite.label;
+      // Snapshot the grant rather than pointing at the invite. Editing an invite must
+      // not silently widen a session already in flight; a guest who should lose access
+      // is ejected by revoke_for_invite instead, which is explicit.
+      session.perm = invite.perm;
+      session.gamepad_base_slot = invite.gamepad_base_slot;
+      session.app_id = invite.app_id;
+      session.expires_at = policy::clock_t::now() + session_ttl;
+
+      auto token = crypto::rand_alphabet(guest_token_length, token_alphabet);
+
+      std::lock_guard<std::mutex> lock(g_guest_mutex);
+      sweep_locked(policy::clock_t::now());
+      g_sessions.emplace(token, std::move(session));
+      return token;
+    }
+
+    std::optional<session_t> lookup(const std::string &token) {
+      if (token.empty()) {
+        return std::nullopt;
+      }
+      const auto now = policy::clock_t::now();
+      std::lock_guard<std::mutex> lock(g_guest_mutex);
+      sweep_locked(now);
+      const auto it = g_sessions.find(token);
+      if (it == g_sessions.end()) {
+        return std::nullopt;
+      }
+      return it->second;
+    }
+
+    void revoke(const std::string &token) {
+      std::lock_guard<std::mutex> lock(g_guest_mutex);
+      g_sessions.erase(token);
+    }
+
+    void revoke_for_invite(const std::string &invite_id) {
+      std::lock_guard<std::mutex> lock(g_guest_mutex);
+      for (auto it = g_sessions.begin(); it != g_sessions.end();) {
+        it = it->second.invite_id == invite_id ? g_sessions.erase(it) : std::next(it);
+      }
+    }
+
+  }  // namespace guest
 
 }  // namespace invite

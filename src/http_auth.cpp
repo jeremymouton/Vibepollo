@@ -1525,6 +1525,10 @@ namespace confighttp {
   std::string extract_refresh_token_from_cookie(const SimpleWeb::CaseInsensitiveMultimap &headers) {
     return make_request_auth_policy().extract_cookie(headers, refresh_cookie_name);
   }
+
+  std::string extract_guest_token_from_cookie(const SimpleWeb::CaseInsensitiveMultimap &headers) {
+    return make_request_auth_policy().extract_cookie(headers, guest_cookie_name);
+  }
 #endif
 
 }  // namespace confighttp
