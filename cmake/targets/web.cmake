@@ -48,11 +48,19 @@ if(SUNSHINE_NPM_EXECUTABLE)
         COMMAND "${CMAKE_COMMAND}" -E env
                 "SUNSHINE_WEB_OUTPUT_DIR=${SUNSHINE_WEB_OUTPUT_DIR}"
                 "${SUNSHINE_NPM_EXECUTABLE}" run build
+        # The guest invite landing page is deliberately standalone — no framework,
+        # no bundle, nothing shared with the admin UI (see docs/guest-invites.md) —
+        # so no vite build emits it. Copied explicitly, and AFTER both builds,
+        # because vite empties its output directory and would take it with it.
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${SUNSHINE_WEB_SOURCE_DIR}/join.html"
+                "${SUNSHINE_WEB_ROOT_OUTPUT_DIR}/join.html"
         COMMAND "${CMAKE_COMMAND}" -E touch "${SUNSHINE_WEB_STAMP}"
         WORKING_DIRECTORY "${SUNSHINE_WEB_SOURCE_DIR}"
         BYPRODUCTS
             "${SUNSHINE_LEGACY_WEB_OUTPUT_DIR}/index.html"
             "${SUNSHINE_WEB_OUTPUT_DIR}/index.html"
+            "${SUNSHINE_WEB_ROOT_OUTPUT_DIR}/join.html"
         DEPENDS ${SUNSHINE_WEB_SOURCES}
         COMMENT "Building the Vibepollo browser interface"
         USES_TERMINAL
@@ -60,7 +68,8 @@ if(SUNSHINE_NPM_EXECUTABLE)
     add_custom_target(web_ui DEPENDS
         "${SUNSHINE_WEB_STAMP}"
         "${SUNSHINE_LEGACY_WEB_OUTPUT_DIR}/index.html"
-        "${SUNSHINE_WEB_OUTPUT_DIR}/index.html")
+        "${SUNSHINE_WEB_OUTPUT_DIR}/index.html"
+        "${SUNSHINE_WEB_ROOT_OUTPUT_DIR}/join.html")
 else()
     add_custom_target(web_ui
         COMMAND "${CMAKE_COMMAND}" -E echo "npm is required to build the Vibepollo browser interface"

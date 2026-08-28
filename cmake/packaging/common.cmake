@@ -42,6 +42,9 @@ install(CODE "
     if(NOT EXISTS \"${CMAKE_CURRENT_BINARY_DIR}/assets/web/v2/index.html\")
         message(FATAL_ERROR \"Vibepollo v2 Web UI is missing. Build the web_ui target before packaging.\")
     endif()
+    if(NOT EXISTS \"${CMAKE_CURRENT_BINARY_DIR}/assets/web/join.html\")
+        message(FATAL_ERROR \"Guest invite landing page is missing. Build the web_ui target before packaging.\")
+    endif()
 " COMPONENT assets)
 install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets/web/"
         DESTINATION "${SUNSHINE_ASSETS_DIR}/web"
