@@ -136,6 +136,11 @@ namespace invite {
     /// Drop a session early — the guest leaving, or the owner revoking.
     void revoke(const std::string &token);
 
+    /// How many guests are connected on this invite right now. Drives the owner's
+    /// "someone is in" indicator, which is a different question from `uses` —
+    /// that counts redemptions ever, this counts people currently here.
+    int active_count(const std::string &invite_id);
+
     /// Drop every session issued from one invite. Called when the owner revokes it, so
     /// revoking a link also ejects whoever is already using it.
     void revoke_for_invite(const std::string &invite_id);

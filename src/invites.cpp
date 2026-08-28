@@ -364,6 +364,19 @@ namespace invite {
       g_sessions.erase(token);
     }
 
+    int active_count(const std::string &invite_id) {
+      const auto now = policy::clock_t::now();
+      std::lock_guard<std::mutex> lock(g_guest_mutex);
+      sweep_locked(now);
+      int count = 0;
+      for (const auto &entry : g_sessions) {
+        if (entry.second.invite_id == invite_id) {
+          ++count;
+        }
+      }
+      return count;
+    }
+
     void revoke_for_invite(const std::string &invite_id) {
       std::lock_guard<std::mutex> lock(g_guest_mutex);
       for (auto it = g_sessions.begin(); it != g_sessions.end();) {

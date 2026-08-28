@@ -88,6 +88,20 @@ namespace system_tray {
   void update_tray_paired(std::string device_name);
 
   void update_tray_client_connected(std::string client_name);
+
+  /**
+   * @brief Notify that a guest joined through an invite link.
+   *
+   * Distinct from update_tray_client_connected, which covers paired GameStream
+   * clients. A guest arriving on an invite is someone with no account and no
+   * paired certificate, so the notification names what they were granted — the
+   * owner should be able to tell a gamepad-only guest from a full-control one
+   * without opening anything.
+   *
+   * @param label What the invite was called, e.g. "Brother"
+   * @param access Human-readable grant, e.g. "Gamepad only"
+   */
+  void update_tray_guest_joined(std::string label, std::string access);
   /**
    * @brief Spawns a notification when ViGEm is missing.
    * Clicking it opens the Web UI Dashboard for more information.

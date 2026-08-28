@@ -54,6 +54,7 @@
 #include "http_auth.h"
 #include "httpcommon.h"
 #include "invites.h"
+#include "system_tray.h"
 #include "platform/common.h"
 #ifdef _WIN32
   #include "src/platform/windows/image_convert.h"
@@ -2244,6 +2245,8 @@ namespace confighttp {
       // wrong on their own.
       node["live"] = invite::policy::is_live(invite, now);
       node["locked_for_seconds"] = invite::policy::lockout_remaining_seconds(invite, now);
+      // Distinct from "uses": that counts redemptions ever, this counts who is here now.
+      node["active_sessions"] = invite::guest::active_count(invite.id);
       return node;
     }
 
@@ -4373,6 +4376,12 @@ namespace confighttp {
       }
       BOOST_LOG(info) << "WebRTC: guest session for '"sv << guest->label << "' (perm "sv
                       << *options.input_permission << ", pad slot "sv << guest->gamepad_base_slot << ")"sv;
+#ifdef _WIN32
+      // Someone with no account just got input on this machine. That should be
+      // visible without going looking for it, and it should say what they were
+      // granted — gamepad-only and full-control are very different guests.
+      system_tray::update_tray_guest_joined(guest->label, invites_api::describe_perm(guest->perm));
+#endif
     }
 
     auto session = webrtc_stream::create_session(options);

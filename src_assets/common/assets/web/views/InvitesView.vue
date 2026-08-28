@@ -8,7 +8,7 @@
  * answer computed in one place rather than three clients each decoding a
  * bitmask slightly differently.
  */
-import { computed, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 
 import { ApiError, apiDelete, apiGet, apiPatch, apiPost } from '@/api/client';
@@ -42,6 +42,7 @@ interface Invite {
   uses: number;
   live: boolean;
   locked_for_seconds: number;
+  active_sessions: number;
 }
 
 const { t } = useI18n();
@@ -74,6 +75,15 @@ function fullLink(invite: Invite): string {
 }
 
 function statusOf(invite: Invite): { label: string; tone: StatusTone } {
+  // Ranked above everything else on purpose: "someone is connected right now" is
+  // the fact the owner most needs off this page, and it stays true even for an
+  // invite that has since been revoked or run out of uses.
+  if (invite.active_sessions > 0) {
+    return {
+      label: t('ui.invites.status_connected', { count: invite.active_sessions }),
+      tone: 'info',
+    };
+  }
   if (invite.revoked) return { label: t('ui.invites.status_revoked'), tone: 'danger' };
   if (!invite.live) return { label: t('ui.invites.status_spent'), tone: 'neutral' };
   if (invite.locked_for_seconds > 0)
@@ -197,7 +207,19 @@ async function copy(text: string, message: string): Promise<void> {
   }
 }
 
-onMounted(load);
+let refresh: ReturnType<typeof setInterval> | undefined;
+
+onMounted(() => {
+  load();
+  // Someone joining or leaving is not something the owner triggers, so the page
+  // has to ask. Five seconds is fast enough to feel live and slow enough to be
+  // free.
+  refresh = setInterval(load, 5000);
+});
+
+onBeforeUnmount(() => {
+  if (refresh) clearInterval(refresh);
+});
 </script>
 
 <template>
@@ -282,7 +304,12 @@ onMounted(load);
     />
 
     <ul v-else class="list">
-      <li v-for="invite in invites" :key="invite.id" class="card">
+      <li
+        v-for="invite in invites"
+        :key="invite.id"
+        class="card"
+        :class="{ 'card--connected': invite.active_sessions > 0 }"
+      >
         <header class="card__head">
           <div>
             <h3>{{ invite.label }}</h3>
@@ -440,6 +467,11 @@ onMounted(load);
   padding: 16px;
   border: 1px solid var(--color-border, #2c313a);
   border-radius: 12px;
+}
+
+.card--connected {
+  border-color: var(--color-accent, #4f8cff);
+  box-shadow: inset 3px 0 0 var(--color-accent, #4f8cff);
 }
 
 .card__head {

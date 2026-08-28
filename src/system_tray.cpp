@@ -605,6 +605,31 @@ namespace system_tray {
     });
   }
 
+  void update_tray_guest_joined(std::string label, std::string access) {
+    run_on_tray_thread([label = std::move(label), access = std::move(access)]() {
+      tray.notification_title = nullptr;
+      tray.notification_text = nullptr;
+      tray.notification_cb = nullptr;
+      tray.notification_icon = nullptr;
+      tray.icon = TRAY_ICON;
+
+      char msg[256];
+      snprintf(msg, std::size(msg), "%s joined using an invite link. Access: %s.", label.c_str(), access.c_str());
+  #ifdef _WIN32
+      auto msg_acp = utf8ToAcp(msg);
+      strncpy(msg, msg_acp.c_str(), std::size(msg) - 1);
+      msg[std::size(msg) - 1] = '\0';
+  #endif
+      tray.notification_title = "Guest Joined";
+      static std::string s_guest_text;
+      s_guest_text = msg;
+      tray.notification_text = s_guest_text.c_str();
+      tray.notification_icon = TRAY_ICON;
+      tray.tooltip = PROJECT_NAME;
+      tray_update(&tray);
+    });
+  }
+
   void update_tray_vigem_missing() {
     run_on_tray_thread([]() {
       tray.notification_title = nullptr;

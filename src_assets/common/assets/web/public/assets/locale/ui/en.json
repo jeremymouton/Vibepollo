@@ -2001,7 +2001,8 @@
       "restore": "Un-revoke",
       "delete": "Delete",
       "delete_title": "Delete this invite?",
-      "delete_description": "Anyone using it right now will be disconnected. Revoking instead keeps the record, so a refused link is still explicable."
+      "delete_description": "Anyone using it right now will be disconnected. Revoking instead keeps the record, so a refused link is still explicable.",
+      "status_connected": "{count} connected now"
     }
   }
 }
