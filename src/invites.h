@@ -1,0 +1,94 @@
+/**
+ * @file src/invites.h
+ * @brief Guest invite storage — the owner's list of links, and redeeming one.
+ *
+ * The rules live in invite_policy.h and are pure. This is the part that has state: an
+ * in-memory list guarded by a mutex, persisted to invites.json beside the state file.
+ *
+ * Kept out of nvhttp's own state file on purpose. Invites are written far more often
+ * than pairings — every redemption bumps a counter, every wrong PIN bumps another — and
+ * a corrupt invite file must never be able to cost the owner their paired clients.
+ *
+ * See docs/guest-invites.md.
+ */
+#pragma once
+
+#include "invite_policy.h"
+
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace invite {
+
+  using policy::invite_t;
+  using policy::mode_e;
+  using policy::result_e;
+
+  /// What an owner may set when creating or editing an invite. Everything is optional on
+  /// a PATCH; on create, the defaults produce a browser-only, gamepad-only invite that
+  /// expires in a day, which is the shape almost every invite wants.
+  struct spec_t {
+    std::optional<std::string> label;
+    std::optional<std::uint32_t> perm;
+    std::optional<int> gamepad_base_slot;
+    std::optional<int> app_id;
+    std::optional<bool> allow_browser;
+    std::optional<bool> allow_pairing;
+    std::optional<bool> revoked;
+    std::optional<int> max_uses;
+    /// Seconds from now. 0 means "never expires"; absent on PATCH leaves it alone.
+    std::optional<long long> expires_in_seconds;
+  };
+
+  /// Outcome of a redemption attempt, carrying what the caller needs to act on it.
+  struct redemption_t {
+    result_e result;
+    /// Populated only when result == ok. A copy, so the caller never holds the lock.
+    invite_t invite;
+    /// Seconds to wait, when refused for a lockout.
+    int retry_after_seconds = 0;
+  };
+
+  /// Read invites.json. Safe to call when the file does not exist. Called once at start.
+  void load();
+
+  /// Every invite, newest first. Includes the token and PIN — this is the owner's view,
+  /// and callers must never expose it to a guest.
+  std::vector<invite_t> list();
+
+  /// One invite by id, or nothing.
+  std::optional<invite_t> find(const std::string &id);
+
+  /// Create an invite, generating its id, token and PIN. Persists before returning.
+  invite_t create(const spec_t &spec);
+
+  /// Apply the set fields of @p spec to an existing invite. Persists on success.
+  std::optional<invite_t> update(const std::string &id, const spec_t &spec);
+
+  /// New token and PIN for an existing invite, invalidating the link already sent.
+  std::optional<invite_t> rotate(const std::string &id);
+
+  /// Forget an invite entirely. Prefer setting revoked, which keeps the refusal explicable.
+  bool remove(const std::string &id);
+
+  /**
+   * @brief Look up an invite by its link token, without redeeming it.
+   *
+   * For the landing page, which has to say what the link offers before anyone types a
+   * PIN. The returned invite still carries its secrets, so callers must project it down
+   * to the guest-safe fields.
+   */
+  std::optional<invite_t> find_by_token(const std::string &token);
+
+  /**
+   * @brief Attempt to redeem a link token with a PIN.
+   *
+   * Evaluates and records the outcome under one lock, so two guests racing on the last
+   * use of an invite cannot both win, and persists whatever changed. An unknown token
+   * takes the same path as a known one, so a token that does not exist is not answered
+   * faster than one that does.
+   */
+  redemption_t redeem(const std::string &token, mode_e mode, const std::string &pin);
+
+}  // namespace invite
