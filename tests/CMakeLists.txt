@@ -342,6 +342,8 @@ sunshine_register_component(NAME test_component_file_handler TEST_SOURCE unit/te
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/file_handler_core.cpp")
 sunshine_register_component(NAME test_component_state_storage TEST_SOURCE unit/test_state_storage.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/state_storage_policy.cpp")
+sunshine_register_component(NAME test_component_invite_policy TEST_SOURCE unit/test_invite_policy.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/invite_policy.cpp")
 sunshine_register_component(NAME test_component_http_auth TEST_SOURCE unit/test_http_auth.cpp
     EXTRA_TEST_SOURCES "${CMAKE_CURRENT_LIST_DIR}/unit/test_confighttp.cpp"
     PRODUCT_SOURCES
