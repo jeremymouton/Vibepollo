@@ -48,6 +48,8 @@ interface Invite {
 const { t } = useI18n();
 
 const invites = ref<Invite[]>([]);
+// Set from /api/invites — the `public_base_url` setting, or '' when unset.
+const linkBase = ref('');
 const loading = ref(false);
 const error = ref('');
 const notice = ref('');
@@ -67,11 +69,12 @@ const draft = ref({
   max_uses: 0,
 });
 
-/// The host cannot know the origin it is reached on — behind a reverse proxy it
-/// may be a name it has never heard of — so the API returns a relative path and
-/// the full link is assembled here, in the one place that does know.
+/// The API returns a relative path, so the origin is chosen here. Prefer the
+/// configured public base URL: the owner is looking at this page on the LAN, so
+/// `window.location.origin` is a private address the guest cannot open. Falling
+/// back to it keeps a LAN-only setup working with nothing to configure.
 function fullLink(invite: Invite): string {
-  return window.location.origin + invite.path;
+  return (linkBase.value || window.location.origin) + invite.path;
 }
 
 function statusOf(invite: Invite): { label: string; tone: StatusTone } {
@@ -116,8 +119,9 @@ async function load(): Promise<void> {
   loading.value = true;
   error.value = '';
   try {
-    const response = await apiGet<{ invites?: Invite[] }>('/api/invites');
+    const response = await apiGet<{ invites?: Invite[]; link_base?: string }>('/api/invites');
     invites.value = Array.isArray(response.invites) ? response.invites : [];
+    linkBase.value = (response.link_base ?? '').replace(/\/+$/, '');
   } catch (err) {
     error.value = describe(err);
   } finally {

@@ -2381,6 +2381,9 @@ namespace confighttp {
     }
     nlohmann::json output = nlohmann::json::object();
     output["invites"] = items;
+    // Each invite carries a relative path; this is the origin to hang it off.
+    // Empty when unconfigured, and the page then falls back to its own origin.
+    output["link_base"] = config::nvhttp.public_base_url;
     send_response(response, output);
   }
 

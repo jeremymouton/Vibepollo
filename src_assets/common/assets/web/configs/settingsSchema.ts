@@ -698,6 +698,8 @@ export const settingsCategories: SettingsCategory[] = [
           number('port', { min: 1019, max: 65514, restartRequired: true }),
           text('bind_address', { monospace: true, stacked: true }),
           text('external_ip', { monospace: true, stacked: true }),
+          text('public_base_url', { monospace: true, stacked: true }),
+          text('webrtc_ice_servers', { monospace: true, stacked: true }),
           number('ping_timeout', { min: 0, step: 1 }),
         ],
       },

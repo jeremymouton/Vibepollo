@@ -307,6 +307,17 @@ namespace config {
      * remains supported so existing deployments keep working.
      */
     std::string webrtc_ice_servers;
+
+    /**
+     * @brief Public origin that guest links should point at, e.g. https://host.example.com
+     *
+     * The owner reaches this UI on the LAN, so the address in the browser bar is
+     * a private one a guest can never open. The host cannot discover its public
+     * name on its own — the reverse proxy in front of it is the only thing that
+     * knows — so it has to be told once. Empty means "use whatever origin the
+     * page was served from", which is right for a LAN-only setup.
+     */
+    std::string public_base_url;
   };
 
   struct input_t {

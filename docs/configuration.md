@@ -2056,6 +2056,32 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### public_base_url
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The address guests reach this host on, used to build guest invite links.
+            You are looking at this page on your local network, so the address in your
+            browser bar is one a guest cannot open; the host cannot discover its own
+            public name, because only the reverse proxy in front of it knows that.
+            Leave empty on a local network and invite links use whatever address the
+            invites page was opened on. No trailing slash.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">empty (use the address the page was served from)</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            public_base_url = https://play.example.com
+            @endcode</td>
+    </tr>
+</table>
+
 ### lan_encryption_mode
 
 <table>
