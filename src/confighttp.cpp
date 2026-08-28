@@ -2487,6 +2487,26 @@ namespace confighttp {
   }
 
 
+  /**
+   * @brief Serve the guest landing page for an invite link.
+   *
+   * Unauthenticated, and deliberately a standalone file rather than the admin
+   * SPA: this is the one page shown to someone who is not the owner, so their
+   * browser is never handed the app's own bundle. The token is not templated in
+   * — the page reads it from its own URL — which keeps this a static asset and
+   * removes any chance of injecting it into the markup.
+   */
+  void getJoinPage(resp_https_t response, [[maybe_unused]] req_https_t request) {
+    print_req(request);
+    std::string content = file_handler::read_file(WEB_DIR "join.html");
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "text/html; charset=utf-8");
+    // The page is per-invite and must not be cached by anything in between.
+    headers.emplace("Cache-Control", "no-store");
+    headers.emplace("X-Frame-Options", "DENY");
+    response->write(content, headers);
+  }
+
   // ── Guest join (UNAUTHENTICATED) ──────────────────────────────────────────
   // The only routes in this file that anyone on the network may call without an
   // account. Everything they can reach is bounded by the invite named in the
@@ -6438,6 +6458,7 @@ namespace confighttp {
     register_api_route("^/api/token/([a-fA-F0-9]+)$", "DELETE", revokeApiToken);
     // Session validation endpoint used by the web UI to detect HttpOnly session cookies
     server.resource["^/api-tokens/?$"]["GET"] = getTokenPage;
+    server.resource["^/join/([^/]+)/?$"]["GET"] = getJoinPage;
     register_api_route("^/api/auth/login$", "POST", loginUser);
     register_api_route("^/api/auth/refresh$", "POST", refreshSession);
     register_api_route("^/api/auth/logout$", "POST", logoutUser);
@@ -6508,6 +6529,7 @@ namespace confighttp {
     headers.emplace("Content-Type", "text/html; charset=utf-8");
     response->write(content, headers);
   }
+
 
   /**
    * @brief Converts a string representation of a token scope to its corresponding TokenScope enum value.

@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Join</title>
+    <!--
+      Deliberately standalone: no framework, no admin bundle, no shared layout.
+
+      This is the one page in the product shown to someone who is not the owner and
+      may never be trusted, so it loads nothing that the admin UI loads. Keeping it
+      a single self-contained file means the guest's browser cannot be handed any
+      of the app's own JavaScript, and the page cannot drift into depending on it.
+    -->
+    <style>
+      :root {
+        --bg: #14161a;
+        --card: #1d2026;
+        --line: #2c313a;
+        --text: #e8eaed;
+        --muted: #9aa1ab;
+        --accent: #4f8cff;
+        --bad: #ff6b6b;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--text);
+        font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      .card {
+        width: 100%;
+        max-width: 420px;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 28px;
+      }
+      h1 {
+        margin: 0 0 4px;
+        font-size: 22px;
+      }
+      .sub {
+        margin: 0 0 22px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .grant {
+        display: inline-block;
+        margin-bottom: 22px;
+        padding: 5px 11px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      label {
+        display: block;
+        margin-bottom: 7px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      input[type="text"] {
+        width: 100%;
+        padding: 13px 14px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        background: #0f1114;
+        color: var(--text);
+        font-size: 22px;
+        letter-spacing: 0.32em;
+        text-align: center;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      input[type="text"]:focus {
+        outline: 2px solid var(--accent);
+        outline-offset: 1px;
+      }
+      button {
+        width: 100%;
+        margin-top: 16px;
+        padding: 13px;
+        border: 0;
+        border-radius: 9px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .msg {
+        margin-top: 16px;
+        padding: 11px 13px;
+        border-radius: 9px;
+        font-size: 14px;
+        display: none;
+      }
+      .msg.bad {
+        display: block;
+        background: rgba(255, 107, 107, 0.12);
+        color: var(--bad);
+      }
+      .choices {
+        display: none;
+        margin-top: 4px;
+      }
+      .choice {
+        display: block;
+        width: 100%;
+        margin-top: 10px;
+        padding: 15px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #0f1114;
+        color: var(--text);
+        text-align: left;
+        text-decoration: none;
+        cursor: pointer;
+      }
+      .choice b {
+        display: block;
+        font-size: 15px;
+      }
+      .choice span {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .hidden {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1 id="title">Checking your invite…</h1>
+      <p class="sub" id="subtitle">One moment.</p>
+      <div class="grant hidden" id="grant"></div>
+
+      <form id="pin-form" class="hidden" autocomplete="off">
+        <label for="pin">Enter the PIN you were sent</label>
+        <input
+          id="pin"
+          name="pin"
+          type="text"
+          inputmode="numeric"
+          maxlength="6"
+          pattern="[0-9]*"
+          aria-describedby="msg"
+        />
+        <button type="submit" id="submit">Join</button>
+      </form>
+
+      <div class="choices" id="choices">
+        <button class="choice" id="choice-browser" type="button">
+          <b>Play in this browser</b>
+          <span>Nothing to install. A controller is recommended.</span>
+        </button>
+        <div class="choice hidden" id="choice-pair">
+          <b>Use your Moonlight client</b>
+          <span id="pair-hint">Pair with the PIN shown in Moonlight.</span>
+        </div>
+      </div>
+
+      <div class="msg" id="msg" role="alert" aria-live="polite"></div>
+    </main>
+
+    <script>
+      (function () {
+        'use strict';
+
+        // The token is the last path segment. Read from the URL rather than
+        // templated into the page so this file stays a static asset.
+        const token = decodeURIComponent(
+          window.location.pathname.replace(/\/+$/, '').split('/').pop() || ''
+        );
+
+        const el = (id) => document.getElementById(id);
+        const show = (node, on) => node.classList.toggle('hidden', !on);
+
+        function fail(text) {
+          el('title').textContent = 'This link will not work';
+          el('subtitle').textContent = '';
+          show(el('grant'), false);
+          show(el('pin-form'), false);
+          el('choices').style.display = 'none';
+          const m = el('msg');
+          m.className = 'msg bad';
+          m.textContent = text;
+        }
+
+        function note(text) {
+          const m = el('msg');
+          m.className = text ? 'msg bad' : 'msg';
+          m.textContent = text || '';
+        }
+
+        async function json(url, options) {
+          const res = await fetch(url, options);
+          let body = {};
+          try {
+            body = await res.json();
+          } catch (e) {
+            /* an empty or non-JSON body is handled by the caller via res.ok */
+          }
+          return { ok: res.ok, body };
+        }
+
+        // The redeem POST is a state change, so it carries a CSRF token exactly
+        // as every other mutation in the app does. Issuing one grants no
+        // authority, so this endpoint is reachable without a session.
+        async function csrfToken() {
+          const { ok, body } = await json('/api/csrf-token');
+          return ok && body.csrf_token ? body.csrf_token : '';
+        }
+
+        async function load() {
+          if (!token) {
+            fail('This invite link is no longer valid.');
+            return;
+          }
+          const { ok, body } = await json('/api/join/' + encodeURIComponent(token));
+          if (!ok || !body.live) {
+            fail(body.error || 'This invite link is no longer valid.');
+            return;
+          }
+
+          el('title').textContent = body.label ? 'Hi, ' + body.label : 'You have been invited';
+          el('subtitle').textContent = 'Enter your PIN to join the game.';
+          el('grant').textContent = body.permission_summary || '';
+          show(el('grant'), Boolean(body.permission_summary));
+          show(el('pin-form'), true);
+          el('pin').focus();
+
+          // Remembered so the choice screen can offer only what this invite allows.
+          window.__invite = body;
+        }
+
+        async function redeem(event) {
+          event.preventDefault();
+          const pin = el('pin').value.trim();
+          if (!pin) {
+            note('Enter the PIN you were sent.');
+            return;
+          }
+
+          el('submit').disabled = true;
+          note('');
+
+          const { ok, body } = await json('/api/join/' + encodeURIComponent(token) + '/redeem', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-CSRF-Token': await csrfToken(),
+            },
+            body: JSON.stringify({ pin }),
+          });
+
+          el('submit').disabled = false;
+
+          if (!ok) {
+            let text = body.error || 'That did not work.';
+            if (body.retry_after_seconds) {
+              text += ' Try again in ' + body.retry_after_seconds + 's.';
+            }
+            note(text);
+            el('pin').select();
+            return;
+          }
+
+          offerWaysIn(body);
+        }
+
+        function offerWaysIn(invite) {
+          el('title').textContent = "You're in";
+          el('subtitle').textContent = 'Choose how you want to play.';
+          show(el('pin-form'), false);
+          note('');
+          el('choices').style.display = 'block';
+
+          show(el('choice-browser'), invite.allow_browser !== false);
+          show(el('choice-pair'), invite.allow_pairing === true);
+
+          el('choice-browser').addEventListener('click', function () {
+            // The session cookie is already set, so the stream page can start a
+            // session without any further credential.
+            window.location.href = '/webrtc';
+          });
+        }
+
+        el('pin-form').addEventListener('submit', redeem);
+        load().catch(function () {
+          fail('Could not reach the host. It may be offline.');
+        });
+      })();
+    </script>
+  </body>
+</html>
