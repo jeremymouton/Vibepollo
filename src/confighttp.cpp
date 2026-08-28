@@ -637,18 +637,34 @@ namespace confighttp {
   }
 
   nlohmann::json load_webrtc_ice_servers() {
-    auto env = std::getenv("SUNSHINE_WEBRTC_ICE_SERVERS");
-    if (!env || !*env) {
-      return nlohmann::json::array();
+    // The config file wins. This used to be reachable only through an environment
+    // variable, which on Windows meant editing the service's registry key — an
+    // absurd requirement for the one setting that decides whether a remote guest
+    // can connect at all. The variable is still honoured so existing deployments
+    // keep working, but it is now the fallback, not the only way in.
+    const auto parse = [](const char *source, const std::string &raw) -> std::optional<nlohmann::json> {
+      if (raw.empty()) {
+        return std::nullopt;
+      }
+      try {
+        auto parsed = nlohmann::json::parse(raw);
+        if (parsed.is_array()) {
+          return parsed;
+        }
+        BOOST_LOG(warning) << "WebRTC: "sv << source << " must be a JSON array of ICE servers"sv;
+      } catch (const std::exception &e) {
+        BOOST_LOG(warning) << "WebRTC: invalid "sv << source << ": "sv << e.what();
+      }
+      return std::nullopt;
+    };
+
+    if (auto from_config = parse("webrtc_ice_servers", config::nvhttp.webrtc_ice_servers)) {
+      return *from_config;
     }
 
-    try {
-      auto parsed = nlohmann::json::parse(env);
-      if (parsed.is_array()) {
-        return parsed;
-      }
-    } catch (const std::exception &e) {
-      BOOST_LOG(warning) << "WebRTC: invalid SUNSHINE_WEBRTC_ICE_SERVERS: "sv << e.what();
+    const auto *env = std::getenv("SUNSHINE_WEBRTC_ICE_SERVERS");
+    if (auto from_env = parse("SUNSHINE_WEBRTC_ICE_SERVERS", env ? env : "")) {
+      return *from_env;
     }
 
     return nlohmann::json::array();

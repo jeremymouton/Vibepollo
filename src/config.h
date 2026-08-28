@@ -294,6 +294,19 @@ namespace config {
     std::string vibeshine_file_state;
 
     std::string external_ip;
+
+    /**
+     * @brief ICE servers for the browser WebRTC client, as a JSON array.
+     *
+     * Empty means no STUN and no TURN, which is LAN-only: neither end ever learns
+     * its public address, so a remote guest's browser and the host never find a
+     * media path. The page still loads, because that goes through the reverse
+     * proxy — only the video is missing, which makes it a confusing failure.
+     *
+     * Overrides SUNSHINE_WEBRTC_ICE_SERVERS when set. That environment variable
+     * remains supported so existing deployments keep working.
+     */
+    std::string webrtc_ice_servers;
   };
 
   struct input_t {

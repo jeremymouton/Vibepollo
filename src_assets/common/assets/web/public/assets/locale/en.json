@@ -998,10 +998,6 @@
     "realtime_stats_show_host_charts": "Show History Charts Card",
     "realtime_stats_show_session_history": "Show Session History Card",
     "vibeshine_file_state": "Vibepollo state file",
-    "virtual_display_driver_label": "Virtual Display Driver",
-    "virtual_display_driver_desc": "The Vibepollo Display Driver is the recommended default for virtual displays. Select SudoVDA (legacy) only if you need the previous driver — both stay installed, so you can switch back at any time.",
-    "virtual_display_driver_vibeshine_option": "Vibepollo Display Driver (recommended, default)",
-    "virtual_display_driver_sudovda_option": "SudoVDA (legacy)",
     "virtual_display_mode_disabled_win10": "Use Physical Display — Default on Windows 10",
     "virtual_display_mode_per_client_plain": "Virtual Display (Per Client)",
     "virtual_display_mode_step_hint_win10": "Select which display Vibepollo should prepare. On Windows 10 the physical display with DXGI capture is the default: the Windows 11 capture pipeline that makes virtual screens worthwhile (WGC frame-generation capture at 4× refresh) isn't available here. You can still enable a virtual display manually, but frame generation capture and pacing will have issues on Windows 10.",
@@ -1069,7 +1065,9 @@
     "limit_framerate": "Limit frame rate",
     "nvenc_temporal_aq": "NVIDIA temporal adaptive quantization",
     "pacing_max_bitrate_kbps": "Pacing maximum bitrate (Kbps)",
-    "packetsize": "Network packet size"
+    "packetsize": "Network packet size",
+    "webrtc_ice_servers": "WebRTC ICE servers",
+    "webrtc_ice_servers_desc": "STUN and TURN servers for the browser client, as a JSON array. Leave empty for local network only. Without a STUN server, guests outside your network can open the page but will never receive video."
   },
   "index": {
     "description": "Vibepollo is a self-hosted game stream host for Moonlight.",

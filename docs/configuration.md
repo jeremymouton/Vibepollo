@@ -2031,6 +2031,31 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### webrtc_ice_servers
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            STUN and TURN servers for the browser client, as a JSON array. Without at
+            least one STUN server the browser only ever learns its own LAN address, so a
+            guest outside your network can load the page but will never receive video.
+            Add a TURN server as well for guests whose network blocks direct connections.
+            Overrides the SUNSHINE_WEBRTC_ICE_SERVERS environment variable.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">empty (local network only)</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            webrtc_ice_servers = [{"urls":["stun:stun.example.com:3478"]},{"urls":["turn:turn.example.com:3478"],"username":"user","credential":"secret"}]
+            @endcode</td>
+    </tr>
+</table>
+
 ### lan_encryption_mode
 
 <table>
