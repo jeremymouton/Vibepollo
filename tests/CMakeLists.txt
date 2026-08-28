@@ -43,23 +43,41 @@ endfunction()
 
 function(sunshine_extract_config_source_options output_variable)
     file(READ "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/config.cpp" _config_source)
+    # CMake's regex engine does not interpret \t or \n inside a bracket class, so
+    # "[ \t\r\n]*" only ever matched spaces and the literal letters t, r and n.
+    # Calls split across lines were therefore invisible.  Flatten first and the
+    # patterns below only have to think about spaces.
+    string(REGEX REPLACE "[\t\r\n]" " " _config_source "${_config_source}")
     set(_patterns
-        "(string_f|path_f|string_restricted_f)[ \\t\\r\\n]*\\([ \\t\\r\\n]*vars[ \\t\\r\\n]*,[ \\t\\r\\n]*\\\"([^\\\"]+)\\\""
-        "(int_f|int_between_f)[ \\t\\r\\n]*\\([ \\t\\r\\n]*vars[ \\t\\r\\n]*,[ \\t\\r\\n]*\\\"([^\\\"]+)\\\""
-        "bool_f[ \\t\\r\\n]*\\([ \\t\\r\\n]*vars[ \\t\\r\\n]*,[ \\t\\r\\n]*\\\"([^\\\"]+)\\\""
-        "(double_f|double_between_f)[ \\t\\r\\n]*\\([ \\t\\r\\n]*vars[ \\t\\r\\n]*,[ \\t\\r\\n]*\\\"([^\\\"]+)\\\""
-        "generic_f[ \\t\\r\\n]*\\([ \\t\\r\\n]*vars[ \\t\\r\\n]*,[ \\t\\r\\n]*\\\"([^\\\"]+)\\\""
-        "list_prep_cmd_f[ \\t\\r\\n]*\\([ \\t\\r\\n]*vars[ \\t\\r\\n]*,[ \\t\\r\\n]*\\\"([^\\\"]+)\\\""
-        "map_int_int_f[ \\t\\r\\n]*\\([ \\t\\r\\n]*vars[ \\t\\r\\n]*,[ \\t\\r\\n]*\\\"([^\\\"]+)\\\"")
+        "(string_f|path_f|string_restricted_f)[ ]*\\([ ]*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\""
+        "(int_f|int_between_f)[ ]*\\([ ]*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\""
+        "bool_f[ ]*\\([ ]*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\""
+        "(double_f|double_between_f)[ ]*\\([ ]*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\""
+        "generic_f[ ]*\\([ ]*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\""
+        "list_prep_cmd_f[ ]*\\([ ]*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\""
+        "map_int_int_f[ ]*\\([ ]*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\""
+        "list_server_cmd_f[ ]*\\([ ]*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\""
+        "list_string_f[ ]*\\([ ]*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\""
+        "frame_limit_millihz_f[ ]*\\([ ]*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\"")
 
     set(_options "")
     foreach(_pattern IN LISTS _patterns)
         string(REGEX MATCHALL "${_pattern}" _matches "${_config_source}")
         foreach(_match IN LISTS _matches)
-            string(REGEX REPLACE ".*vars[ \\t\\r\\n]*,[ \\t\\r\\n]*\\\"([^\\\"]+)\\\".*" "\\1" _option "${_match}")
+            string(REGEX REPLACE ".*vars[ ]*,[ ]*\\\"([^\\\"]+)\\\".*" "\\1" _option "${_match}")
             list(APPEND _options "${_option}")
         endforeach()
     endforeach()
+
+    # Options read by hand rather than through a helper still reach the user, so
+    # they belong in the catalog too.  Without this, server_cmd and the dd_*
+    # snapshot keys were invisible to every check below.
+    string(REGEX MATCHALL "vars\\.find\\([ ]*\\\"([^\\\"]+)\\\"" _find_matches "${_config_source}")
+    foreach(_match IN LISTS _find_matches)
+        string(REGEX REPLACE ".*\\\"([^\\\"]+)\\\".*" "\\1" _option "${_match}")
+        list(APPEND _options "${_option}")
+    endforeach()
+
     list(REMOVE_DUPLICATES _options)
     set(${output_variable} "${_options}" PARENT_SCOPE)
 endfunction()
@@ -82,6 +100,20 @@ function(sunshine_extract_documented_config_options output_variable)
         if(NOT _option STREQUAL "")
             list(APPEND _options "${_option}")
         endif()
+    endforeach()
+    list(REMOVE_DUPLICATES _options)
+    set(${output_variable} "${_options}" PARENT_SCOPE)
+endfunction()
+
+function(sunshine_extract_ui_config_options output_variable)
+    file(READ "${SUNSHINE_TEST_REPOSITORY_ROOT}/src_assets/common/assets/web/configs/settingsSchema.ts" _schema)
+    string(REGEX REPLACE "[\t\r\n]" " " _schema "${_schema}")
+    # Field helpers in the v2 settings schema all take the config key first.
+    string(REGEX MATCHALL "(boolean|number|text|select|duration)\\([ ]*'([^']+)'" _matches "${_schema}")
+    set(_options "")
+    foreach(_match IN LISTS _matches)
+        string(REGEX REPLACE ".*'([^']+)'.*" "\\1" _option "${_match}")
+        list(APPEND _options "${_option}")
     endforeach()
     list(REMOVE_DUPLICATES _options)
     set(${output_variable} "${_options}" PARENT_SCOPE)
@@ -149,13 +181,16 @@ file(MAKE_DIRECTORY "${SUNSHINE_TEST_GENERATED_INCLUDE_DIR}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/config.cpp"
     "${SUNSHINE_TEST_REPOSITORY_ROOT}/docs/configuration.md"
-    "${SUNSHINE_TEST_REPOSITORY_ROOT}/src_assets/common/assets/web/public/assets/locale/en.json")
+    "${SUNSHINE_TEST_REPOSITORY_ROOT}/src_assets/common/assets/web/public/assets/locale/en.json"
+    "${SUNSHINE_TEST_REPOSITORY_ROOT}/src_assets/common/assets/web/configs/settingsSchema.ts")
 sunshine_extract_config_source_options(SUNSHINE_CONFIG_SOURCE_OPTIONS)
 sunshine_extract_documented_config_options(SUNSHINE_DOCUMENTED_CONFIG_OPTIONS)
 sunshine_extract_translated_config_options(SUNSHINE_TRANSLATED_CONFIG_OPTIONS)
+sunshine_extract_ui_config_options(SUNSHINE_UI_CONFIG_OPTIONS)
 sunshine_contract_cpp_list(SUNSHINE_CONFIG_SOURCE_OPTIONS SUNSHINE_CONFIG_SOURCE_OPTIONS_CPP)
 sunshine_contract_cpp_list(SUNSHINE_DOCUMENTED_CONFIG_OPTIONS SUNSHINE_DOCUMENTED_CONFIG_OPTIONS_CPP)
 sunshine_contract_cpp_list(SUNSHINE_TRANSLATED_CONFIG_OPTIONS SUNSHINE_TRANSLATED_CONFIG_OPTIONS_CPP)
+sunshine_contract_cpp_list(SUNSHINE_UI_CONFIG_OPTIONS SUNSHINE_UI_CONFIG_OPTIONS_CPP)
 configure_file(
     "${CMAKE_CURRENT_LIST_DIR}/support/config_catalog_contract.h.in"
     "${SUNSHINE_TEST_GENERATED_INCLUDE_DIR}/config_catalog_contract.generated.h"

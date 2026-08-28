@@ -239,6 +239,58 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### server_cmd
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Commands an authorized client may run on the host, as a JSON array. Each
+            entry has a @code{}name@endcode shown to the client, the @code{}cmd@endcode
+            to run, and @code{}elevated@endcode for whether it runs with administrator
+            rights. Only clients holding the matching permission can invoke them.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            []
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            server_cmd = [{"name":"Restart display driver","cmd":"nircmd.exe restartdisplay","elevated":true}]
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_virtual_display_permanent_count
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            How many Vibepollo virtual displays to keep present at all times, outside a
+            streaming session. 0 means virtual displays are created only while streaming
+            and removed afterwards. @code{}dd_vdd_static_monitor_count@endcode is accepted
+            as a legacy alias and is read only when this option is absent.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_virtual_display_permanent_count = 1
+            @endcode</td>
+    </tr>
+</table>
+
 ### notify_pre_releases
 
 <table>
