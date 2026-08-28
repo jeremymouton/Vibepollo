@@ -4,9 +4,9 @@ Let the host owner hand a friend a link that gets them into a game — in a brow
 with a Moonlight client they already have — without giving them an account, the host
 password, or full control of the machine.
 
-Status: **browser path complete; native pairing and owner UI outstanding.** This
-document is the design the implementation is checked against. Each stage lists how it is
-verified.
+Status: **all four stages built.** Two things remain unproven and are listed at the
+bottom — both need the Windows host. This document is the design the implementation is
+checked against.
 
 ## Why this exists here
 
@@ -162,8 +162,15 @@ signature is kept and delegates, so the admin path is unchanged.
 |---|---|---|
 | 1 | Invite model, store, persistence, owner CRUD | **Done.** 33 unit tests (expiry, lockout onset/release/escalation/cap, refusal ordering, use limits, permission clamping, constant-time compare, persistence round-trip); every touched translation unit compiles clean |
 | 2 | Guest sessions, `/api/join/*`, landing page, browser redeem | **Done.** Landing page verified in a browser against a stand-in backend across all six paths; guest branch of `createWebRTCSession` compiles but is unreachable in a non-WebRTC build |
-| 3 | Native pairing with `invite.perm` | Outstanding. Needs `nvhttp::pin()` to take an explicit permission, plus `POST /api/join/{token}/pair` |
-| 4 | Owner UI — invites page, copy link, PIN, QR | Outstanding. The API is complete and returns a ready-to-paste `path`, a `permission_summary` phrase, and derived `live` / `locked_for_seconds` so the page needs no bitmask logic |
+| 3 | Native pairing with `invite.perm` | **Done.** `pair_session_t` carries the permission from `pin()` to `clientpairingsecret`, overriding the "first client gets everything" rule. Flow verified in a browser. `nvhttp.cpp` itself is NOT compile-verified — it does not build on macOS, 6 pre-existing errors either way |
+| 4 | Owner UI — invites page | **Done.** `/v2/invites`, verified in a browser against a stand-in API driving the real built bundle: create, revoke, un-revoke, rotate, delete-with-confirm, empty state. No QR code — the link auto-copies on create, which is the actual thing an owner does next |
+
+### The two ways in, as built
+
+An owner creates an invite at `/v2/invites` and the link lands on the clipboard. The
+guest opens `/join/{token}`, types the PIN, and is offered whichever ways the invite
+allows — playing in the browser, or pairing their own Moonlight client with the PIN
+Moonlight is showing them.
 
 ### Still to check on the Windows host
 
