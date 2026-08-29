@@ -162,6 +162,70 @@ let videoRenderOverloadedSince: number | null = null;
 let videoLatencyResetAt: number | null = null;
 let videoPlaybackStream: MediaStream | null = null;
 
+/// 'auto' is not an encoding the server understands — it is resolved to the best
+/// codec both ends actually support, at the moment the stream starts, so the answer
+/// reflects the adapter and browser in play rather than one chosen weeks ago.
+const codecChoice = ref<EncodingType | 'auto'>('auto');
+
+/// Named resolutions, because typing 2560 and 1440 into two boxes is a worse way to
+/// say "1440p". Custom keeps the boxes for anything not on the list — an ultrawide,
+/// or matching an unusual desktop exactly.
+const RESOLUTIONS: Array<{ label: string; width: number; height: number }> = [
+  { label: '720p', width: 1280, height: 720 },
+  { label: '1080p', width: 1920, height: 1080 },
+  { label: '1440p', width: 2560, height: 1440 },
+  { label: '4K', width: 3840, height: 2160 },
+];
+const resolutionChoice = ref<string>('1080p');
+
+function onResolutionChanged(): void {
+  const preset = RESOLUTIONS.find((r) => r.label === resolutionChoice.value);
+  if (!preset) return;
+  form.width = preset.width;
+  form.height = preset.height;
+}
+
+/// Matches the current width and height back to a preset name, so a session started
+/// at 1920x1080 shows "1080p" rather than falling to Custom.
+function syncResolutionChoice(): void {
+  const match = RESOLUTIONS.find((r) => r.width === form.width && r.height === form.height);
+  resolutionChoice.value = match ? match.label : 'custom';
+}
+
+const FRAME_RATES = [30, 60, 90, 120, 144];
+const fpsChoice = ref<string>('60');
+
+function onFpsChanged(): void {
+  if (fpsChoice.value === 'custom') return;
+  form.fps = Number(fpsChoice.value);
+}
+
+function syncFpsChoice(): void {
+  fpsChoice.value = FRAME_RATES.includes(form.fps) ? String(form.fps) : 'custom';
+}
+
+/// 0 means "let the host decide", which a slider cannot express, so it is a separate
+/// switch and the slider is disabled while it is on.
+const useHostBitrate = computed({
+  get: () => form.bitrateKbps === 0,
+  set: (on: boolean) => {
+    form.bitrateKbps = on ? 0 : 20_000;
+  },
+});
+
+const bitrateLabel = computed(() =>
+  form.bitrateKbps === 0
+    ? t('ui.browser_stream.settings.bitrate_host_default', 'Host default')
+    : `${(form.bitrateKbps / 1000).toFixed(form.bitrateKbps % 1000 ? 1 : 0)} Mbps`,
+);
+
+/// Newest first: at a given bitrate AV1 and HEVC hold detail that H.264 loses, and
+/// the difference is largest exactly where it matters, on a constrained link.
+function bestAvailableCodec(): EncodingType {
+  const preference: EncodingType[] = ['av1', 'hevc', 'h264'];
+  return preference.find((codec) => codecAvailable(codec)) ?? 'h264';
+}
+
 const form = reactive<StreamLaunchForm>({
   appId: '',
   bitrateKbps: 20_000,
@@ -186,7 +250,12 @@ function unavailableCapabilities(reason: string): WebRtcHostCapabilities {
 }
 
 function appIdFor(app: AppRecord): number | null {
-  const id = Number(app.index);
+  // The host resolves the app by its OWN id, not by where it happens to sit in the
+  // list. Sending the index meant every launch asked for an app id that matched
+  // nothing, and came back "Cannot find requested application". /api/apps sends
+  // both fields; index is only useful for ordering.
+  const raw = (app as Record<string, unknown>)['id'] ?? (app as Record<string, unknown>)['index'];
+  const id = Number(raw);
   return Number.isInteger(id) && id > 0 ? id : null;
 }
 
@@ -508,11 +577,32 @@ async function refresh(): Promise<void> {
     );
   }
 
+  // Now that both ends have reported what they support, 'auto' can mean something.
+  // Resolving earlier would settle on the h264 fallback, since nothing is known to
+  // be available before this point.
+  syncResolutionChoice();
+  syncFpsChoice();
+  if (codecChoice.value === 'auto') {
+    applyCodecChoice();
+    if (form.hdr && !hdrAvailable(form.encoding)) form.hdr = false;
+  }
+
   if (browserResult.status === 'rejected' && !refreshError.value) {
     refreshError.value = t('ui.browser_stream.errors.inspect_browser');
   }
   await fetchSessionStatus();
   loading.value = false;
+}
+
+/// Keeps form.encoding — the value actually sent — in step with the dropdown, and
+/// re-resolves it when 'auto' is selected.
+function applyCodecChoice(): void {
+  form.encoding = codecChoice.value === 'auto' ? bestAvailableCodec() : codecChoice.value;
+}
+
+function onCodecChoiceChanged(): void {
+  applyCodecChoice();
+  onEncodingChanged();
 }
 
 function onEncodingChanged(): void {
@@ -1640,10 +1730,13 @@ onBeforeUnmount(() => {
               <span class="vs-field__label">{{ t('ui.browser_stream.settings.codec') }}</span>
               <select
                 id="browser-stream-codec"
-                v-model="form.encoding"
+                v-model="codecChoice"
                 class="vs-select"
-                @change="onEncodingChanged"
+                @change="onCodecChoiceChanged"
               >
+                <option value="auto">
+                  {{ t('ui.browser_stream.codecs.auto', 'Automatic') }}
+                </option>
                 <option
                   v-for="codec in codecs"
                   :key="codec"
@@ -1672,7 +1765,26 @@ onBeforeUnmount(() => {
               </span>
             </label>
 
-            <div class="stream-form__numeric-grid">
+            <label class="vs-field" for="browser-stream-resolution">
+              <span class="vs-field__label">{{
+                t('ui.browser_stream.settings.resolution', 'Resolution')
+              }}</span>
+              <select
+                id="browser-stream-resolution"
+                v-model="resolutionChoice"
+                class="vs-select"
+                @change="onResolutionChanged"
+              >
+                <option v-for="preset in RESOLUTIONS" :key="preset.label" :value="preset.label">
+                  {{ preset.label }} ({{ preset.width }}x{{ preset.height }})
+                </option>
+                <option value="custom">
+                  {{ t('ui.browser_stream.settings.custom', 'Custom') }}
+                </option>
+              </select>
+            </label>
+
+            <div v-if="resolutionChoice === 'custom'" class="stream-form__numeric-grid">
               <label class="vs-field" for="browser-stream-width">
                 <span class="vs-field__label">{{ t('ui.browser_stream.settings.width') }}</span>
                 <input
@@ -1697,31 +1809,62 @@ onBeforeUnmount(() => {
                   step="2"
                 />
               </label>
-              <label class="vs-field" for="browser-stream-fps">
-                <span class="vs-field__label">{{ t('ui.browser_stream.settings.fps') }}</span>
-                <input
-                  id="browser-stream-fps"
-                  v-model.number="form.fps"
-                  class="vs-input"
-                  type="number"
-                  :min="hostCapabilities.limits.min_fps"
-                  :max="hostCapabilities.limits.max_fps"
-                  step="1"
-                />
-              </label>
-              <label class="vs-field" for="browser-stream-bitrate">
-                <span class="vs-field__label">{{ t('ui.browser_stream.settings.bitrate') }}</span>
-                <input
-                  id="browser-stream-bitrate"
-                  v-model.number="form.bitrateKbps"
-                  class="vs-input"
-                  type="number"
-                  :min="hostCapabilities.limits.min_bitrate_kbps"
-                  :max="hostCapabilities.limits.max_bitrate_kbps"
-                  step="1000"
-                />
-              </label>
             </div>
+
+            <label class="vs-field" for="browser-stream-fps-choice">
+              <span class="vs-field__label">{{ t('ui.browser_stream.settings.fps') }}</span>
+              <select
+                id="browser-stream-fps-choice"
+                v-model="fpsChoice"
+                class="vs-select"
+                @change="onFpsChanged"
+              >
+                <option v-for="rate in FRAME_RATES" :key="rate" :value="String(rate)">
+                  {{ rate }} fps
+                </option>
+                <option value="custom">
+                  {{ t('ui.browser_stream.settings.custom', 'Custom') }}
+                </option>
+              </select>
+            </label>
+
+            <label v-if="fpsChoice === 'custom'" class="vs-field" for="browser-stream-fps">
+              <span class="vs-field__label">{{
+                t('ui.browser_stream.settings.custom_fps', 'Custom frame rate')
+              }}</span>
+              <input
+                id="browser-stream-fps"
+                v-model.number="form.fps"
+                class="vs-input"
+                type="number"
+                :min="hostCapabilities.limits.min_fps"
+                :max="hostCapabilities.limits.max_fps"
+                step="1"
+              />
+            </label>
+
+            <label class="stream-form__check">
+              <input v-model="useHostBitrate" type="checkbox" />
+              <span>{{
+                t('ui.browser_stream.settings.bitrate_host_default', 'Let the host choose bitrate')
+              }}</span>
+            </label>
+
+            <label class="vs-field" for="browser-stream-bitrate">
+              <span class="vs-field__label">
+                {{ t('ui.browser_stream.settings.bitrate') }} — {{ bitrateLabel }}
+              </span>
+              <input
+                id="browser-stream-bitrate"
+                v-model.number="form.bitrateKbps"
+                class="vs-range"
+                type="range"
+                :disabled="useHostBitrate"
+                :min="Math.max(hostCapabilities.limits.min_bitrate_kbps, 1000)"
+                :max="hostCapabilities.limits.max_bitrate_kbps || 150000"
+                step="1000"
+              />
+            </label>
           </fieldset>
 
           <label
