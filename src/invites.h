@@ -176,7 +176,17 @@ namespace invite {
 
     /// Drop every session issued from one invite. Called when the owner revokes it, so
     /// revoking a link also ejects whoever is already using it.
+    ///
+    /// Ejects them from the CREDENTIAL, not from a stream already running: a
+    /// negotiated WebRTC session keeps flowing because nothing re-checks the guest
+    /// afterwards. Call stream_sessions_for_invite first and close those too.
     void revoke_for_invite(const std::string &invite_id);
+
+    /// The WebRTC sessions this invite's guests are currently running.
+    ///
+    /// Must be read BEFORE revoking: revoke_for_invite drops the guest sessions, and
+    /// the stream ids live on them.
+    std::vector<std::string> stream_sessions_for_invite(const std::string &invite_id);
 
   }  // namespace guest
 

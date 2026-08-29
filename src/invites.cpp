@@ -435,6 +435,18 @@ namespace invite {
       return count;
     }
 
+    std::vector<std::string> stream_sessions_for_invite(const std::string &invite_id) {
+      std::lock_guard<std::mutex> lock(g_guest_mutex);
+      sweep_locked(policy::clock_t::now());
+      std::vector<std::string> ids;
+      for (const auto &entry : g_sessions) {
+        if (entry.second.invite_id == invite_id && !entry.second.stream_session_id.empty()) {
+          ids.push_back(entry.second.stream_session_id);
+        }
+      }
+      return ids;
+    }
+
     void revoke_for_invite(const std::string &invite_id) {
       std::lock_guard<std::mutex> lock(g_guest_mutex);
       for (auto it = g_sessions.begin(); it != g_sessions.end();) {

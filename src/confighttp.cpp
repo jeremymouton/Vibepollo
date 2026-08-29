@@ -2467,8 +2467,30 @@ namespace confighttp {
    */
   void unpair_invite_devices(const std::string &invite_id) {
     for (const auto &uuid : invite::take_paired_devices(invite_id)) {
+      // unpair_client removes the certificate AND calls stop_session on anything
+      // that device is streaming, so a native guest is dropped mid-game rather than
+      // merely blocked from reconnecting.
       if (nvhttp::unpair_client(uuid)) {
         BOOST_LOG(info) << "Invites: unpaired device "sv << uuid << " with invite "sv << invite_id;
+      }
+    }
+  }
+
+  /**
+   * @brief End every browser stream this invite's guests are running.
+   *
+   * Revoking took the credential away, which stops the next request — and does
+   * nothing to a stream already negotiated, because once media is flowing no code
+   * re-checks the guest session behind it. So an owner who revoked mid-stream
+   * watched the guest keep playing, which is the opposite of what the button says.
+   *
+   * The ids must be read BEFORE the invite is changed: the revoke drops the guest
+   * sessions and the stream ids live on them.
+   */
+  void close_invite_streams(const std::vector<std::string> &stream_session_ids, const std::string &invite_id) {
+    for (const auto &id : stream_session_ids) {
+      if (webrtc_stream::close_session(id)) {
+        BOOST_LOG(info) << "Invites: closed stream "sv << id << " with invite "sv << invite_id;
       }
     }
   }
@@ -2491,7 +2513,15 @@ namespace confighttp {
     for (const auto &invite : invite::list()) {
       const bool expired_by_time =
         invite.expires_at != invite::policy::time_point_t {} && invite.expires_at <= now;
-      if (expired_by_time && !invite.paired_device_uuids.empty()) {
+      if (!expired_by_time) {
+        continue;
+      }
+      const auto live_streams = invite::guest::stream_sessions_for_invite(invite.id);
+      if (!live_streams.empty()) {
+        close_invite_streams(live_streams, invite.id);
+        invite::guest::revoke_for_invite(invite.id);
+      }
+      if (!invite.paired_device_uuids.empty()) {
         unpair_invite_devices(invite.id);
       }
     }
@@ -2570,6 +2600,9 @@ namespace confighttp {
       return;
     }
 
+    // Captured before update(): it drops the guest sessions that carry these ids.
+    const auto live_streams = invite::guest::stream_sessions_for_invite(id);
+
     const auto updated = invite::update(id, spec);
     if (!updated) {
       not_found(response, request, "No such invite");
@@ -2580,6 +2613,7 @@ namespace confighttp {
     // at pairing time and cannot be narrowed in place, so it is unpaired instead.
     const bool narrowed = (spec.revoked && *spec.revoked) || spec.perm || spec.gamepad_base_slot || spec.app_id;
     if (narrowed) {
+      close_invite_streams(live_streams, id);
       unpair_invite_devices(id);
     }
     send_response(response, invites_api::to_owner_json(*updated));
@@ -2600,7 +2634,10 @@ namespace confighttp {
       return;
     }
 
-    const auto rotated = invite::rotate(std::string(request->path_match[1]));
+    const std::string rotate_id {request->path_match[1]};
+    const auto live_streams = invite::guest::stream_sessions_for_invite(rotate_id);
+
+    const auto rotated = invite::rotate(rotate_id);
     if (!rotated) {
       not_found(response, request, "No such invite");
       return;
@@ -2609,7 +2646,8 @@ namespace confighttp {
     // grounds that the old link is dead. A device it paired is admitted by the same
     // link and goes the same way, or "new link and PIN" would quietly leave the old
     // holder streaming.
-    unpair_invite_devices(std::string(request->path_match[1]));
+    close_invite_streams(live_streams, rotate_id);
+    unpair_invite_devices(rotate_id);
     BOOST_LOG(info) << "Invites: rotated '"sv << rotated->label << "'"sv;
     send_response(response, invites_api::to_owner_json(*rotated));
   }
@@ -2633,8 +2671,10 @@ namespace confighttp {
     }
 
     const std::string id {request->path_match[1]};
-    // Before remove(), not after: the uuids live on the invite, so deleting it first
-    // would throw away the only record of what needs unpairing.
+    // Before remove(), not after: the uuids live on the invite and the stream ids on
+    // its guest sessions, so deleting it first throws away the record of what needs
+    // tearing down.
+    close_invite_streams(invite::guest::stream_sessions_for_invite(id), id);
     unpair_invite_devices(id);
     if (!invite::remove(id)) {
       not_found(response, request, "No such invite");
