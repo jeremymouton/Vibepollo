@@ -6486,6 +6486,34 @@ namespace confighttp {
       });
     };
 
+    /// Blocking, but the handler owns authentication.
+    ///
+    /// register_blocking_api_route above calls authenticate() in the wrapper, which
+    /// only recognises an OWNER session. A route a redeemed guest may call cannot
+    /// use it: the wrapper refuses the guest before the handler ever runs, so the
+    /// handler's own guest check is dead code. That is exactly what happened to
+    /// createWebRTCSession — a guest got 401 Unauthorized on the very first call of
+    /// the browser flow, and the guest branch inside it had never once executed.
+    ///
+    /// A handler registered here MUST authenticate for itself. There is no gate in
+    /// front of it beyond CSRF.
+    auto register_blocking_api_route_self_authenticating =
+      [&](const char *pattern, const char *method, const auto &handler) {
+        register_api_route(pattern, method, [&blocking_route_pool, handler](resp_https_t response, req_https_t request) {
+          blocking_route_pool.push([handler, response = std::move(response), request = std::move(request)]() mutable {
+            try {
+              handler(response, request);
+            } catch (const std::exception &e) {
+              BOOST_LOG(error) << "Blocking config API handler failed: " << e.what();
+              bad_request(response, request, "Internal server error");
+            } catch (...) {
+              BOOST_LOG(error) << "Blocking config API handler failed with an unknown exception";
+              bad_request(response, request, "Internal server error");
+            }
+          });
+        });
+      };
+
     register_api_route("^/api/pin$", "POST", savePin);
     register_api_route("^/api/otp$", "POST", getOTP);
     register_api_route("^/api/apps$", "GET", getApps);
@@ -6558,7 +6586,7 @@ namespace confighttp {
     register_api_route("^/api/history/sessions/active$", "GET", getActiveSessionHistory);
     register_api_route("^/api/history/sessions/([A-Fa-f0-9-]+)$", "GET", getSessionHistoryDetail);
     register_api_route("^/api/history/sessions/([A-Fa-f0-9-]+)$", "DELETE", deleteSessionHistory);
-    register_blocking_api_route("^/api/webrtc/sessions$", "POST", createWebRTCSession);
+    register_blocking_api_route_self_authenticating("^/api/webrtc/sessions$", "POST", createWebRTCSession);
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)$", "GET", getWebRTCSession);
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)$", "DELETE", deleteWebRTCSession);
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)/offer$", "POST", postWebRTCOffer);
