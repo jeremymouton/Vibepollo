@@ -21,7 +21,10 @@ import { WebRtcClient } from '@/utils/webrtc/client';
 import TouchGamepad from '@/components/TouchGamepad.vue';
 import type { EncodingType, StreamConfig, WebRtcStatsSnapshot } from '@/types/webrtc';
 
-type Phase = 'connecting' | 'playing' | 'ended' | 'error';
+/// 'ready' exists so the guest picks before anything starts. A stream's encoder is
+/// fixed when the session is created, so a choice made afterwards costs a reconnect —
+/// and a guest on a phone or a poor line is exactly who most needs to choose first.
+type Phase = 'ready' | 'connecting' | 'playing' | 'ended' | 'error';
 
 /// What this browser can actually decode. Offering AV1 to a device that cannot
 /// decode it produces a black screen rather than an error, so the list is built
@@ -111,7 +114,7 @@ const pathKind = computed(() => {
   return 'direct';
 });
 
-const phase = ref<Phase>('connecting');
+const phase = ref<Phase>('ready');
 const message = ref('Connecting to the host…');
 const videoEl = ref<HTMLVideoElement>();
 const stageEl = ref<HTMLDivElement>();
@@ -155,12 +158,24 @@ function streamConfig(): StreamConfig {
   return config;
 }
 
-async function applyQuality(): Promise<void> {
+/// Remembers the choice before connecting, so a returning guest is not asked twice.
+async function startChosen(): Promise<void> {
+  saveQuality();
+  phase.value = 'connecting';
+  message.value = 'Connecting to the host…';
+  await start();
+}
+
+function saveQuality(): void {
   try {
     window.localStorage.setItem(QUALITY_KEY, JSON.stringify(quality.value));
   } catch {
     /* private browsing; the choice just will not persist */
   }
+}
+
+async function applyQuality(): Promise<void> {
+  saveQuality();
   showSettings.value = false;
   // The session's encoder is fixed when it is created, so a change means a new one.
   detachInput();
@@ -297,7 +312,9 @@ async function reportTelemetry(): Promise<void> {
   }
 }
 
-onMounted(start);
+onMounted(() => {
+  message.value = '';
+});
 onBeforeUnmount(() => {
   stopTelemetry();
   detachInput();
@@ -326,7 +343,43 @@ onBeforeUnmount(() => {
       class="absolute inset-0 flex flex-col items-center justify-center gap-4 text-center text-white/90 bg-black/80 px-6"
     >
       <img src="/images/logo-apollo-45.png" alt="" class="h-14 w-14 opacity-80" />
-      <p class="text-lg">{{ message }}</p>
+
+      <div v-if="phase === 'ready'" class="w-full max-w-xs space-y-3 text-left text-sm">
+        <p class="text-center text-base">Ready when you are.</p>
+        <label class="block">
+          Quality
+          <select v-model.number="quality.maxHeight" class="mt-1 w-full rounded bg-white/10 p-2">
+            <option :value="720">720p — best on a phone or a slow line</option>
+            <option :value="1080">1080p</option>
+            <option :value="1440">1440p — needs a fast connection</option>
+          </select>
+        </label>
+        <label class="block">
+          Bitrate
+          <select v-model.number="quality.bitrateKbps" class="mt-1 w-full rounded bg-white/10 p-2">
+            <option :value="0">Automatic</option>
+            <option :value="5000">5 Mbps</option>
+            <option :value="10000">10 Mbps</option>
+            <option :value="20000">20 Mbps</option>
+            <option :value="40000">40 Mbps</option>
+          </select>
+        </label>
+        <label class="block">
+          Frame rate
+          <select v-model.number="quality.fps" class="mt-1 w-full rounded bg-white/10 p-2">
+            <option :value="30">30 fps</option>
+            <option :value="60">60 fps</option>
+          </select>
+        </label>
+        <p class="text-white/50 text-xs">
+          Automatic follows your connection. You can change all of this while playing.
+        </p>
+        <button class="w-full rounded bg-white/25 py-2 text-base" @click="startChosen">
+          Start streaming
+        </button>
+      </div>
+
+      <p v-else class="text-lg">{{ message }}</p>
       <button
         v-if="phase === 'error' || phase === 'ended'"
         class="rounded px-4 py-2 bg-white/15 hover:bg-white/25 transition"
