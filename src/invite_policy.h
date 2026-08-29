@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace invite::policy {
 
@@ -81,6 +82,14 @@ namespace invite::policy {
     int max_uses = 0;  ///< 0 = unlimited
     int uses = 0;
     int failed_attempts = 0;  ///< consecutive; reset by a correct PIN
+
+    /// Moonlight clients this invite paired, by nvhttp device uuid.
+    ///
+    /// A browser guest holds a session that dies with the invite. A native client
+    /// holds a CERTIFICATE, which outlives it — so without this an expiring link
+    /// grants permanent access, which is the opposite of what it promises. Kept
+    /// here so revoking or deleting the invite can take the pairing back too.
+    std::vector<std::string> paired_device_uuids;
   };
 
   /**

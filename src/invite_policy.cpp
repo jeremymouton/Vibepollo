@@ -183,6 +183,7 @@ namespace invite::policy {
     node["max_uses"] = invite.max_uses;
     node["uses"] = invite.uses;
     node["failed_attempts"] = invite.failed_attempts;
+    node["paired_device_uuids"] = invite.paired_device_uuids;
     return node;
   }
 
@@ -215,6 +216,7 @@ namespace invite::policy {
     invite.max_uses = node.value("max_uses", 0);
     invite.uses = node.value("uses", 0);
     invite.failed_attempts = node.value("failed_attempts", 0);
+    invite.paired_device_uuids = node.value("paired_device_uuids", std::vector<std::string> {});
     return invite;
   }
 

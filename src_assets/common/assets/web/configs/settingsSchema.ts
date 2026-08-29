@@ -700,6 +700,7 @@ export const settingsCategories: SettingsCategory[] = [
           text('external_ip', { monospace: true, stacked: true }),
           text('public_base_url', { monospace: true, stacked: true }),
           text('webrtc_ice_servers', { monospace: true, stacked: true }),
+          text('webrtc_turn_secret', { monospace: true, stacked: true }),
           number('ping_timeout', { min: 0, step: 1 }),
         ],
       },

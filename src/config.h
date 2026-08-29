@@ -318,6 +318,20 @@ namespace config {
      * page was served from", which is right for a LAN-only setup.
      */
     std::string public_base_url;
+
+    /**
+     * @brief coturn's static-auth-secret, for minting short-lived TURN credentials.
+     *
+     * With this set, the credentials handed to a guest are generated per session and
+     * expire on their own, so a guest who was let in once cannot keep using the relay
+     * afterwards, and cutting one guest off no longer means changing a password every
+     * other guest also holds.
+     *
+     * Empty keeps whatever username and credential webrtc_ice_servers carries. The
+     * relay must be configured to match: coturn needs use-auth-secret and the same
+     * static-auth-secret, and in that mode it stops accepting its static user= logins.
+     */
+    std::string webrtc_turn_secret;
   };
 
   struct input_t {

@@ -246,6 +246,41 @@ namespace invite {
     return copy;
   }
 
+  void record_paired_device(const std::string &invite_id, const std::string &device_uuid) {
+    if (invite_id.empty() || device_uuid.empty()) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto *invite = find_locked(invite_id);
+    if (!invite) {
+      // The owner deleted the invite while the handshake was in flight. Nothing to
+      // attach the device to, and nothing that will ever revoke it — so say so
+      // loudly rather than leaving a device paired that no invite accounts for.
+      BOOST_LOG(warning) << "Invites: paired device "sv << device_uuid
+                         << " belongs to invite "sv << invite_id
+                         << ", which no longer exists; it must be removed by hand"sv;
+      return;
+    }
+    if (std::find(invite->paired_device_uuids.begin(), invite->paired_device_uuids.end(), device_uuid) !=
+        invite->paired_device_uuids.end()) {
+      return;
+    }
+    invite->paired_device_uuids.push_back(device_uuid);
+    save_locked();
+  }
+
+  std::vector<std::string> take_paired_devices(const std::string &invite_id) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto *invite = find_locked(invite_id);
+    if (!invite || invite->paired_device_uuids.empty()) {
+      return {};
+    }
+    auto taken = std::move(invite->paired_device_uuids);
+    invite->paired_device_uuids.clear();
+    save_locked();
+    return taken;
+  }
+
   bool remove(const std::string &id) {
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto before = g_invites.size();

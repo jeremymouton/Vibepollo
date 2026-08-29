@@ -2134,6 +2134,32 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### webrtc_turn_secret
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The TURN server's shared secret, used to mint a short-lived credential for
+            each guest instead of handing every guest the same permanent password.
+            Must match coturn's @code{}static-auth-secret@endcode, and coturn must have
+            @code{}use-auth-secret@endcode enabled — in that mode it stops accepting the
+            static @code{}user=@endcode logins, so change both together. Leave empty to
+            keep whatever username and credential webrtc_ice_servers already carries.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">empty (use the credentials in webrtc_ice_servers)</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            webrtc_turn_secret = 3a7f1c9e2b5d8a04f6e1c3b7d9a2e5f80c4b6d1a3e7f9c2b5d8a0f4e6c1b3d7a
+            @endcode</td>
+    </tr>
+</table>
+
 ### lan_encryption_mode
 
 <table>

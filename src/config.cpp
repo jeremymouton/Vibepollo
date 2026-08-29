@@ -2006,6 +2006,7 @@ namespace config {
     string_f(vars, "external_ip", nvhttp.external_ip);
     string_f(vars, "webrtc_ice_servers", nvhttp.webrtc_ice_servers);
     string_f(vars, "public_base_url", nvhttp.public_base_url);
+    string_f(vars, "webrtc_turn_secret", nvhttp.webrtc_turn_secret);
     list_prep_cmd_f(vars, "global_prep_cmd", config::sunshine.prep_cmds);
     list_prep_cmd_f(vars, "global_state_cmd", config::sunshine.state_cmds);
     list_server_cmd_f(vars, "server_cmd", config::sunshine.server_cmds);

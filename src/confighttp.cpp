@@ -47,6 +47,7 @@
 
 // local includes
 #include "config.h"
+#include <openssl/hmac.h>
 #include "confighttp.h"
 #include "crypto.h"
 #include "file_handler.h"
@@ -637,6 +638,72 @@ namespace confighttp {
     send_response(response, output_tree, {});
   }
 
+  /**
+   * @brief Replace TURN credentials with ones that expire.
+   *
+   * coturn's REST-API scheme: the username is "<unix expiry>:<name>" and the password
+   * is base64(HMAC-SHA1(shared secret, username)). The relay recomputes it, so nothing
+   * is stored and nothing has to be revoked — the credential simply stops working.
+   *
+   * Why bother: the alternative is one static password shared by every guest, which
+   * never expires, is handed to each of them in the clear, and can only be withdrawn
+   * by changing it for everyone at once.
+   *
+   * Twelve hours, not minutes: coturn re-checks the timestamp when a session refreshes
+   * its allocation, so a TTL shorter than a plausible sitting would drop the stream
+   * mid-game. It still bounds how long a departed guest can relay through the host.
+   *
+   * STUN entries are left alone — they take no credentials.
+   */
+  void apply_ephemeral_turn_credentials(nlohmann::json &servers, const std::string &secret) {
+    using namespace std::chrono;
+    const auto expiry = duration_cast<seconds>(system_clock::now().time_since_epoch()).count() +
+                        duration_cast<seconds>(hours {12}).count();
+    const std::string username = std::to_string(expiry) + ":vibepollo-guest";
+
+    unsigned char digest[EVP_MAX_MD_SIZE] {};
+    unsigned int digest_len = 0;
+    if (!HMAC(EVP_sha1(),
+              secret.data(),
+              static_cast<int>(secret.size()),
+              reinterpret_cast<const unsigned char *>(username.data()),
+              username.size(),
+              digest,
+              &digest_len)) {
+      BOOST_LOG(warning) << "WebRTC: could not derive a TURN credential; leaving the configured one"sv;
+      return;
+    }
+    const auto credential = SimpleWeb::Crypto::Base64::encode(
+      std::string(reinterpret_cast<const char *>(digest), digest_len)
+    );
+
+    for (auto &server : servers) {
+      if (!server.is_object() || !server.contains("urls")) {
+        continue;
+      }
+      // "urls" is either a string or an array of them.
+      const auto is_turn = [](const nlohmann::json &urls) {
+        const auto relay = [](const std::string &u) {
+          return u.starts_with("turn:") || u.starts_with("turns:");
+        };
+        if (urls.is_string()) {
+          return relay(urls.get<std::string>());
+        }
+        if (urls.is_array()) {
+          return std::any_of(urls.begin(), urls.end(), [&](const nlohmann::json &u) {
+            return u.is_string() && relay(u.get<std::string>());
+          });
+        }
+        return false;
+      };
+      if (!is_turn(server["urls"])) {
+        continue;
+      }
+      server["username"] = username;
+      server["credential"] = credential;
+    }
+  }
+
   nlohmann::json load_webrtc_ice_servers() {
     // The config file wins. This used to be reachable only through an environment
     // variable, which on Windows meant editing the service's registry key — an
@@ -659,13 +726,20 @@ namespace confighttp {
       return std::nullopt;
     };
 
+    const auto with_credentials = [](nlohmann::json servers) {
+      if (!config::nvhttp.webrtc_turn_secret.empty()) {
+        apply_ephemeral_turn_credentials(servers, config::nvhttp.webrtc_turn_secret);
+      }
+      return servers;
+    };
+
     if (auto from_config = parse("webrtc_ice_servers", config::nvhttp.webrtc_ice_servers)) {
-      return *from_config;
+      return with_credentials(std::move(*from_config));
     }
 
     const auto *env = std::getenv("SUNSHINE_WEBRTC_ICE_SERVERS");
     if (auto from_env = parse("SUNSHINE_WEBRTC_ICE_SERVERS", env ? env : "")) {
-      return *from_env;
+      return with_credentials(std::move(*from_env));
     }
 
     return nlohmann::json::array();
@@ -2366,6 +2440,26 @@ namespace confighttp {
   }  // namespace invites_api
 
   /**
+   * @brief Take back every Moonlight client an invite paired.
+   *
+   * A browser guest loses access the moment the invite dies, because their session
+   * is checked against it on every call. A native client does not: pairing hands it
+   * a certificate that stands on its own. Revoking a link without this leaves the
+   * guest permanently able to stream, which is precisely what an expiring invite
+   * promises not to do.
+   *
+   * Runs outside the invite lock — take_paired_devices returns and clears in one
+   * step, and unpair_client takes nvhttp's own locks.
+   */
+  void unpair_invite_devices(const std::string &invite_id) {
+    for (const auto &uuid : invite::take_paired_devices(invite_id)) {
+      if (nvhttp::unpair_client(uuid)) {
+        BOOST_LOG(info) << "Invites: unpaired device "sv << uuid << " with invite "sv << invite_id;
+      }
+    }
+  }
+
+  /**
    * @brief List every guest invite, newest first.
    * @api_examples{/api/invites| GET| null}
    */
@@ -2374,6 +2468,19 @@ namespace confighttp {
       return;
     }
     print_req(request);
+
+    // Expiry is the one revocation nobody triggers, so it is swept here, where the
+    // owner's page already polls. Time only: an invite that merely ran out of uses
+    // must NOT unpair anyone, or a single-use invite would eject the guest it just
+    // admitted.
+    const auto now = invite::policy::clock_t::now();
+    for (const auto &invite : invite::list()) {
+      const bool expired_by_time =
+        invite.expires_at != invite::policy::time_point_t {} && invite.expires_at <= now;
+      if (expired_by_time && !invite.paired_device_uuids.empty()) {
+        unpair_invite_devices(invite.id);
+      }
+    }
 
     nlohmann::json items = nlohmann::json::array();
     for (const auto &invite : invite::list()) {
@@ -2454,6 +2561,13 @@ namespace confighttp {
       not_found(response, request, "No such invite");
       return;
     }
+    // Same rule invite::update applies to browser sessions: narrowing a grant must
+    // not leave a wider one still running. A paired client's permissions were fixed
+    // at pairing time and cannot be narrowed in place, so it is unpaired instead.
+    const bool narrowed = (spec.revoked && *spec.revoked) || spec.perm || spec.gamepad_base_slot || spec.app_id;
+    if (narrowed) {
+      unpair_invite_devices(id);
+    }
     send_response(response, invites_api::to_owner_json(*updated));
   }
 
@@ -2477,6 +2591,11 @@ namespace confighttp {
       not_found(response, request, "No such invite");
       return;
     }
+    // invite::rotate already ends the browser sessions the old link admitted, on the
+    // grounds that the old link is dead. A device it paired is admitted by the same
+    // link and goes the same way, or "new link and PIN" would quietly leave the old
+    // holder streaming.
+    unpair_invite_devices(std::string(request->path_match[1]));
     BOOST_LOG(info) << "Invites: rotated '"sv << rotated->label << "'"sv;
     send_response(response, invites_api::to_owner_json(*rotated));
   }
@@ -2499,7 +2618,11 @@ namespace confighttp {
       return;
     }
 
-    if (!invite::remove(std::string(request->path_match[1]))) {
+    const std::string id {request->path_match[1]};
+    // Before remove(), not after: the uuids live on the invite, so deleting it first
+    // would throw away the only record of what needs unpairing.
+    unpair_invite_devices(id);
+    if (!invite::remove(id)) {
       not_found(response, request, "No such invite");
       return;
     }
@@ -2700,7 +2823,7 @@ namespace confighttp {
     }
 
     const auto granted = static_cast<crypto::PERM>(outcome.invite.perm);
-    const bool paired = nvhttp::pin((*input)["moonlight_pin"].get<std::string>(), name, granted);
+    const bool paired = nvhttp::pin((*input)["moonlight_pin"].get<std::string>(), name, granted, outcome.invite.id);
 
     nlohmann::json body = nlohmann::json::object();
     body["status"] = paired;

@@ -49,6 +49,7 @@
 #include "httpcommon.h"
 #include "logging.h"
 #include "network.h"
+#include "invites.h"
 #include "nvhttp.h"
 #include "platform/common.h"
 #include "state_storage.h"
@@ -2388,6 +2389,11 @@ namespace nvhttp {
           BOOST_LOG(info) << "Pairing '"sv << named_cert_p->name
                           << "' from an invite, permission "sv
                           << static_cast<std::uint32_t>(named_cert_p->perm);
+          // The uuid exists only here, several round trips after the invite was
+          // redeemed, so this is the first and only moment the device can be tied
+          // back to the invite that admitted it. Revoking the invite later has
+          // nothing to revoke without this line.
+          invite::record_paired_device(sess.granted_invite_id, named_cert_p->uuid);
         } else {
           // If the device is the first one paired with the server, assign full permission.
           bool first_client = false;
@@ -2704,7 +2710,7 @@ namespace nvhttp {
       }
     }
 
-    bool pin(std::string pin, std::string name, std::optional<crypto::PERM> granted_perm) {
+    bool pin(std::string pin, std::string name, std::optional<crypto::PERM> granted_perm, std::string granted_invite_id) {
       pt::ptree tree;
       if (map_id_sess.empty()) {
         BOOST_LOG(warning) << "PIN submitted but no pending pairing session exists";
@@ -2762,6 +2768,7 @@ namespace nvhttp {
       // Recorded before the handshake proceeds, because the permission is applied at
       // its far end in clientpairingsecret, several round trips from here.
       sess.granted_perm = granted_perm;
+      sess.granted_invite_id = std::move(granted_invite_id);
 
       getservercert(sess, tree, pin);
 

@@ -73,6 +73,26 @@ namespace invite {
   bool remove(const std::string &id);
 
   /**
+   * @brief Remember that this invite paired a Moonlight client.
+   *
+   * Called from the far end of the pairing handshake, where the device finally gets
+   * a uuid — several round trips after the invite was redeemed. Without the record
+   * the pairing cannot be taken back, and an expiring link would hand out permanent
+   * access to anyone who chose the native path.
+   */
+  void record_paired_device(const std::string &invite_id, const std::string &device_uuid);
+
+  /**
+   * @brief Hand back the devices this invite paired, and forget them.
+   *
+   * Take-and-clear in one locked step so two callers cannot both try to unpair the
+   * same device. The actual unpairing happens in the caller: this module does not
+   * depend on nvhttp, and calling into it while holding the invite lock would invite
+   * a deadlock.
+   */
+  std::vector<std::string> take_paired_devices(const std::string &invite_id);
+
+  /**
    * @brief Look up an invite by its link token, without redeeming it.
    *
    * For the landing page, which has to say what the link offers before anyone types a

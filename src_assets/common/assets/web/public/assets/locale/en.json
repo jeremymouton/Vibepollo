@@ -1069,7 +1069,9 @@
     "webrtc_ice_servers": "WebRTC ICE servers",
     "webrtc_ice_servers_desc": "STUN and TURN servers for the browser client, as a JSON array. Leave empty for local network only. Without a STUN server, guests outside your network can open the page but will never receive video.",
     "public_base_url": "Public address for guest links",
-    "public_base_url_desc": "The address guests reach this host on, for example https://play.example.com. Invite links are built from it. Leave empty on a local network and links will use whatever address you opened this page on."
+    "public_base_url_desc": "The address guests reach this host on, for example https://play.example.com. Invite links are built from it. Leave empty on a local network and links will use whatever address you opened this page on.",
+    "webrtc_turn_secret": "TURN shared secret",
+    "webrtc_turn_secret_desc": "Your TURN server's shared secret. With it set, each guest gets a credential that expires by itself instead of one permanent password shared by everyone. Must match coturn's static-auth-secret, with use-auth-secret enabled there."
   },
   "index": {
     "description": "Vibepollo is a self-hosted game stream host for Moonlight.",
