@@ -16,7 +16,11 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import { http } from '@/http';
 import { WebRtcHttpApi } from '@/services/webrtcApi';
-import { attachInputCapture } from '@/utils/webrtc/input';
+import {
+  applyGamepadFeedback,
+  attachInputCapture,
+  requestKeyboardLock,
+} from '@/utils/webrtc/input';
 import { WebRtcClient } from '@/utils/webrtc/client';
 import TouchGamepad from '@/components/TouchGamepad.vue';
 import type { EncodingType, StreamConfig, WebRtcStatsSnapshot } from '@/types/webrtc';
@@ -226,6 +230,10 @@ async function start(): Promise<void> {
       onStats: (snapshot) => {
         stats.value = snapshot;
       },
+      // Rumble. The host sends it down the same data channel the input goes up, and
+      // without this a guest holding a controller that can shake simply never feels
+      // anything — the messages were arriving and being dropped on the floor.
+      onInputMessage: (message) => applyGamepadFeedback(message),
     });
   } catch (err) {
     phase.value = 'error';
@@ -247,6 +255,9 @@ async function goFullscreen(): Promise<void> {
   } catch {
     /* the browser refused; the stream is still playable windowed */
   }
+  // Take the system keys too, so Escape and the Windows key reach the game instead
+  // of the browser. Only granted in fullscreen, and only in some browsers.
+  void requestKeyboardLock();
   // Turn the phone for them. Only allowed while fullscreen, and refused outright on
   // desktop and on iOS, so it is attempted and ignored rather than depended upon.
   try {

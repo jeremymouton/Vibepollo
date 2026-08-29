@@ -36,6 +36,13 @@ export interface BrowserVideoCapabilities {
 export interface WebRtcConnectionCallbacks {
   onConnectionState?: (state: RTCPeerConnectionState) => void;
   onInputState?: (state: RTCDataChannelState) => void;
+  /**
+   * A message arriving FROM the host on the input channel — rumble, in practice.
+   *
+   * The channel was write-only here: input went up and nothing was ever read back,
+   * so a controller that can shake never did.
+   */
+  onInputMessage?: (message: unknown) => void;
   onRemoteStream?: (stream: MediaStream) => void;
   onVideoPlayoutDelay?: (delayMs: number | undefined) => void;
 }
@@ -618,6 +625,16 @@ export class BrowserWebRtcSession {
       };
       this.dataChannel.onerror = () => {
         if (this.isActiveGeneration(generation)) callbacks.onInputState?.('closing');
+      };
+      this.dataChannel.onmessage = (event: MessageEvent) => {
+        if (!this.isActiveGeneration(generation)) return;
+        try {
+          callbacks.onInputMessage?.(
+            typeof event.data === 'string' ? JSON.parse(event.data) : event.data,
+          );
+        } catch {
+          /* the host sent something this build does not understand; ignore it */
+        }
       };
 
       connection.onconnectionstatechange = () => {

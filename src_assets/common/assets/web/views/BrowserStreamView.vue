@@ -24,7 +24,7 @@ import {
   type WebRtcHostCapabilities,
 } from '@/services/webrtc';
 import TouchGamepad from '@/components/TouchGamepad.vue';
-import { attachInputCapture } from '@/utils/webrtc/input';
+import { applyGamepadFeedback, attachInputCapture } from '@/utils/webrtc/input';
 import type { SessionStatus } from '@/types/sessions';
 import type { EncodingType, StreamConfig } from '@/types/webrtc';
 
@@ -892,6 +892,8 @@ async function connect(resume: boolean): Promise<void> {
           startSessionStatusPolling();
         }
       },
+      // Rumble on its way back from the host.
+      onInputMessage: (message: unknown) => applyGamepadFeedback(message),
       onInputState: (state) => {
         if (state !== 'open') releaseForwardedInput();
         inputChannelState.value = state;
