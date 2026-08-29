@@ -19,6 +19,63 @@ import { setVirtualGamepad } from '@/utils/webrtc/input';
 const BUTTON_COUNT = 17;
 const STICK_RADIUS = 56;
 
+/**
+ * Rumble, on a device that has no rumble motor.
+ *
+ * applyGamepadFeedback looks for a vibrationActuator on the pad and gives up if
+ * there is none — which is why the on-screen controller felt nothing while a real
+ * one shook. So it supplies one, and the shared code needs no knowledge of it.
+ *
+ * navigator.vibrate is a switch, not a dial: there is no intensity, only on and
+ * off. Strength is approximated with a duty cycle — a solid buzz when the game
+ * asks for a lot, broken pulses when it asks for little — which reads as weaker
+ * without pretending to a precision the hardware does not have.
+ *
+ * iOS refuses the API outright. There it is simply a no-op, which is the correct
+ * outcome and not worth apologising for on screen.
+ */
+let vibrationBusyUntil = 0;
+
+const vibrationActuator = {
+  type: 'dual-rumble',
+  playEffect: (
+    _type: string,
+    params: { duration?: number; strongMagnitude?: number; weakMagnitude?: number },
+  ) => {
+    const vibrate = navigator.vibrate?.bind(navigator);
+    if (!vibrate) return Promise.resolve('complete');
+
+    const strength = Math.max(params.strongMagnitude ?? 0, params.weakMagnitude ?? 0);
+    const now = performance.now();
+
+    if (strength <= 0.05) {
+      vibrate(0);
+      vibrationBusyUntil = 0;
+      return Promise.resolve('complete');
+    }
+
+    // A game may ask many times a second. Restarting the motor on each one makes it
+    // stutter and drains the battery, so an effect already running is left alone.
+    if (now < vibrationBusyUntil) return Promise.resolve('complete');
+
+    const duration = Math.min(400, Math.max(20, Math.round(params.duration ?? 100)));
+    if (strength > 0.6) {
+      vibrate(duration);
+    } else {
+      // Roughly `strength` of each 40ms slice spent buzzing.
+      const slice = 40;
+      const on = Math.max(8, Math.round(slice * strength));
+      const pattern: number[] = [];
+      for (let elapsed = 0; elapsed < duration; elapsed += slice) {
+        pattern.push(on, Math.max(0, slice - on));
+      }
+      vibrate(pattern);
+    }
+    vibrationBusyUntil = now + duration;
+    return Promise.resolve('complete');
+  },
+};
+
 const pressed = reactive<Record<number, number>>({});
 const axes = reactive<number[]>([0, 0, 0, 0]);
 const root = ref<HTMLDivElement>();
@@ -40,6 +97,7 @@ function snapshot(): Gamepad {
     timestamp: performance.now(),
     axes: axes.slice(),
     buttons,
+    vibrationActuator,
   } as unknown as Gamepad;
 }
 
@@ -95,6 +153,8 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   cancelAnimationFrame(raf);
+  // Do not leave the phone buzzing after the controls are gone.
+  navigator.vibrate?.(0);
   // Withdraw it, or the capture loop keeps reporting a pad nobody is holding.
   setVirtualGamepad();
 });
