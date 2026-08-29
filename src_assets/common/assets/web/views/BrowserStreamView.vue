@@ -1911,7 +1911,11 @@ onBeforeUnmount(() => {
             </label>
 
             <label class="stream-form__check">
-              <input v-model="showTouchPad" type="checkbox" :disabled="!isConnected" />
+              <!-- Deliberately not gated on being connected. On a phone the controls
+                   need to be asked for BEFORE the stream starts, not after it is
+                   already running and there is nothing to press. The overlay itself
+                   still only appears once input can actually reach the host. -->
+              <input v-model="showTouchPad" type="checkbox" />
               <span>
                 {{ t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller') }}
                 <template v-if="!isTouchDevice"> — for a tablet or touchscreen</template>
@@ -1927,7 +1931,8 @@ onBeforeUnmount(() => {
 
             <label class="vs-field" for="browser-stream-bitrate">
               <span class="vs-field__label">
-                {{ t('ui.browser_stream.settings.bitrate') }} — {{ bitrateLabel }}
+                {{ t('ui.browser_stream.settings.bitrate_simple', 'Bitrate') }} —
+                {{ bitrateLabel }}
               </span>
               <input
                 id="browser-stream-bitrate"
