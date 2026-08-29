@@ -12,13 +12,14 @@
  * the grant from the invite server-side, so anything this page asks for is
  * discarded — which is why it does not ask.
  */
-import { onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
+import { http } from '@/http';
 import { WebRtcHttpApi } from '@/services/webrtcApi';
 import { attachInputCapture } from '@/utils/webrtc/input';
 import { WebRtcClient } from '@/utils/webrtc/client';
 import TouchGamepad from '@/components/TouchGamepad.vue';
-import type { EncodingType, StreamConfig } from '@/types/webrtc';
+import type { EncodingType, StreamConfig, WebRtcStatsSnapshot } from '@/types/webrtc';
 
 type Phase = 'connecting' | 'playing' | 'ended' | 'error';
 
@@ -93,12 +94,30 @@ const isTouch =
   typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window);
 const showTouchPad = ref(isTouch);
 
+/// Shown on request. Without it a guest can only report "it was bad", which says
+/// nothing about whether the link was slow, lossy, or the host was struggling —
+/// three problems with three different answers.
+const stats = ref<WebRtcStatsSnapshot>({});
+const showStats = ref(false);
+
+/// host = straight to the PC, srflx = through NAT but still direct, relay = via the
+/// TURN server. Which one it landed on decides whether latency is the internet's
+/// fault or a routing detour.
+const pathKind = computed(() => {
+  const local = stats.value.candidatePair?.localType ?? '';
+  const remote = stats.value.candidatePair?.remoteType ?? '';
+  if (local === 'relay' || remote === 'relay') return 'relayed';
+  if (local === 'host' && remote === 'host') return 'direct (local)';
+  return 'direct';
+});
+
 const phase = ref<Phase>('connecting');
 const message = ref('Connecting to the host…');
 const videoEl = ref<HTMLVideoElement>();
 const stageEl = ref<HTMLDivElement>();
 
 const client = new WebRtcClient(new WebRtcHttpApi());
+const sessionId = ref('');
 const noop = (): void => undefined;
 /// Detaches the current input capture. `noop` until one is attached, so there is
 /// no absent state to model and nothing to guard at the call sites.
@@ -109,8 +128,16 @@ let detachInput: () => void = noop;
 function streamConfig(): StreamConfig {
   const q = quality.value;
   const dpr = window.devicePixelRatio || 1;
-  const w = Math.round(window.screen.width * dpr);
-  const h = Math.round(window.screen.height * dpr);
+  // Always ask for a landscape frame. A phone held upright reports 390x844, and the
+  // host will faithfully stream a 390x844 desktop — a tall slice of a wide screen,
+  // which is unreadable and looks like the stream is broken. The screen's longer
+  // edge is the width whichever way the phone happens to be held.
+  const longEdge = Math.round(Math.max(window.screen.width, window.screen.height) * dpr);
+  const shortEdge = Math.round(Math.min(window.screen.width, window.screen.height) * dpr);
+  // Never taller than 9:16 of the width either: a very tall phone would otherwise
+  // still ask for a squarer desktop than the host actually has.
+  const w = longEdge;
+  const h = Math.min(shortEdge, Math.round((longEdge * 9) / 16));
   const cap = q.maxHeight;
   const scale = Math.min(1, (cap * 16) / 9 / Math.max(w, 1), cap / Math.max(h, 1));
   const even = (n: number) => Math.max(2, Math.round((n * scale) / 2) * 2);
@@ -155,7 +182,7 @@ function wireInput(): void {
 
 async function start(): Promise<void> {
   try {
-    await client.connect(streamConfig(), {
+    sessionId.value = await client.connect(streamConfig(), {
       onRemoteStream: (stream) => {
         if (!videoEl.value) return;
         videoEl.value.srcObject = stream;
@@ -169,6 +196,8 @@ async function start(): Promise<void> {
           phase.value = 'playing';
           message.value = '';
           wireInput();
+          stopTelemetry();
+          telemetryTimer = [setInterval(() => void reportTelemetry(), 10_000)];
         } else if (state === 'failed' || state === 'closed') {
           phase.value = 'ended';
           message.value = 'The connection to the host ended.';
@@ -179,6 +208,9 @@ async function start(): Promise<void> {
         message.value = error.message || 'Could not start the stream.';
       },
       onWarning: (warning) => console.warn(warning),
+      onStats: (snapshot) => {
+        stats.value = snapshot;
+      },
     });
   } catch (err) {
     phase.value = 'error';
@@ -200,6 +232,16 @@ async function goFullscreen(): Promise<void> {
   } catch {
     /* the browser refused; the stream is still playable windowed */
   }
+  // Turn the phone for them. Only allowed while fullscreen, and refused outright on
+  // desktop and on iOS, so it is attempted and ignored rather than depended upon.
+  try {
+    const orientation = screen.orientation as ScreenOrientation & {
+      lock?: (to: string) => Promise<void>;
+    };
+    await orientation.lock?.('landscape');
+  } catch {
+    /* not permitted here; the frame is landscape regardless */
+  }
 }
 
 async function leave(): Promise<void> {
@@ -210,8 +252,54 @@ async function leave(): Promise<void> {
   message.value = 'You have left the session.';
 }
 
+/// Reported every ten seconds while playing, so a session that went badly leaves a
+/// trace in the host log the owner can actually read afterwards. Ten seconds is
+/// often enough to see a stream degrade and rare enough to be invisible.
+/// Held as a 0-or-1 list rather than a nullable, which this project's lint rules
+/// discourage; clearInterval on an empty list is simply a no-op.
+let telemetryTimer: ReturnType<typeof setInterval>[] = [];
+
+function stopTelemetry(): void {
+  telemetryTimer.forEach(clearInterval);
+  telemetryTimer = [];
+}
+
+function candidateKind(): string {
+  const local = stats.value.candidatePair?.localType ?? '';
+  const remote = stats.value.candidatePair?.remoteType ?? '';
+  if (local === 'relay' || remote === 'relay') return 'relay';
+  if (local === 'host' && remote === 'host') return 'host';
+  return 'srflx';
+}
+
+async function reportTelemetry(): Promise<void> {
+  const id = sessionId.value;
+  if (!id || phase.value !== 'playing') return;
+  const s = stats.value;
+  try {
+    await http.post(
+      `/api/webrtc/sessions/${encodeURIComponent(id)}/telemetry`,
+      {
+        path: candidateKind(),
+        rtt: s.roundTripTimeMs ?? 0,
+        jitter: s.videoJitterMs ?? 0,
+        buffer: s.videoJitterBufferMs ?? 0,
+        lost: s.packetsLost ?? 0,
+        bitrate: s.videoBitrateKbps ?? 0,
+        fps: s.videoFps ?? 0,
+        decode: s.videoDecodeMs ?? 0,
+        dropped: s.videoFramesDropped ?? 0,
+      },
+      { validateStatus: () => true },
+    );
+  } catch {
+    /* telemetry must never be the reason a stream stops */
+  }
+}
+
 onMounted(start);
 onBeforeUnmount(() => {
+  stopTelemetry();
   detachInput();
   // keepalive so a reload does not strand the session on the host
   void client.disconnect({ keepalive: true }).catch(() => undefined);
@@ -267,6 +355,12 @@ onBeforeUnmount(() => {
       </button>
       <button
         class="rounded px-3 py-1.5 text-sm bg-black/60 text-white"
+        @click="showStats = !showStats"
+      >
+        Stats
+      </button>
+      <button
+        class="rounded px-3 py-1.5 text-sm bg-black/60 text-white"
         @click="showSettings = !showSettings"
       >
         Quality
@@ -277,6 +371,23 @@ onBeforeUnmount(() => {
       <button class="rounded px-3 py-1.5 text-sm bg-black/60 text-white" @click="leave">
         Leave
       </button>
+    </div>
+
+    <div
+      v-if="showStats && phase === 'playing'"
+      class="absolute top-3 left-3 rounded-lg bg-black/80 px-3 py-2 text-xs text-white/90 font-mono leading-5"
+    >
+      <div>path {{ pathKind }} {{ stats.candidatePair?.protocol ?? '' }}</div>
+      <div>rtt {{ Math.round(stats.roundTripTimeMs ?? 0) }} ms</div>
+      <div>jitter {{ Math.round(stats.videoJitterMs ?? 0) }} ms</div>
+      <div>buffer {{ Math.round(stats.videoJitterBufferMs ?? 0) }} ms</div>
+      <div>lost {{ stats.packetsLost ?? 0 }}</div>
+      <div>
+        {{ Math.round(stats.videoBitrateKbps ?? 0) }} kbps ·
+        {{ Math.round(stats.videoFps ?? 0) }} fps
+      </div>
+      <div>decode {{ Math.round(stats.videoDecodeMs ?? 0) }} ms · {{ stats.videoCodec ?? '' }}</div>
+      <div>dropped {{ stats.videoFramesDropped ?? 0 }}</div>
     </div>
 
     <div

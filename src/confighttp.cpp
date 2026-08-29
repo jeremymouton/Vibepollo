@@ -4615,6 +4615,75 @@ namespace confighttp {
     send_response(response, output);
   }
 
+  /**
+   * @brief A guest's own view of their stream, written to the host log.
+   *
+   * A remote guest's console is not somewhere the owner can look, so "it was
+   * horrible" is all that ever comes back. This puts the numbers that distinguish
+   * the possible causes — a slow link, a lossy one, or a struggling host — where
+   * the owner already reads logs.
+   *
+   * Everything is clamped and coerced to a number before it is logged. The caller
+   * is a guest, so nothing they send may reach the log as free text.
+   */
+  void postWebRTCTelemetry(resp_https_t response, req_https_t request) {
+    const std::string webrtc_session_id = webrtc_session_id_from_path(request);
+    if (!authenticate_for_webrtc_session(response, request, webrtc_session_id)) {
+      return;
+    }
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+
+    std::stringstream ss;
+    ss << request->content.rdbuf();
+    try {
+      const auto input = nlohmann::json::parse(ss.str());
+      const auto num = [&input](const char *key, double lo, double hi) {
+        const auto it = input.find(key);
+        if (it == input.end() || !it->is_number()) {
+          return 0.0;
+        }
+        return std::clamp(it->get<double>(), lo, hi);
+      };
+      // A short enumerated word, never the guest's own string.
+      const auto path = [&input]() -> std::string_view {
+        const auto it = input.find("path");
+        if (it == input.end() || !it->is_string()) {
+          return "unknown"sv;
+        }
+        const auto value = it->get<std::string>();
+        if (value == "relay") {
+          return "relay"sv;
+        }
+        if (value == "host") {
+          return "host"sv;
+        }
+        if (value == "srflx") {
+          return "srflx"sv;
+        }
+        return "unknown"sv;
+      }();
+
+      BOOST_LOG(info) << "WebRTC guest telemetry: session="sv << webrtc_session_id
+                      << " path="sv << path
+                      << " rtt="sv << num("rtt", 0, 60000) << "ms"
+                      << " jitter="sv << num("jitter", 0, 60000) << "ms"
+                      << " buffer="sv << num("buffer", 0, 60000) << "ms"
+                      << " lost="sv << num("lost", 0, 1e9)
+                      << " bitrate="sv << num("bitrate", 0, 1e6) << "kbps"
+                      << " fps="sv << num("fps", 0, 1000)
+                      << " decode="sv << num("decode", 0, 60000) << "ms"
+                      << " dropped="sv << num("dropped", 0, 1e9);
+
+      nlohmann::json output;
+      output["status"] = true;
+      send_response(response, output);
+    } catch (const std::exception &e) {
+      bad_request(response, request, e.what());
+    }
+  }
+
   void getWebRTCSession(resp_https_t response, req_https_t request) {
     const std::string webrtc_session_id = webrtc_session_id_from_path(request);
     if (!authenticate_for_webrtc_session(response, request, webrtc_session_id)) {
@@ -6771,6 +6840,7 @@ namespace confighttp {
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)$", "GET", getWebRTCSession);
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)$", "DELETE", deleteWebRTCSession);
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)/offer$", "POST", postWebRTCOffer);
+    register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)/telemetry$", "POST", postWebRTCTelemetry);
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)/answer$", "GET", getWebRTCAnswer);
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)/ice$", "GET", getWebRTCIce);
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)/ice$", "POST", postWebRTCIce);
