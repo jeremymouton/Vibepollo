@@ -364,7 +364,7 @@ namespace invite {
         return;
       }
       std::lock_guard<std::mutex> lock(g_guest_mutex);
-      prune_expired(policy::clock_t::now());
+      sweep_locked(policy::clock_t::now());
       if (const auto it = g_sessions.find(token); it != g_sessions.end()) {
         // Last one wins. A guest who reloads the page creates a fresh session and the
         // old one is already being torn down, so there is nothing to keep.
@@ -377,7 +377,7 @@ namespace invite {
         return false;
       }
       std::lock_guard<std::mutex> lock(g_guest_mutex);
-      prune_expired(policy::clock_t::now());
+      sweep_locked(policy::clock_t::now());
       const auto it = g_sessions.find(token);
       return it != g_sessions.end() && it->second.stream_session_id == stream_session_id;
     }
