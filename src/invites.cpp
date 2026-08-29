@@ -359,6 +359,29 @@ namespace invite {
       return it->second;
     }
 
+    void bind_stream_session(const std::string &token, const std::string &stream_session_id) {
+      if (token.empty() || stream_session_id.empty()) {
+        return;
+      }
+      std::lock_guard<std::mutex> lock(g_guest_mutex);
+      prune_expired(policy::clock_t::now());
+      if (const auto it = g_sessions.find(token); it != g_sessions.end()) {
+        // Last one wins. A guest who reloads the page creates a fresh session and the
+        // old one is already being torn down, so there is nothing to keep.
+        it->second.stream_session_id = stream_session_id;
+      }
+    }
+
+    bool owns_stream_session(const std::string &token, const std::string &stream_session_id) {
+      if (token.empty() || stream_session_id.empty()) {
+        return false;
+      }
+      std::lock_guard<std::mutex> lock(g_guest_mutex);
+      prune_expired(policy::clock_t::now());
+      const auto it = g_sessions.find(token);
+      return it != g_sessions.end() && it->second.stream_session_id == stream_session_id;
+    }
+
     void revoke(const std::string &token) {
       std::lock_guard<std::mutex> lock(g_guest_mutex);
       g_sessions.erase(token);

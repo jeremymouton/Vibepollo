@@ -4109,6 +4109,32 @@ namespace confighttp {
 #endif
   }
 
+  /**
+   * @brief Authorise a request against ONE WebRTC session.
+   *
+   * The owner may drive any session. A redeemed guest may drive exactly the session
+   * their own cookie created and no other — not another guest's, and not one the owner
+   * started. Anything that is not scoped to a single session (listing sessions, for
+   * instance) must keep calling authenticate() directly; this helper is not a general
+   * relaxation of admin auth, and deliberately cannot be used as one, because it
+   * requires a session id to say yes to anything.
+   *
+   * Writes the failure response itself, exactly as authenticate() does, so a guest that
+   * does not own the session is answered by the ordinary owner-auth path and cannot
+   * tell the difference between "not yours" and "not logged in".
+   */
+  bool authenticate_for_webrtc_session(resp_https_t response, req_https_t request, const std::string &session_id) {
+    if (invite::guest::owns_stream_session(extract_guest_token_from_cookie(request->header), session_id)) {
+      return true;
+    }
+    return authenticate(response, request);
+  }
+
+  /// The session id every session-scoped WebRTC route carries in its path.
+  std::string webrtc_session_id_from_path(const req_https_t &request) {
+    return request->path_match.size() > 1 ? std::string {request->path_match[1]} : std::string {};
+  }
+
   void createWebRTCSession(resp_https_t response, req_https_t request) {
     // A redeemed guest may start a session without an owner login — but only the
     // session their invite describes. Their grant is applied further down, after
@@ -4394,6 +4420,11 @@ namespace confighttp {
       return;
     }
     BOOST_LOG(debug) << "WebRTC: session created id=" << session->id;
+    if (guest) {
+      // Bind before the id is handed back, so the guest's very next request — the
+      // offer — already authorises.
+      invite::guest::bind_stream_session(extract_guest_token_from_cookie(request->header), session->id);
+    }
     nlohmann::json output;
     output["status"] = true;
     output["session"] = webrtc_session_to_json(*session);
@@ -4404,7 +4435,8 @@ namespace confighttp {
   }
 
   void getWebRTCSession(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
+    const std::string webrtc_session_id = webrtc_session_id_from_path(request);
+    if (!authenticate_for_webrtc_session(response, request, webrtc_session_id)) {
       return;
     }
 
@@ -4425,7 +4457,8 @@ namespace confighttp {
   }
 
   void deleteWebRTCSession(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
+    const std::string webrtc_session_id = webrtc_session_id_from_path(request);
+    if (!authenticate_for_webrtc_session(response, request, webrtc_session_id)) {
       return;
     }
 
@@ -4444,7 +4477,8 @@ namespace confighttp {
   }
 
   void postWebRTCOffer(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
+    const std::string webrtc_session_id = webrtc_session_id_from_path(request);
+    if (!authenticate_for_webrtc_session(response, request, webrtc_session_id)) {
       return;
     }
     if (!check_content_type(response, request, "application/json")) {
@@ -4500,7 +4534,8 @@ namespace confighttp {
   }
 
   void getWebRTCAnswer(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
+    const std::string webrtc_session_id = webrtc_session_id_from_path(request);
+    if (!authenticate_for_webrtc_session(response, request, webrtc_session_id)) {
       return;
     }
 
@@ -4526,7 +4561,8 @@ namespace confighttp {
   }
 
   void postWebRTCIce(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
+    const std::string webrtc_session_id = webrtc_session_id_from_path(request);
+    if (!authenticate_for_webrtc_session(response, request, webrtc_session_id)) {
       return;
     }
     if (!check_content_type(response, request, "application/json")) {
@@ -4594,7 +4630,8 @@ namespace confighttp {
   }
 
   void getWebRTCIce(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
+    const std::string webrtc_session_id = webrtc_session_id_from_path(request);
+    if (!authenticate_for_webrtc_session(response, request, webrtc_session_id)) {
       return;
     }
 
@@ -4634,7 +4671,8 @@ namespace confighttp {
   }
 
   void getWebRTCIceStream(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
+    const std::string webrtc_session_id = webrtc_session_id_from_path(request);
+    if (!authenticate_for_webrtc_session(response, request, webrtc_session_id)) {
       return;
     }
 

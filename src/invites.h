@@ -125,6 +125,10 @@ namespace invite {
       int gamepad_base_slot = 0;
       int app_id = -1;
       policy::time_point_t expires_at {};
+      /// The WebRTC session this guest created, once they have created one.
+      /// Signalling is authorised against this and nothing else, so a guest can
+      /// drive their own stream and cannot touch anyone else's.
+      std::string stream_session_id;
     };
 
     /// Mint a session for a successfully redeemed invite. Returns the cookie value.
@@ -135,6 +139,15 @@ namespace invite {
 
     /// Drop a session early — the guest leaving, or the owner revoking.
     void revoke(const std::string &token);
+
+    /// Record the WebRTC session a guest just created, so the signalling routes can
+    /// tell "their own stream" from "somebody else's".
+    void bind_stream_session(const std::string &token, const std::string &stream_session_id);
+
+    /// Whether this cookie owns this WebRTC session. False for an unknown or expired
+    /// cookie, for a guest who has not created a session, and for any mismatch — the
+    /// three cases are deliberately indistinguishable to the caller.
+    bool owns_stream_session(const std::string &token, const std::string &stream_session_id);
 
     /// How many guests are connected on this invite right now. Drives the owner's
     /// "someone is in" indicator, which is a different question from `uses` —
