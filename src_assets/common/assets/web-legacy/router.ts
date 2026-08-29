@@ -26,6 +26,14 @@ const routes = [
     redirect: { path: '/clients', query: { sec: 'tokens' } },
   },
   { path: '/webrtc', component: WebRtcClientView, meta: { container: 'full' } },
+  // Where a redeemed guest lands. `guest: true` keeps the login gate off it — the
+  // page carries no admin surface, and its session is authorised by the guest
+  // cookie server-side rather than by an owner login.
+  {
+    path: '/play',
+    component: () => import('@/views/GuestPlayView.vue'),
+    meta: { container: 'full', guest: true },
+  },
 ];
 
 const CHUNK_RELOAD_FLAG = 'sunshine:chunk-reload';
@@ -75,8 +83,10 @@ router.beforeEach(async (_to: RouteLocationNormalized) => {
         /* ignore */
       }
     }
-    // If not authenticated, trigger overlay (do not redirect)
-    if (!auth.isAuthenticated) auth.requireLogin();
+    // If not authenticated, trigger overlay (do not redirect). Guest routes are
+    // exempt: a guest has no owner account to log in with, and prompting them for
+    // one is exactly the bug this route exists to fix.
+    if (!auth.isAuthenticated && _to.meta?.['guest'] !== true) auth.requireLogin();
   } catch {
     /* ignore */
   }

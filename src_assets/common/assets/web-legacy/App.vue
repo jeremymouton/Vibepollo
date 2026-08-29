@@ -4,7 +4,12 @@
       <n-dialog-provider>
         <n-notification-provider>
           <n-message-provider>
-            <div class="min-h-screen flex flex-col bg-light dark:bg-dark text-dark dark:text-light">
+            <!-- A guest sees only the stream. No header, no nav, no login modal. -->
+            <RouterView v-if="isGuestRoute" />
+            <div
+              v-else
+              class="min-h-screen flex flex-col bg-light dark:bg-dark text-dark dark:text-light"
+            >
               <header
                 class="sticky top-0 z-30 h-14 flex items-center gap-4 px-4 border-b border-dark/10 dark:border-light/10 bg-light/70 dark:bg-dark/60 backdrop-blur supports-[backdrop-filter]:bg-light/40 supports-[backdrop-filter]:dark:bg-dark/40"
               >
@@ -52,7 +57,13 @@
                     :options="mobileMenuOptions"
                     @select="onMobileSelect"
                   >
-                    <n-button type="primary" strong circle size="small" :aria-label="$t('navbar.menu')">
+                    <n-button
+                      type="primary"
+                      strong
+                      circle
+                      size="small"
+                      :aria-label="$t('navbar.menu')"
+                    >
                       <i class="fas fa-bars" />
                     </n-button>
                   </n-dropdown>
@@ -157,6 +168,8 @@ const isDark = useDarkModeClassRef();
 const naiveOverrides = useNaiveThemeOverrides();
 
 const route = useRoute();
+/// Guest routes render bare — see the RouterView branch above.
+const isGuestRoute = computed(() => route.meta?.['guest'] === true);
 const router = useRouter();
 
 // Use config metadata as a fallback for container sizing when route meta isn't set
