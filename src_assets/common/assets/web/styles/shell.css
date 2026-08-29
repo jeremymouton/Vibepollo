@@ -52,6 +52,10 @@
   min-height: 0;
   flex: 1;
   flex-direction: column;
+  /* Scroll the links rather than letting them grow past the sidebar. Without this
+     a short window pushes the nav straight through the footer and the last item
+     collides with the host status. */
+  overflow-y: auto;
   padding: var(--vs-space-8);
 }
 
@@ -94,6 +98,8 @@
 }
 
 .sidebar__footer {
+  /* Never give up height to the scrolling nav above it. */
+  flex-shrink: 0;
   padding: var(--vs-space-8);
   border-top: 1px solid var(--vs-color-border-subtle);
 }
