@@ -2725,6 +2725,10 @@ namespace confighttp {
       node["allow_pairing"] = invite.allow_pairing;
       node["permission_summary"] = invites_api::describe_perm(invite.perm);
       node["live"] = invite::policy::is_live(invite, invite::policy::clock_t::now());
+      // Which pad the guest will drive. Not a secret — it is their own seat number —
+      // and the join page needs it to label their controller, so a guest can tell at
+      // a glance whether they are about to play as player one or player two.
+      node["gamepad_base_slot"] = invite.gamepad_base_slot;
       return node;
     }
 

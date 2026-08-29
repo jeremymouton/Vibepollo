@@ -140,6 +140,90 @@
       .hidden {
         display: none !important;
       }
+
+      /* Controller check */
+      .pad {
+        margin-top: 10px;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #0f1114;
+      }
+      .pad-name {
+        font-size: 13px;
+        font-weight: 600;
+        word-break: break-word;
+      }
+      .pad-hint {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .pad-buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-top: 10px;
+      }
+      .pad-buttons i {
+        width: 22px;
+        height: 22px;
+        display: grid;
+        place-items: center;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        font-size: 10px;
+        font-style: normal;
+        color: var(--muted);
+      }
+      /* Pressed is announced by colour AND by the ring, so it does not rely on
+         colour alone for anyone who cannot distinguish it. */
+      .pad-buttons i[data-on='1'] {
+        border-color: var(--accent);
+        outline: 2px solid var(--accent);
+        color: var(--text);
+        background: #1b2740;
+      }
+      .pad-axes {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 4px 8px;
+        align-items: center;
+        margin-top: 10px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .pad-axes div[role='meter'] {
+        height: 6px;
+        border-radius: 3px;
+        background: #2c313a;
+        position: relative;
+      }
+      .pad-axes div[role='meter'] > span {
+        position: absolute;
+        top: -2px;
+        width: 10px;
+        height: 10px;
+        margin-left: -5px;
+        border-radius: 50%;
+        background: var(--accent);
+      }
+      .dl {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 10px;
+      }
+      .dl a {
+        padding: 6px 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        color: var(--text);
+        text-decoration: none;
+        font-size: 13px;
+      }
+      .dl a:hover {
+        border-color: var(--accent);
+      }
     </style>
   </head>
   <body>
@@ -167,6 +251,20 @@
           <b>Play in this browser</b>
           <span>Nothing to install. A controller is recommended.</span>
         </button>
+
+        <!-- Checking the controller HERE rather than after joining: a pad that is
+             asleep, on the wrong mode, or claimed by another app looks exactly like
+             a broken stream once the video is up, and the guest has no way to tell
+             the difference. Better to find out before anyone is watching. -->
+        <div class="pad" id="pad-check">
+          <div class="pad-name" id="pad-name">No controller detected</div>
+          <div class="pad-hint" id="pad-hint">
+            Connect a controller and press any button on it — browsers hide gamepads
+            until you do.
+          </div>
+          <div class="pad-buttons" id="pad-buttons"></div>
+          <div class="pad-axes" id="pad-axes"></div>
+        </div>
         <div class="choice hidden" id="choice-pair">
           <b>Use your Moonlight client</b>
           <span
@@ -174,6 +272,17 @@
             <code id="pair-host">this host</code>. Moonlight will show you a four-digit
             PIN — type it here.</span
           >
+          <div class="dl">
+            <a href="https://moonlight-stream.org/#downloads" target="_blank" rel="noopener noreferrer"
+              >Get Moonlight</a
+            >
+            <a href="https://apps.apple.com/app/moonlight-game-streaming/id1000551566" target="_blank" rel="noopener noreferrer"
+              >macOS / iOS</a
+            >
+            <a href="https://play.google.com/store/apps/details?id=com.limelight" target="_blank" rel="noopener noreferrer"
+              >Android</a
+            >
+          </div>
           <form id="pair-form" style="margin-top: 12px">
             <input
               id="moonlight-pin"
@@ -304,6 +413,100 @@
           offerWaysIn(body);
         }
 
+        // The pad the owner assigned this invite. Slots are raw controller indexes,
+        // and index 0 is player one in every game, so the label is slot + 1.
+        let playerLabel = '';
+
+        /**
+         * Live view of the guest's controller.
+         *
+         * Polls rather than listening: gamepadconnected fires once, and the thing a
+         * guest actually needs to see is a button lighting up as they press it —
+         * that is what tells them the browser is reading THIS pad, not some other
+         * device, and not a stale entry.
+         */
+        function watchGamepads() {
+          const nameEl = el('pad-name');
+          const hintEl = el('pad-hint');
+          const buttonsEl = el('pad-buttons');
+          const axesEl = el('pad-axes');
+          let renderedFor = null;
+          let renderedButtons = 0;
+
+          function firstPad() {
+            const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+            for (let i = 0; i < pads.length; i++) {
+              if (pads[i] && pads[i].connected) return pads[i];
+            }
+            return null;
+          }
+
+          function build(pad) {
+            buttonsEl.innerHTML = '';
+            axesEl.innerHTML = '';
+            for (let i = 0; i < pad.buttons.length; i++) {
+              const b = document.createElement('i');
+              b.textContent = String(i);
+              b.setAttribute('data-on', '0');
+              buttonsEl.appendChild(b);
+            }
+            for (let i = 0; i < pad.axes.length; i++) {
+              const label = document.createElement('span');
+              label.textContent = 'Axis ' + i;
+              const track = document.createElement('div');
+              track.setAttribute('role', 'meter');
+              track.appendChild(document.createElement('span'));
+              axesEl.appendChild(label);
+              axesEl.appendChild(track);
+            }
+            renderedButtons = pad.buttons.length;
+          }
+
+          function frame() {
+            const pad = firstPad();
+            if (!pad) {
+              if (renderedFor !== null) {
+                renderedFor = null;
+                nameEl.textContent = 'No controller detected';
+                hintEl.textContent =
+                  'Connect a controller and press any button on it — browsers hide gamepads until you do.';
+                buttonsEl.innerHTML = '';
+                axesEl.innerHTML = '';
+              }
+              requestAnimationFrame(frame);
+              return;
+            }
+
+            if (pad.id !== renderedFor || pad.buttons.length !== renderedButtons) {
+              renderedFor = pad.id;
+              nameEl.textContent = playerLabel ? pad.id + ' (' + playerLabel + ')' : pad.id;
+              hintEl.textContent = 'Press buttons and move the sticks — they should light up below.';
+              build(pad);
+            }
+
+            const cells = buttonsEl.children;
+            for (let i = 0; i < pad.buttons.length && i < cells.length; i++) {
+              const b = pad.buttons[i];
+              const on = (typeof b === 'object' ? b.pressed || b.value > 0.5 : b > 0.5) ? '1' : '0';
+              if (cells[i].getAttribute('data-on') !== on) cells[i].setAttribute('data-on', on);
+            }
+            const tracks = axesEl.querySelectorAll('div[role=\'meter\'] > span');
+            for (let i = 0; i < pad.axes.length && i < tracks.length; i++) {
+              // -1..1 onto 0..100%
+              tracks[i].style.left = ((pad.axes[i] + 1) / 2) * 100 + '%';
+            }
+            requestAnimationFrame(frame);
+          }
+
+          if (!navigator.getGamepads) {
+            nameEl.textContent = 'This browser cannot read controllers';
+            hintEl.textContent =
+              'Keyboard and mouse will still work if the invite allows them. Chrome, Edge and Safari all support gamepads.';
+            return;
+          }
+          requestAnimationFrame(frame);
+        }
+
         function offerWaysIn(invite) {
           el('title').textContent = "You're in";
           el('subtitle').textContent = 'Choose how you want to play.';
@@ -313,6 +516,18 @@
 
           show(el('choice-browser'), invite.allow_browser !== false);
           show(el('choice-pair'), invite.allow_pairing === true);
+
+          if (typeof invite.gamepad_base_slot === 'number') {
+            playerLabel = 'Player ' + (invite.gamepad_base_slot + 1);
+          }
+          // Only worth showing if this invite can actually use a pad; a watch-only
+          // link would just be offering a test for something they cannot do.
+          const padUseful =
+            invite.allow_browser !== false &&
+            typeof invite.permission_summary === 'string' &&
+            /gamepad|full control/i.test(invite.permission_summary);
+          show(el('pad-check'), padUseful);
+          if (padUseful) watchGamepads();
 
           el('choice-browser').addEventListener('click', function () {
             // The session cookie is already set, so the stream page can start a
