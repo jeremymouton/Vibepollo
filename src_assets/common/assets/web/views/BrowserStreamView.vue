@@ -178,6 +178,16 @@ const RESOLUTIONS: Array<{ label: string; width: number; height: number }> = [
 ];
 const resolutionChoice = ref<string>('1080p');
 
+/// How much late video to tolerate.
+///
+/// This page used to hardcode 'latency' with zero slack and a one-frame maximum
+/// age — the most aggressive setting there is, which discards anything arriving
+/// even slightly late. On a LAN that is right. Over any link with jitter it throws
+/// away frames faster than it saves time, and the stream reads as stuttery and
+/// smeared, which is exactly how it compared against the invite page: that one
+/// sends nothing and so gets the host's own default of 'balanced'.
+const pacingMode = ref<'latency' | 'balanced' | 'smoothness'>('balanced');
+
 function onResolutionChanged(): void {
   const preset = RESOLUTIONS.find((r) => r.label === resolutionChoice.value);
   if (!preset) return;
@@ -829,9 +839,10 @@ async function connect(resume: boolean): Promise<void> {
     height: form.height,
     muteHostAudio: form.muteHostAudio,
     resume,
-    videoMaxFrameAgeMs: Math.max(5, Math.min(100, Math.round(1000 / Math.max(1, form.fps)))),
-    videoPacingMode: 'latency',
-    videoPacingSlackMs: 0,
+    // Slack and maximum frame age are deliberately not sent: the host derives both
+    // from the mode, and overriding them here is what made 'balanced' behave like
+    // 'latency' anyway.
+    videoPacingMode: pacingMode.value,
     width: form.width,
   };
 
@@ -1810,6 +1821,17 @@ onBeforeUnmount(() => {
                 />
               </label>
             </div>
+
+            <label class="vs-field" for="browser-stream-pacing">
+              <span class="vs-field__label">{{
+                t('ui.browser_stream.settings.pacing', 'Smoothness')
+              }}</span>
+              <select id="browser-stream-pacing" v-model="pacingMode" class="vs-select">
+                <option value="latency">Lowest latency — same network only</option>
+                <option value="balanced">Balanced — recommended</option>
+                <option value="smoothness">Smoothest — for a poor connection</option>
+              </select>
+            </label>
 
             <label class="vs-field" for="browser-stream-fps-choice">
               <span class="vs-field__label">{{ t('ui.browser_stream.settings.fps') }}</span>
