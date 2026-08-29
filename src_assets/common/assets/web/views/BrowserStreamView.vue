@@ -1319,7 +1319,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="page page--wide browser-stream-page">
+  <div class="vs-page vs-page--dashboard browser-stream-page">
     <PageHeader
       :title="t('ui.browser_stream.title')"
       :description="t('ui.browser_stream.description')"

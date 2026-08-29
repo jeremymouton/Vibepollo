@@ -227,7 +227,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="invites">
+  <section class="vs-page invites">
     <PageHeader :title="t('ui.invites.title')" :description="t('ui.invites.description')">
       <template #actions>
         <AppButton
@@ -417,8 +417,9 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 14px;
   padding: 18px;
-  border: 1px solid var(--color-border, #2c313a);
+  border: 1px solid var(--vs-color-border-subtle);
   border-radius: 12px;
+  background: var(--vs-color-bg-surface);
 }
 
 .create__grid {
@@ -437,9 +438,9 @@ onBeforeUnmount(() => {
 .field input,
 .field select {
   padding: 9px 10px;
-  border: 1px solid var(--color-border, #2c313a);
+  border: 1px solid var(--vs-color-border-subtle);
   border-radius: 8px;
-  background: var(--color-surface, #0f1114);
+  background: var(--vs-color-bg-subtle);
   color: inherit;
 }
 
@@ -469,13 +470,14 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 10px;
   padding: 16px;
-  border: 1px solid var(--color-border, #2c313a);
+  border: 1px solid var(--vs-color-border-subtle);
   border-radius: 12px;
+  background: var(--vs-color-bg-surface);
 }
 
 .card--connected {
-  border-color: var(--color-accent, #4f8cff);
-  box-shadow: inset 3px 0 0 var(--color-accent, #4f8cff);
+  border-color: var(--vs-color-accent-default);
+  box-shadow: inset 3px 0 0 var(--vs-color-accent-default);
 }
 
 .card__head {
@@ -515,7 +517,7 @@ onBeforeUnmount(() => {
   min-width: 0;
   padding: 7px 10px;
   border-radius: 7px;
-  background: var(--color-surface, #0f1114);
+  background: var(--vs-color-bg-subtle);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
   overflow-x: auto;

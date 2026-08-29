@@ -446,7 +446,7 @@ onMounted(() => void load());
 </script>
 
 <template>
-  <div class="page page--narrow maintenance-page">
+  <div class="vs-page vs-page--settings maintenance-page">
     <PageHeader
       :title="t('ui.maintenance.title')"
       :description="t('ui.maintenance.description')"

@@ -6,7 +6,7 @@ const { t } = useI18n();
 </script>
 
 <template>
-  <div class="page page--narrow">
+  <div class="vs-page vs-page--settings">
     <EmptyState
       icon="help"
       :title="t('ui.not_found.title')"

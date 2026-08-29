@@ -186,7 +186,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="page page--wide overview-page">
+  <div class="vs-page vs-page--dashboard overview-page">
     <PageHeader :title="t('ui.overview.title')" :description="t('ui.overview.description')">
       <template #meta>
         <span class="overview-updated">{{

@@ -439,7 +439,7 @@ onMounted(() => void load());
 </script>
 
 <template>
-  <div class="page page--narrow integrations-page">
+  <div class="vs-page vs-page--settings integrations-page">
     <PageHeader
       :title="t('ui.integrations.title')"
       :description="t('ui.integrations.description')"

@@ -693,7 +693,7 @@ onMounted(() => void load());
 </script>
 
 <template>
-  <div class="page settings-page">
+  <div class="vs-page settings-page">
     <PageHeader :title="t('ui.settings.title')" :description="t('ui.settings.description')">
       <template #actions>
         <button class="button button--secondary" type="button" :disabled="loading" @click="load">

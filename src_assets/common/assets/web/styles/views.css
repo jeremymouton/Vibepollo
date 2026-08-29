@@ -1,20 +1,8 @@
-.page {
-  width: min(100%, 1280px);
-  margin: 0 auto;
-  padding: var(--vs-space-32);
-}
-
-.page--wide {
-  width: min(100%, 1440px);
-}
-
-.page--fluid {
-  width: 100%;
-}
-
-.page--narrow {
-  width: min(100%, 960px);
-}
+/* The page container lives in base.css as .vs-page, with --dashboard, --settings
+   and --fluid variants. There used to be a second, identical set here — .page,
+   .page--wide, .page--narrow — with the same three widths under different names,
+   and views picked whichever they happened to copy from. That is why the layouts
+   drifted apart. Removed rather than aliased, so there is one name again. */
 
 .section-stack {
   display: grid;
