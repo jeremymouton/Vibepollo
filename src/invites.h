@@ -93,6 +93,20 @@ namespace invite {
   std::vector<std::string> take_paired_devices(const std::string &invite_id);
 
   /**
+   * @brief The permission an invite currently grants a device it paired, if any.
+   *
+   * Empty for a device no invite paired — an owner's own client — whose permission
+   * is not an invite's business.
+   *
+   * Exists because the two guest paths enforce permission at different moments. The
+   * browser's grant is overwritten at every session creation, so it cannot drift. A
+   * native client's is baked into its certificate at pairing time and never looked
+   * at again, so narrowing the invite afterwards did nothing to it, and a device
+   * paired before invites existed carried whatever it happened to be given.
+   */
+  std::optional<std::uint32_t> perm_for_paired_device(const std::string &device_uuid);
+
+  /**
    * @brief Look up an invite by its link token, without redeeming it.
    *
    * For the landing page, which has to say what the link offers before anyone types a

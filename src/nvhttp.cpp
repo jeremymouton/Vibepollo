@@ -2045,6 +2045,24 @@ namespace nvhttp {
       }
       launch_session->unique_id = get_arg(args, "uniqueid", "unknown");
       launch_session->perm = verified_client->perm;
+      // A guest's certificate carries whatever it was granted the day it was paired,
+      // and nothing has looked at it since. Narrowing the invite, or revoking it,
+      // left a native client streaming with its original rights — where the browser
+      // path cannot drift, because its grant is overwritten every session. So the
+      // invite is consulted again here and its CURRENT grant is the ceiling.
+      //
+      // Intersected, never widened: this can only take rights away. A device no
+      // invite paired is untouched, because its permission is the owner's business.
+      if (const auto granted = invite::perm_for_paired_device(verified_client->uuid)) {
+        const auto before = static_cast<std::uint32_t>(launch_session->perm);
+        const auto clamped = before & *granted;
+        if (clamped != before) {
+          BOOST_LOG(info) << "Guest device '"sv << verified_client->name
+                          << "' clamped from permission "sv << before << " to "sv << clamped
+                          << " by its invite"sv;
+        }
+        launch_session->perm = static_cast<crypto::PERM>(clamped);
+      }
       const auto launch_appid_arg = get_arg(args, "appid", "0");
       const auto launch_appuuid_arg = get_arg(args, "appuuid", "");
       auto launch_app_ctx = proc::proc.resolve_app(launch_appid_arg, launch_appuuid_arg);

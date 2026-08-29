@@ -269,6 +269,22 @@ namespace invite {
     save_locked();
   }
 
+  std::optional<std::uint32_t> perm_for_paired_device(const std::string &device_uuid) {
+    if (device_uuid.empty()) {
+      return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (const auto &invite : g_invites) {
+      if (std::find(invite.paired_device_uuids.begin(), invite.paired_device_uuids.end(), device_uuid) !=
+          invite.paired_device_uuids.end()) {
+        // A revoked invite grants nothing. The device is unpaired on revocation
+        // anyway, but if that ever fails to land this still refuses it everything.
+        return invite.revoked ? 0u : invite.perm;
+      }
+    }
+    return std::nullopt;
+  }
+
   std::vector<std::string> take_paired_devices(const std::string &invite_id) {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto *invite = find_locked(invite_id);

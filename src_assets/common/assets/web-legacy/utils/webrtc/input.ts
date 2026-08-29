@@ -467,12 +467,41 @@ function setMotionRequest(id: number, motionType: number, enabled: boolean): voi
   motionRequestState.set(id, state);
 }
 
+/**
+ * A pad that isn't a pad — the on-screen controls a phone guest plays with.
+ *
+ * Injected here rather than given its own input path on purpose. Everything below
+ * reads pads through this one function, so a virtual entry inherits the whole
+ * pipeline unchanged: the button bitmask, the deadzones, the trigger scaling, the
+ * rate limiting. The host cannot tell it from hardware, which is exactly right —
+ * a guest granted a gamepad should get one whether or not they own one.
+ */
+/// Held as a 0-or-1 element list rather than a nullable, which this file's lint
+/// rules discourage.
+let virtualGamepad: Gamepad[] = [];
+
+export function setVirtualGamepad(pad?: Gamepad): void {
+  virtualGamepad = pad ? [pad] : [];
+}
+
 function getGamepads(): (Gamepad | null)[] {
   if (typeof navigator === 'undefined') return [];
   const fallback = (navigator as Navigator & { webkitGetGamepads?: () => (Gamepad | null)[] })
     .webkitGetGamepads;
   const pads = navigator.getGamepads?.() ?? fallback?.() ?? [];
-  return Array.isArray(pads) ? pads : Array.from(pads);
+  // Array.from copes with both a real array and the array-like GamepadList that
+  // older engines hand back.
+  const list = Array.from(pads);
+  const virtual = virtualGamepad[0];
+  if (virtual) {
+    // Takes the first slot no real pad occupies, so plugging a controller in while
+    // the on-screen one is up does not make the two fight over an index.
+    const free = list.findIndex((entry) => !entry);
+    const slot = free < 0 ? list.length : free;
+    const seated: Gamepad = { ...virtual, index: slot };
+    list[slot] = seated;
+  }
+  return list;
 }
 
 function isGamepadConnected(gamepad: Gamepad): boolean {
