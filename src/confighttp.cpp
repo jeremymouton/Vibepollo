@@ -1633,6 +1633,20 @@ namespace confighttp {
       return;
     }
 
+    // The root goes to v2. It is the UI that gets worked on, and the one an owner
+    // should land in; the legacy app stays reachable at its own paths, which is
+    // what /play — the guest stream page — is served from, so this must not become
+    // a blanket redirect.
+    //
+    // A redirect rather than serving v2's shell here: v2 is built with base "/v2/"
+    // and mounts its router at "/v2/", so it only works under that prefix. Moving
+    // it would mean rebuilding both bundles with swapped bases and repointing the
+    // packaging, for a cosmetically shorter URL.
+    if (path_view == "/" || path_view.empty()) {
+      send_redirect(response, request, "/v2/");
+      return;
+    }
+
     const bool is_v2_route = path_view == "/v2" || path_view.starts_with("/v2/");
     const bool is_v2_static_path = path_view == "/v2/assets" || path_view.starts_with("/v2/assets/") ||
                                    path_view == "/v2/images" || path_view.starts_with("/v2/images/");
