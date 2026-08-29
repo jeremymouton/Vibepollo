@@ -23,6 +23,8 @@ import {
   type BrowserVideoCapabilities,
   type WebRtcHostCapabilities,
 } from '@/services/webrtc';
+import TouchGamepad from '@/components/TouchGamepad.vue';
+import { attachInputCapture } from '@/utils/webrtc/input';
 import type { SessionStatus } from '@/types/sessions';
 import type { EncodingType, StreamConfig } from '@/types/webrtc';
 
@@ -187,6 +189,38 @@ const resolutionChoice = ref<string>('1080p');
 /// smeared, which is exactly how it compared against the invite page: that one
 /// sends nothing and so gets the host's own default of 'balanced'.
 const pacingMode = ref<'latency' | 'balanced' | 'smoothness'>('balanced');
+
+/// Gamepads, and only gamepads.
+///
+/// This page forwards keyboard, mouse and wheel with its own handlers but never
+/// read a controller at all — there was a gamepad icon and nothing behind it. The
+/// shared capture module does read them, so it is attached with its keyboard and
+/// pointer half switched off; attaching the whole thing would send every keystroke
+/// twice.
+/// The same overlay guests get. It publishes a Gamepad-shaped object through
+/// setVirtualGamepad, and the capture attached below reads it exactly as hardware —
+/// so it needed no separate path here, only somewhere to be shown.
+const isTouchDevice =
+  typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window);
+const showTouchPad = ref(false);
+
+const noopDetach = (): void => undefined;
+let detachGamepads: () => void = noopDetach;
+
+function releaseGamepads(): void {
+  detachGamepads();
+  detachGamepads = noopDetach;
+}
+
+function captureGamepads(): void {
+  releaseGamepads();
+  const surface = streamSurface.value;
+  if (!surface || !inputReady.value) return;
+  detachGamepads = attachInputCapture(surface, (payload) => browserSession.sendRawInput(payload), {
+    video: videoEl.value,
+    pointerAndKeyboard: false,
+  });
+}
 
 function onResolutionChanged(): void {
   const preset = RESOLUTIONS.find((r) => r.label === resolutionChoice.value);
@@ -1390,6 +1424,13 @@ watch(inputForwarding, (enabled, wasEnabled) => {
   if (!enabled && wasEnabled) releaseForwardedInput();
 });
 
+// inputReady already means connected + forwarding on + data channel open, which is
+// exactly when a controller can reach the host.
+watch(inputReady, (ready) => {
+  if (ready) captureGamepads();
+  else releaseGamepads();
+});
+
 onMounted(() => {
   standaloneWebApp.value = runningAsStandaloneWebApp();
   void refresh();
@@ -1402,6 +1443,7 @@ onMounted(() => {
   videoEl.value?.addEventListener('webkitendfullscreen', onNativeVideoFullscreenEnd);
 });
 onBeforeUnmount(() => {
+  releaseGamepads();
   stopSessionStatusPolling();
   cancelFullscreenExitHold();
   finishFullscreenExitSwipe();
@@ -1616,6 +1658,7 @@ onBeforeUnmount(() => {
       >
         <video ref="videoEl" autoplay muted playsinline disablepictureinpicture />
         <audio ref="audioEl" autoplay hidden />
+        <TouchGamepad v-if="showTouchPad && inputReady" />
         <div
           v-if="showFullscreenSwipeExit"
           class="stream-surface__exit-swipe"
@@ -1863,6 +1906,14 @@ onBeforeUnmount(() => {
                 :max="hostCapabilities.limits.max_fps"
                 step="1"
               />
+            </label>
+
+            <label class="stream-form__check">
+              <input v-model="showTouchPad" type="checkbox" :disabled="!isConnected" />
+              <span>
+                {{ t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller') }}
+                <template v-if="!isTouchDevice"> — for a tablet or touchscreen</template>
+              </span>
             </label>
 
             <label class="stream-form__check">

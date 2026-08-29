@@ -521,6 +521,23 @@ export class BrowserWebRtcSession {
     return this.peerConnection?.connectionState === 'connected';
   }
 
+  /**
+   * Send an already-serialised input payload.
+   *
+   * sendInput takes an object and stringifies it. The shared capture module emits
+   * JSON strings, and binary for mouse moves, so passing its output through
+   * sendInput would encode a string inside a string.
+   */
+  sendRawInput(payload: string | ArrayBuffer): boolean {
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') return false;
+    try {
+      this.dataChannel.send(payload as string);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   sendInput(message: Record<string, unknown>): boolean {
     if (!this.dataChannel || this.dataChannel.readyState !== 'open') return false;
     try {

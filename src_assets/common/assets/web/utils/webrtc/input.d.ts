@@ -16,6 +16,8 @@ interface InputCaptureOptions {
   video?: HTMLVideoElement | null;
   onMetrics?: (metrics: InputCaptureMetrics) => void;
   gamepad?: boolean;
+  /** Capture pointer, wheel and keyboard as well as gamepads. Defaults to true. */
+  pointerAndKeyboard?: boolean;
   shouldDrop?: (payload: InputMessage) => boolean;
 }
 
@@ -27,3 +29,6 @@ export declare function attachInputCapture(
   send: (payload: string | ArrayBuffer) => boolean | void,
   options?: InputCaptureOptions,
 ): () => void;
+
+/** Publish a Gamepad-shaped object so the capture loop reads it as hardware. */
+export declare function setVirtualGamepad(pad?: Gamepad): void;

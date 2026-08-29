@@ -10,9 +10,21 @@ export default defineConfig({
   plugins: [vue()],
   base: '/v2/',
   resolve: {
-    alias: {
-      '@': fileURLToPath(new URL('.', import.meta.url)),
-    },
+    // Ordered: the webrtc utilities live in the legacy tree and are shared, which is
+    // what the .d.ts stubs under utils/webrtc describe. Everything else is local.
+    alias: [
+      {
+        find: '@/components/TouchGamepad.vue',
+        replacement: fileURLToPath(
+          new URL('../web-legacy/components/TouchGamepad.vue', import.meta.url),
+        ),
+      },
+      {
+        find: /^@\/utils\/webrtc\/(.*)$/,
+        replacement: fileURLToPath(new URL('../web-legacy/utils/webrtc/$1', import.meta.url)),
+      },
+      { find: '@', replacement: fileURLToPath(new URL('.', import.meta.url)) },
+    ],
   },
   build: {
     outDir: configuredOutputDirectory

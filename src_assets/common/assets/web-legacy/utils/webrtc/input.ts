@@ -16,6 +16,14 @@ interface InputCaptureOptions {
   video?: HTMLVideoElement | null;
   onMetrics?: (metrics: InputCaptureMetrics) => void;
   gamepad?: boolean;
+  /**
+   * Whether to capture pointer, wheel and keyboard as well as gamepads.
+   *
+   * The v2 stream page already forwards those itself, and attaching them again
+   * would send every keystroke and mouse move twice. It wants the gamepad half
+   * only, which is the half it never had.
+   */
+  pointerAndKeyboard?: boolean;
   shouldDrop?: (payload: InputMessage) => boolean;
 }
 
@@ -561,6 +569,7 @@ export function attachInputCapture(
   const onMetrics = options.onMetrics;
   const gamepadEnabled = options.gamepad ?? true;
   const shouldDrop = options.shouldDrop;
+  const captureKeyboardAndPointer = options.pointerAndKeyboard ?? true;
   let queuedMove: InputMessage | null = null;
   let queuedMoveAt = 0;
   let rafId = 0;
@@ -1165,7 +1174,7 @@ export function attachInputCapture(
     }
   };
 
-  if (supportsPointer) {
+  if (captureKeyboardAndPointer && supportsPointer) {
     element.addEventListener('pointermove', onPointerMove);
     element.addEventListener('pointerdown', onPointerDown);
     element.addEventListener('pointerup', onPointerUp);
@@ -1175,13 +1184,15 @@ export function attachInputCapture(
     element.addEventListener('mousedown', onMouseDown);
     element.addEventListener('mouseup', onMouseUp);
   }
-  element.addEventListener('wheel', onWheel, { passive: false });
-  window.addEventListener('keydown', onKeyDown, true);
-  window.addEventListener('keyup', onKeyUp, true);
-  element.addEventListener('contextmenu', onContextMenu);
-  element.addEventListener('blur', onBlur);
-  window.addEventListener('blur', onBlur);
-  document.addEventListener('visibilitychange', onVisibilityChange);
+  if (captureKeyboardAndPointer) {
+    element.addEventListener('wheel', onWheel, { passive: false });
+    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('keyup', onKeyUp, true);
+    element.addEventListener('contextmenu', onContextMenu);
+    element.addEventListener('blur', onBlur);
+    window.addEventListener('blur', onBlur);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+  }
 
   if (supportsGamepad) {
     gamepadRaf = requestAnimationFrame(pollGamepads);
