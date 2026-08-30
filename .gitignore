@@ -73,3 +73,8 @@ AGENTS.md
 test_sunshine.log
 vibeshine_state.json
 .claude/
+
+# Installers pulled down from CI for testing. Tens of megabytes each, and
+# rebuildable from any run, so they have no business in the history — especially
+# with the repository public.
+dist/
