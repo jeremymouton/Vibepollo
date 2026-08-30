@@ -24,6 +24,7 @@ import {
   type WebRtcHostCapabilities,
 } from '@/services/webrtc';
 import TouchGamepad from '@/components/TouchGamepad.vue';
+import { useActiveStream } from '@/stores/activeStream';
 import { applyGamepadFeedback, attachInputCapture } from '@/utils/webrtc/input';
 import type { SessionStatus } from '@/types/sessions';
 import type { EncodingType, StreamConfig } from '@/types/webrtc';
@@ -206,6 +207,11 @@ const showTouchPad = ref(false);
 
 /// Same numbers the guest page shows, for the same reason: "it looked bad" cannot
 /// tell a slow link from a lossy one from a host that cannot keep up.
+/// Publishes the running stream so the corner player can show it while the owner
+/// is on another page. Publishing the video-only stream, not the raw one: the
+/// audio stays on this page's own element, and two elements playing it would echo.
+const activeStream = useActiveStream();
+
 const showStats = ref(false);
 const streamStats = ref<{
   bitrateKbps?: number;
@@ -854,6 +860,7 @@ function attachRemoteStream(stream: MediaStream): void {
     player.muted = true;
     player.srcObject = videoPlaybackStream;
     startVideoFrameLatencyMonitoring(player);
+    activeStream.publish(videoPlaybackStream ?? undefined, selectedAppName.value);
   }
 
   const audioTracks = stream.getAudioTracks();
@@ -984,6 +991,7 @@ async function disconnect(restartStatusPolling = true): Promise<void> {
   if (audioEl.value) audioEl.value.srcObject = null;
   videoPlaybackStream = null;
   audioPlaybackStream = null;
+  activeStream.publish();
   playbackBlocked.value = false;
   connectionState.value = 'idle';
   if (restartStatusPolling) startSessionStatusPolling();

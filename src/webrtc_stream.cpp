@@ -3174,18 +3174,28 @@ namespace webrtc_stream {
       // discover what settings they chose, so being told "disconnect it first" is a
       // dead end. When asked to, adopt the running capture instead: the second
       // arrival joins on the terms already set rather than dictating new ones.
-      if (
+      const bool joining_active_capture =
         options.adopt_active_capture &&
         webrtc_capture.active.load(std::memory_order_acquire) &&
+        webrtc_capture.config_key &&
         webrtc_capture.active_video_config &&
-        webrtc_capture.active_audio_config
-      ) {
+        webrtc_capture.active_audio_config;
+
+      if (joining_active_capture) {
         BOOST_LOG(info) << "WebRTC: joining the active capture rather than reconfiguring it"sv;
         video_config = *webrtc_capture.active_video_config;
         audio_config = *webrtc_capture.active_audio_config;
       }
 
-      auto desired_key = build_capture_config_key(effective_app_id, video_config, options);
+      // Adopting the running key rather than rebuilding one from the guest's request.
+      // The key is not derived from the video configuration alone — it also carries
+      // the audio channel count, the host-audio flag and which application is being
+      // captured, none of which live in video_config. Copying only the configs left
+      // those three free to differ, and the comparison below still refused the guest
+      // for reasons they had even less ability to do anything about.
+      auto desired_key = joining_active_capture
+        ? *webrtc_capture.config_key
+        : build_capture_config_key(effective_app_id, video_config, options);
 
       if (
         webrtc_capture.active.load(std::memory_order_acquire) &&

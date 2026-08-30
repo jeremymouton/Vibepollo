@@ -349,59 +349,67 @@ onBeforeUnmount(() => {
       disablepictureinpicture
     ></video>
 
-    <div
-      v-if="phase !== 'playing'"
-      class="absolute inset-0 flex flex-col items-center justify-center gap-4 text-center text-white/90 bg-black/80 px-6"
-    >
-      <img src="/images/logo-apollo-45.png" alt="" class="h-14 w-14 opacity-80" />
+    <!-- Scrolls when it has to. A phone held sideways has barely any height, and
+         centring alone clips the overflow in both directions — the Start button
+         ended up below the fold with no way to reach it. min-h-full on the inner
+         block keeps it centred whenever there IS room. -->
+    <div v-if="phase !== 'playing'" class="absolute inset-0 overflow-y-auto bg-black/80">
+      <div
+        class="min-h-full flex flex-col items-center justify-center gap-4 px-6 py-8 text-center text-white/90"
+      >
+        <img src="/images/logo-apollo-45.png" alt="" class="h-14 w-14 opacity-80" />
 
-      <div v-if="phase === 'ready'" class="w-full max-w-xs space-y-3 text-left text-sm">
-        <p class="text-center text-base">Ready when you are.</p>
-        <label class="block">
-          Quality
-          <select v-model.number="quality.maxHeight" class="mt-1 w-full rounded bg-white/10 p-2">
-            <option :value="720">720p — best on a phone or a slow line</option>
-            <option :value="1080">1080p</option>
-            <option :value="1440">1440p — needs a fast connection</option>
-          </select>
-        </label>
-        <label class="block">
-          Bitrate
-          <select v-model.number="quality.bitrateKbps" class="mt-1 w-full rounded bg-white/10 p-2">
-            <option :value="0">Automatic</option>
-            <option :value="5000">5 Mbps</option>
-            <option :value="10000">10 Mbps</option>
-            <option :value="20000">20 Mbps</option>
-            <option :value="40000">40 Mbps</option>
-          </select>
-        </label>
-        <label class="block">
-          Frame rate
-          <select v-model.number="quality.fps" class="mt-1 w-full rounded bg-white/10 p-2">
-            <option :value="30">30 fps</option>
-            <option :value="60">60 fps</option>
-          </select>
-        </label>
-        <p class="text-white/50 text-xs">
-          Automatic follows your connection. You can change all of this while playing.
-        </p>
-        <button class="w-full rounded bg-white/25 py-2 text-base" @click="startChosen">
-          Start streaming
+        <div v-if="phase === 'ready'" class="w-full max-w-xs space-y-3 text-left text-sm">
+          <p class="text-center text-base">Ready when you are.</p>
+          <label class="block">
+            Quality
+            <select v-model.number="quality.maxHeight" class="mt-1 w-full rounded bg-white/10 p-2">
+              <option :value="720">720p — best on a phone or a slow line</option>
+              <option :value="1080">1080p</option>
+              <option :value="1440">1440p — needs a fast connection</option>
+            </select>
+          </label>
+          <label class="block">
+            Bitrate
+            <select
+              v-model.number="quality.bitrateKbps"
+              class="mt-1 w-full rounded bg-white/10 p-2"
+            >
+              <option :value="0">Automatic</option>
+              <option :value="5000">5 Mbps</option>
+              <option :value="10000">10 Mbps</option>
+              <option :value="20000">20 Mbps</option>
+              <option :value="40000">40 Mbps</option>
+            </select>
+          </label>
+          <label class="block">
+            Frame rate
+            <select v-model.number="quality.fps" class="mt-1 w-full rounded bg-white/10 p-2">
+              <option :value="30">30 fps</option>
+              <option :value="60">60 fps</option>
+            </select>
+          </label>
+          <p class="text-white/50 text-xs">
+            Automatic follows your connection. You can change all of this while playing.
+          </p>
+          <button class="w-full rounded bg-white/25 py-2 text-base" @click="startChosen">
+            Start streaming
+          </button>
+        </div>
+
+        <p v-else class="text-lg">{{ message }}</p>
+        <button
+          v-if="phase === 'error' || phase === 'ended'"
+          class="rounded px-4 py-2 bg-white/15 hover:bg-white/25 transition"
+          @click="
+            phase = 'connecting';
+            message = 'Connecting to the host…';
+            start();
+          "
+        >
+          Try again
         </button>
       </div>
-
-      <p v-else class="text-lg">{{ message }}</p>
-      <button
-        v-if="phase === 'error' || phase === 'ended'"
-        class="rounded px-4 py-2 bg-white/15 hover:bg-white/25 transition"
-        @click="
-          phase = 'connecting';
-          message = 'Connecting to the host…';
-          start();
-        "
-      >
-        Try again
-      </button>
     </div>
 
     <TouchGamepad v-if="phase === 'playing' && showTouchPad" />

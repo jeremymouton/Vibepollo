@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import { useRoute } from 'vue-router';
+
+import MiniStream from '@/components/MiniStream.vue';
 import { onMounted } from 'vue';
 import { useI18n } from 'vue-i18n';
 
@@ -7,6 +10,7 @@ import AuthView from '@/views/AuthView.vue';
 import { useSystemStore } from '@/stores/system';
 
 const system = useSystemStore();
+const route = useRoute();
 const { t } = useI18n();
 
 onMounted(() => {
@@ -26,8 +30,19 @@ onMounted(() => {
   <AuthView v-else-if="system.needsSetup || system.needsLogin" />
 
   <AppShell v-else>
-    <RouterView />
+    <!-- The stream page is kept alive so navigating to Invites or Devices does not
+         tear the session down. Leaving the page is not the same as wanting to stop
+         playing, and reconnecting costs a renegotiation and a fresh encoder. -->
+    <RouterView v-slot="{ Component }">
+      <KeepAlive :include="['BrowserStreamView']">
+        <component :is="Component" />
+      </KeepAlive>
+    </RouterView>
   </AppShell>
+
+  <!-- Outside AppShell so it is not clipped by the page container, and shown only
+       while a stream is running somewhere other than the page it belongs to. -->
+  <MiniStream v-if="!system.needsSetup && !system.needsLogin && route.path !== '/stream'" />
 
   <div class="visually-hidden" aria-live="polite" aria-atomic="true">
     {{ system.error ? t(system.error) : '' }}
