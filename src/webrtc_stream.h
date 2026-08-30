@@ -35,6 +35,16 @@ namespace webrtc_stream {
     std::optional<bool> hdr;
     std::optional<bool> yuv444;
     std::optional<int> audio_channels;
+
+    /**
+     * @brief Join a capture already running instead of being refused for differing.
+     *
+     * The capture is shared by every WebRTC peer, so a second session must match the
+     * first exactly. An owner told to disconnect and retry can do so. A guest cannot:
+     * the stream is not theirs to end, and the settings it uses are not visible to
+     * them. So a guest asks for this and takes what is already running.
+     */
+    bool adopt_active_capture = false;
     std::optional<std::string> audio_codec;
       std::optional<std::string> profile;
       std::optional<int> app_id;

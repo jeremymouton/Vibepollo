@@ -872,6 +872,11 @@ namespace webrtc_stream {
       std::atomic_bool feedback_shutdown {false};
       std::optional<int> app_id;
       std::optional<WebRtcCaptureConfigKey> config_key;
+      /// The settings the running capture is actually using. The key alone can say
+      /// "these differ" but not "use these instead", which is what a guest joining
+      /// somebody else's stream needs.
+      std::optional<video::config_t> active_video_config;
+      std::optional<audio::config_t> active_audio_config;
       std::optional<WebRtcStreamStartParams> stream_start_params;
       std::optional<int> published_bitrate_kbps;
     };
@@ -3165,6 +3170,21 @@ namespace webrtc_stream {
       auto audio_config = build_audio_config(options);
       apply_rtsp_video_overrides(video_config, rtsp_config);
       apply_rtx_hdr_stream_policy(video_config);
+      // A guest cannot disconnect whoever is already streaming, and has no way to
+      // discover what settings they chose, so being told "disconnect it first" is a
+      // dead end. When asked to, adopt the running capture instead: the second
+      // arrival joins on the terms already set rather than dictating new ones.
+      if (
+        options.adopt_active_capture &&
+        webrtc_capture.active.load(std::memory_order_acquire) &&
+        webrtc_capture.active_video_config &&
+        webrtc_capture.active_audio_config
+      ) {
+        BOOST_LOG(info) << "WebRTC: joining the active capture rather than reconfiguring it"sv;
+        video_config = *webrtc_capture.active_video_config;
+        audio_config = *webrtc_capture.active_audio_config;
+      }
+
       auto desired_key = build_capture_config_key(effective_app_id, video_config, options);
 
       if (
@@ -3330,6 +3350,8 @@ namespace webrtc_stream {
       webrtc_capture.launch_session = launch_session;
       webrtc_capture.app_id = effective_app_id > 0 ? std::optional<int> {effective_app_id} : std::nullopt;
       webrtc_capture.config_key = desired_key;
+      webrtc_capture.active_video_config = video_config;
+      webrtc_capture.active_audio_config = audio_config;
       webrtc_capture.published_bitrate_kbps.reset();
 #ifdef _WIN32
       if (pending_output_override_lease) {
@@ -3475,6 +3497,8 @@ namespace webrtc_stream {
         webrtc_capture.launch_session.reset();
         webrtc_capture.app_id.reset();
         webrtc_capture.config_key.reset();
+        webrtc_capture.active_video_config.reset();
+        webrtc_capture.active_audio_config.reset();
         webrtc_capture.stream_start_params.reset();
         webrtc_capture.published_bitrate_kbps.reset();
 
