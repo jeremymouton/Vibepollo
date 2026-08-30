@@ -1774,6 +1774,23 @@ namespace webrtc_stream {
       crypto::PERM input_permission = crypto::PERM::_all_inputs;
       int gamepad_base_slot = 0;
       video::config_t video_config;
+
+      /// This peer's own encoder.
+      ///
+      /// Every WebRTC peer used to share one encoder, which forced three things on
+      /// everybody: one codec, the slowest peer's bitrate, and one keyframe stream. A
+      /// guest whose browser negotiated a codec the encoder was not emitting decoded
+      /// nothing and asked for keyframes forever, and those keyframes landed in the
+      /// host's stream too. video.cpp already supports many encoders over one display
+      /// capture — it is how several Moonlight clients are served — so each peer now
+      /// runs its own, and packets are routed back by channel_data.
+      std::shared_ptr<safe::mail_raw_t> encoder_mail;
+      std::thread encoder_thread;
+      /// Identity stamped onto this peer's encoded packets by video.cpp. Heap-allocated
+      /// so the address stays valid and unique for the life of the session.
+      std::shared_ptr<int> channel_token;
+      /// Last bitrate handed to this peer's encoder, for change-threshold damping.
+      std::optional<int> published_bitrate_kbps;
       ring_buffer_t<EncodedVideoFrame> video_frames {kMaxVideoFrames};
       ring_buffer_t<EncodedAudioFrame> audio_frames {kMaxAudioFrames};
       ring_buffer_t<RawVideoFrame> raw_video_frames {kMaxVideoFrames};
@@ -1885,64 +1902,69 @@ namespace webrtc_stream {
     }
 
 #ifdef SUNSHINE_ENABLE_WEBRTC
-    std::optional<int> aggregate_webrtc_encoder_bitrate_locked() {
-      std::optional<int> aggregate_bitrate_kbps;
-      // A capture is shared by all WebRTC peers. Use its most constrained
-      // active peer so encoded frames do not accumulate downstream of the
-      // per-peer sender when one connection slows down.
-      for (const auto &[_, session] : sessions) {
-        if (!session.state.video || !session.peer) {
-          continue;
-        }
-        const int configured = std::max(1, session.video_config.bitrate);
-        const int target = std::clamp(
-          session.congestion_target_bitrate_kbps.value_or(configured),
-          1,
-          configured
-        );
-        aggregate_bitrate_kbps = aggregate_bitrate_kbps
-          ? std::min(*aggregate_bitrate_kbps, target)
-          : target;
-      }
-      return aggregate_bitrate_kbps;
-    }
-
-    void publish_webrtc_encoder_bitrate(int target_bitrate_kbps) {
-      if (target_bitrate_kbps <= 0 || rtsp_sessions_active.load(std::memory_order_relaxed)) {
+    /// Start this peer's own encoder over the shared display capture.
+    ///
+    /// video.cpp keeps a vector of capture contexts against one display, so calling
+    /// video::capture() once per peer gives each an independent encoder — its own codec,
+    /// bitrate and keyframe stream — while the screen is still grabbed exactly once.
+    /// channel_data is the identity video.cpp stamps onto the packets it produces, which
+    /// is how submit_video_packet routes them back to the right peer.
+    void start_session_encoder(Session &session) {
+      if (!session.state.video || session.encoder_thread.joinable()) {
         return;
       }
+      session.channel_token = std::make_shared<int>(0);
+      session.encoder_mail = std::make_shared<safe::mail_raw_t>();
 
-      std::shared_ptr<safe::mail_raw_t> capture_mail;
-      {
-        std::lock_guard<std::mutex> lock(webrtc_capture.mutex);
-        if (!webrtc_capture.active.load(std::memory_order_acquire) || !webrtc_capture.mail) {
-          return;
-        }
+      auto mail = session.encoder_mail;
+      auto config = session.video_config;
+      auto *channel = static_cast<void *>(session.channel_token.get());
+      const auto id = session.state.id;
 
-        const auto previous = webrtc_capture.published_bitrate_kbps;
-        const bool decreasing = previous && target_bitrate_kbps < *previous;
-        const int minimum_change = previous
-          ? std::max(
-              decreasing ? kWebrtcBitrateDecreaseMinimumKbps : kWebrtcBitrateIncreaseMinimumKbps,
-              *previous * kWebrtcBitrateChangePercent / 100
-            )
-          : 0;
-        const int change = previous ? std::abs(target_bitrate_kbps - *previous) : 0;
-        if (previous && change < minimum_change) {
-          return;
-        }
+      session.encoder_thread = std::thread([mail, config, channel, id]() mutable {
+        BOOST_LOG(info) << "WebRTC: encoder starting for session " << id << ' '
+                        << config.width << 'x' << config.height << '@' << config.framerate
+                        << " format=" << config.videoFormat
+                        << " bitrate=" << config.bitrate << "kbps";
+        video::capture(mail, config, channel);
+        BOOST_LOG(info) << "WebRTC: encoder stopped for session " << id;
+      });
+    }
 
-        webrtc_capture.published_bitrate_kbps = target_bitrate_kbps;
-        capture_mail = webrtc_capture.mail;
+    /// Ignore small changes so the encoder is not reconfigured on every tick.
+    bool bitrate_change_is_significant(std::optional<int> previous, int target_kbps) {
+      if (!previous) {
+        return true;
       }
+      const bool decreasing = target_kbps < *previous;
+      const int minimum_change = std::max(
+        decreasing ? kWebrtcBitrateDecreaseMinimumKbps : kWebrtcBitrateIncreaseMinimumKbps,
+        *previous * kWebrtcBitrateChangePercent / 100
+      );
+      return std::abs(target_kbps - *previous) >= minimum_change;
+    }
 
-      const auto bitrate_event = capture_mail->event<int>(mail::dynamic_bitrate);
+    /// Hand a bitrate to one peer's encoder.
+    ///
+    /// This replaces an aggregate that ran the single shared encoder at the MINIMUM target
+    /// across every session. That made one guest on a poor link — or one who simply pinned a
+    /// low slider — the ceiling for everybody, the host included. Encoders are per peer now,
+    /// so each peer's congestion controller drives only its own.
+    void raise_session_encoder_bitrate(
+      const std::shared_ptr<safe::mail_raw_t> &encoder_mail,
+      const std::string &session_id,
+      int target_bitrate_kbps
+    ) {
+      if (!encoder_mail || target_bitrate_kbps <= 0) {
+        return;
+      }
+      const auto bitrate_event = encoder_mail->event<int>(mail::dynamic_bitrate);
       if (!bitrate_event) {
         return;
       }
       bitrate_event->raise(target_bitrate_kbps);
-      BOOST_LOG(debug) << "WebRTC: congestion controller target "
-                       << target_bitrate_kbps << " kbps for shared encoder";
+      BOOST_LOG(debug) << "WebRTC: congestion controller target " << target_bitrate_kbps
+                       << " kbps for session " << session_id;
     }
 
     void on_webrtc_encoder_rate_update(
@@ -1963,7 +1985,9 @@ namespace webrtc_stream {
         return;
       }
 
-      std::optional<int> aggregate_bitrate_kbps;
+      std::shared_ptr<safe::mail_raw_t> encoder_mail;
+      std::string session_id;
+      int session_target_kbps = 0;
       {
         std::lock_guard lg {session_mutex};
         if (!context->active.load(std::memory_order_acquire)) {
@@ -1974,19 +1998,24 @@ namespace webrtc_stream {
           return;
         }
 
+        // The configured bitrate is this peer's own ceiling; congestion control moves
+        // freely underneath it and no longer has to agree with anybody else's.
         const int configured_bitrate_kbps = std::max(1, current->second.video_config.bitrate);
-        current->second.congestion_target_bitrate_kbps = std::clamp(
-          requested_bitrate_kbps,
-          1,
-          configured_bitrate_kbps
-        );
-        aggregate_bitrate_kbps = aggregate_webrtc_encoder_bitrate_locked();
+        const int target_kbps = std::clamp(requested_bitrate_kbps, 1, configured_bitrate_kbps);
+        current->second.congestion_target_bitrate_kbps = target_kbps;
+        if (!bitrate_change_is_significant(current->second.published_bitrate_kbps, target_kbps)) {
+          return;
+        }
+        current->second.published_bitrate_kbps = target_kbps;
+        encoder_mail = current->second.encoder_mail;
+        session_id = current->second.state.id;
+        session_target_kbps = target_kbps;
       }
 
-      if (!aggregate_bitrate_kbps || !context->active.load(std::memory_order_acquire)) {
+      if (!context->active.load(std::memory_order_acquire)) {
         return;
       }
-      publish_webrtc_encoder_bitrate(*aggregate_bitrate_kbps);
+      raise_session_encoder_bitrate(encoder_mail, session_id, session_target_kbps);
     }
 #endif
 
@@ -2075,6 +2104,36 @@ namespace webrtc_stream {
       BOOST_LOG(debug) << "WebRTC: keyframe requested (" << reason << ')';
     }
 
+    /// Raise IDR on one peer's encoder, given only its mail.
+    ///
+    /// Some call sites have released the session lock by the time they decide to ask, so
+    /// they capture the mail while the session is in scope and raise afterwards.
+    void raise_session_keyframe(
+      const std::shared_ptr<safe::mail_raw_t> &encoder_mail,
+      std::string_view reason
+    ) {
+      if (!encoder_mail) {
+        request_keyframe(reason);
+        return;
+      }
+      auto idr_events = encoder_mail->event<bool>(mail::idr);
+      if (!idr_events) {
+        return;
+      }
+      idr_events->raise(true);
+      BOOST_LOG(debug) << "WebRTC: keyframe requested (" << reason << ')';
+    }
+
+    /// Ask only this peer's encoder for a keyframe.
+    ///
+    /// The global overload above raises IDR for every session at once, so one peer that
+    /// could not decode — and therefore asked forever — pushed ~70kB keyframes into every
+    /// other peer's stream. Now that each peer owns an encoder, a keyframe request belongs
+    /// to the peer that made it.
+    void request_keyframe(Session &session, std::string_view reason) {
+      raise_session_keyframe(session.encoder_mail, reason);
+    }
+
     void reset_video_pacing_after_dependency_gap(
       Session &session,
       std::chrono::steady_clock::time_point now
@@ -2103,7 +2162,7 @@ namespace webrtc_stream {
       if (!session.last_keyframe_request ||
           now - *session.last_keyframe_request >= kKeyframeRequestInterval) {
         session.last_keyframe_request = now;
-        request_keyframe(reason);
+        request_keyframe(session, reason);
       }
     }
 
@@ -2131,6 +2190,7 @@ namespace webrtc_stream {
       // call into libwebrtc. Taking it first closes the otherwise unavoidable
       // check-then-push window for work prepared before this resync request.
       std::lock_guard<std::mutex> send_lock(*video_send_gate);
+      std::shared_ptr<safe::mail_raw_t> resync_encoder_mail;
       {
         std::lock_guard lg {session_mutex};
         auto it = sessions.find(std::string {session_id});
@@ -2158,12 +2218,14 @@ namespace webrtc_stream {
         session.last_keyframe_request = now;
         session.last_latency_resync = now;
         reset_video_pacing_after_dependency_gap(session, now);
+        // Captured here because the request below happens after the lock is released.
+        resync_encoder_mail = session.encoder_mail;
       }
 
       // The next work item must be a post-resync IDR. Work extracted before
       // this point carries the old delivery epoch and is rejected just before
       // it reaches the WebRTC sender.
-      request_keyframe("browser latency resync");
+      raise_session_keyframe(resync_encoder_mail, "browser latency resync");
       BOOST_LOG(debug) << "WebRTC: latency resync requested id=" << session_id
                        << " discarded " << discarded_frames << " queued frame(s)";
     }
@@ -3378,9 +3440,9 @@ namespace webrtc_stream {
 #endif
       webrtc_capture.active.store(true, std::memory_order_release);
 
-      webrtc_capture.video_thread = std::thread([mail, video_config]() mutable {
-        video::capture(mail, video_config, nullptr);
-      });
+      // No shared video encoder any more — each session starts its own in
+      // start_session_encoder(), over this same display capture. Audio stays shared
+      // because every peer gets the same Opus stream.
       webrtc_capture.audio_thread = std::thread([mail, audio_config]() mutable {
         audio::capture(mail, audio_config, nullptr);
       });
@@ -5063,7 +5125,7 @@ namespace webrtc_stream {
                   if (!session.last_keyframe_request ||
                       now - *session.last_keyframe_request >= kKeyframeRequestInterval) {
                     session.last_keyframe_request = now;
-                    request_keyframe("waiting for video keyframe");
+                    request_keyframe(session, "waiting for video keyframe");
                   }
                 }
               }
@@ -5294,6 +5356,7 @@ namespace webrtc_stream {
 
             const auto now = std::chrono::steady_clock::now();
             bool should_request = false;
+            std::shared_ptr<safe::mail_raw_t> pli_encoder_mail;
             {
               std::lock_guard lg {session_mutex};
               auto it = sessions.find(ctx->id);
@@ -5311,12 +5374,13 @@ namespace webrtc_stream {
               if (!it->second.last_keyframe_request ||
                   now - *it->second.last_keyframe_request >= kPliRequestInterval) {
                 it->second.last_keyframe_request = now;
+                pli_encoder_mail = it->second.encoder_mail;
                 should_request = true;
               }
             }
 
             if (should_request) {
-              request_keyframe("PLI/FIR");
+              raise_session_keyframe(pli_encoder_mail, "PLI/FIR");
             }
           },
           session.keyframe_context.get()
@@ -5386,7 +5450,7 @@ namespace webrtc_stream {
       if (session.state.video && requested_video_keyframe) {
         session.needs_keyframe = true;
         session.last_keyframe_request = std::chrono::steady_clock::now();
-        request_keyframe("initial video track");
+        request_keyframe(session, "initial video track");
       }
 
       ensure_media_thread();
@@ -5598,8 +5662,10 @@ namespace webrtc_stream {
       }
       {
         std::lock_guard lg {session_mutex};
-        sessions.emplace(snapshot.id, std::move(session));
+        const auto inserted = sessions.emplace(snapshot.id, std::move(session)).first;
         first_session = active_sessions.fetch_add(1, std::memory_order_relaxed) == 0;
+        // After insertion, so the first packets this encoder produces have somewhere to go.
+        start_session_encoder(inserted->second);
       }
       webrtc_capture.pending_session_creations.fetch_sub(1, std::memory_order_release);
       reservation_guard.disable();
@@ -5646,6 +5712,10 @@ namespace webrtc_stream {
       );
     });
 
+    // Owned outside the WebRTC ifdef: the encoder exists whenever the session does.
+    std::shared_ptr<safe::mail_raw_t> encoder_mail;
+    std::thread encoder_thread;
+
 #ifdef SUNSHINE_ENABLE_WEBRTC
     BOOST_LOG(debug) << "WebRTC: close_session enter id=" << id;
     std::shared_ptr<lwrtc_factory_t> factory;
@@ -5660,7 +5730,6 @@ namespace webrtc_stream {
     std::shared_ptr<SessionDataChannelContext> data_channel_context;
     std::shared_ptr<SessionKeyframeContext> keyframe_context;
     std::shared_ptr<SessionRateContext> rate_context;
-    std::optional<int> remaining_bitrate_kbps;
 #endif
     bool removed = false;
     bool last_session = false;
@@ -5688,10 +5757,9 @@ namespace webrtc_stream {
         keyframe_context = it->second.keyframe_context;
         rate_context = it->second.rate_context;
 #endif
+        encoder_mail = std::move(it->second.encoder_mail);
+        encoder_thread = std::move(it->second.encoder_thread);
         sessions.erase(it);
-#ifdef SUNSHINE_ENABLE_WEBRTC
-        remaining_bitrate_kbps = aggregate_webrtc_encoder_bitrate_locked();
-#endif
         removed = true;
         // Publish the teardown reservation before removing the active owner.
         // An HTTP observer that acquires active_sessions == 0 must also observe
@@ -5701,6 +5769,18 @@ namespace webrtc_stream {
     }
     if (removed) {
       local_answer_cv.notify_all();
+    }
+
+    // Stop this peer's encoder. Joined only after the session lock is released: the
+    // encoder thread delivers through submit_video_packet, which takes that same lock,
+    // so joining while holding it would deadlock.
+    if (encoder_mail) {
+      if (auto shutdown_event = encoder_mail->event<bool>(mail::shutdown)) {
+        shutdown_event->raise(true);
+      }
+    }
+    if (encoder_thread.joinable()) {
+      encoder_thread.join();
     }
 #ifdef SUNSHINE_ENABLE_WEBRTC
     // These callbacks retain raw context pointers in libwebrtc. Deactivate
@@ -5750,9 +5830,6 @@ namespace webrtc_stream {
     video_source.reset();
     audio_source.reset();
     factory.reset();
-    if (!last_session && remaining_bitrate_kbps) {
-      publish_webrtc_encoder_bitrate(*remaining_bitrate_kbps);
-    }
 #endif
     BOOST_LOG(debug) << "WebRTC: close_session exit id=" << id;
 
@@ -5827,7 +5904,10 @@ namespace webrtc_stream {
       return;
     }
 
-    if (!webrtc_capture.active.load(std::memory_order_acquire) || packet.channel_data != nullptr) {
+    // Packets used to arrive with a null channel and be broadcast to every peer, because
+    // one encoder served them all. Each peer now owns an encoder and video.cpp stamps that
+    // peer's token on its packets, so this delivers to exactly one session.
+    if (!webrtc_capture.active.load(std::memory_order_acquire) || packet.channel_data == nullptr) {
       return;
     }
 
@@ -5836,6 +5916,9 @@ namespace webrtc_stream {
     std::lock_guard lg {session_mutex};
     for (auto &[_, session] : sessions) {
       if (!session.state.video) {
+        continue;
+      }
+      if (!session.channel_token || session.channel_token.get() != packet.channel_data) {
         continue;
       }
 
