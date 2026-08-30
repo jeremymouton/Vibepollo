@@ -1972,6 +1972,12 @@ namespace webrtc_stream {
     }
 
     /// Ignore small changes so the encoder is not reconfigured on every tick.
+    /// How far congestion control may pull the encoder below the configured bitrate.
+    ///
+    /// 100 would pin the bitrate exactly as Moonlight does; 0 would restore the previous
+    /// behaviour of following the estimate all the way down.
+    constexpr int kEncoderBitrateFloorPercent = 50;
+
     bool bitrate_change_is_significant(std::optional<int> previous, int target_kbps) {
       if (!previous) {
         return true;
@@ -2041,7 +2047,22 @@ namespace webrtc_stream {
         // The configured bitrate is this peer's own ceiling; congestion control moves
         // freely underneath it and no longer has to agree with anybody else's.
         const int configured_bitrate_kbps = std::max(1, current->second.video_config.bitrate);
-        const int target_kbps = std::clamp(requested_bitrate_kbps, 1, configured_bitrate_kbps);
+
+        // ...but not all the way down. Obeying the bandwidth estimate without a floor is
+        // why this looks worse than MoonlightWeb: that bridges a fixed-bitrate GameStream
+        // into WebRTC, so its source never slows and the picture stays sharp even when the
+        // path is poor. Ours throttled the encoder on every loss signal and collapsed to
+        // ~1.3Mbps at 1080p, which is mush. A floor keeps detail at the cost of dropping
+        // packets on a genuinely bad path — the same trade Moonlight makes deliberately.
+        const int floor_kbps = std::max(
+          1,
+          configured_bitrate_kbps * kEncoderBitrateFloorPercent / 100
+        );
+        const int target_kbps = std::clamp(
+          std::max(requested_bitrate_kbps, floor_kbps),
+          1,
+          configured_bitrate_kbps
+        );
         current->second.congestion_target_bitrate_kbps = target_kbps;
         if (!bitrate_change_is_significant(current->second.published_bitrate_kbps, target_kbps)) {
           return;
