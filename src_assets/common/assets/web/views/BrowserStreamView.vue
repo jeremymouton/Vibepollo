@@ -204,6 +204,21 @@ const isTouchDevice =
   typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window);
 const showTouchPad = ref(false);
 
+/// Same numbers the guest page shows, for the same reason: "it looked bad" cannot
+/// tell a slow link from a lossy one from a host that cannot keep up.
+const showStats = ref(false);
+const streamStats = ref<{
+  bitrateKbps?: number;
+  fps?: number;
+  packetsLost?: number;
+  framesDropped?: number;
+  roundTripMs?: number;
+  jitterMs?: number;
+  jitterBufferMs?: number;
+  codec?: string;
+  path?: string;
+}>({});
+
 const noopDetach = (): void => undefined;
 let detachGamepads: () => void = noopDetach;
 
@@ -893,6 +908,9 @@ async function connect(resume: boolean): Promise<void> {
         }
       },
       // Rumble on its way back from the host.
+      onStreamStats: (snapshot) => {
+        streamStats.value = snapshot;
+      },
       onInputMessage: (message: unknown) => applyGamepadFeedback(message),
       onInputState: (state) => {
         if (state !== 'open') releaseForwardedInput();
@@ -1661,6 +1679,20 @@ onBeforeUnmount(() => {
         <video ref="videoEl" autoplay muted playsinline disablepictureinpicture />
         <audio ref="audioEl" autoplay hidden />
         <TouchGamepad v-if="showTouchPad && inputReady" />
+
+        <div v-if="showStats && isConnected" class="stream-stats">
+          <div>path {{ streamStats.path ?? '—' }}</div>
+          <div>rtt {{ Math.round(streamStats.roundTripMs ?? 0) }} ms</div>
+          <div>jitter {{ Math.round(streamStats.jitterMs ?? 0) }} ms</div>
+          <div>buffer {{ Math.round(streamStats.jitterBufferMs ?? 0) }} ms</div>
+          <div>lost {{ streamStats.packetsLost ?? 0 }}</div>
+          <div>dropped {{ streamStats.framesDropped ?? 0 }}</div>
+          <div>
+            {{ Math.round(streamStats.bitrateKbps ?? 0) }} kbps ·
+            {{ Math.round(streamStats.fps ?? 0) }} fps
+          </div>
+          <div>{{ streamStats.codec ?? '' }}</div>
+        </div>
         <div
           v-if="showFullscreenSwipeExit"
           class="stream-surface__exit-swipe"
@@ -1915,6 +1947,13 @@ onBeforeUnmount(() => {
                    need to be asked for BEFORE the stream starts, not after it is
                    already running and there is nothing to press. The overlay itself
                    still only appears once input can actually reach the host. -->
+              <input v-model="showStats" type="checkbox" />
+              <span>{{
+                t('ui.browser_stream.settings.show_stats', 'Show performance stats')
+              }}</span>
+            </label>
+
+            <label class="stream-form__check">
               <input v-model="showTouchPad" type="checkbox" />
               <span>
                 {{ t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller') }}
@@ -2048,6 +2087,21 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.stream-stats {
+  position: absolute;
+  top: 0.75rem;
+  left: 0.75rem;
+  z-index: 5;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--vs-radius-control);
+  color: #fff;
+  font-family: var(--vs-font-mono, monospace);
+  font-size: 0.6875rem;
+  line-height: 1.45;
+  background: rgb(0 0 0 / 72%);
+  pointer-events: none;
+}
+
 .browser-stream-page {
   display: grid;
   gap: var(--vs-space-24);

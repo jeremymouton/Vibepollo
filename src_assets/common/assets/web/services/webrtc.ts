@@ -43,6 +43,25 @@ export interface WebRtcConnectionCallbacks {
    * so a controller that can shake never did.
    */
   onInputMessage?: (message: unknown) => void;
+  /**
+   * A periodic read of how the stream is actually going.
+   *
+   * The connection was already being polled for jitter-buffer depth; everything
+   * here comes from the same report. Without it the only way to judge a stream is
+   * to look at it, which cannot separate a slow link from a lossy one from a host
+   * that is struggling.
+   */
+  onStreamStats?: (stats: {
+    bitrateKbps?: number;
+    fps?: number;
+    packetsLost?: number;
+    framesDropped?: number;
+    roundTripMs?: number;
+    jitterMs?: number;
+    jitterBufferMs?: number;
+    codec?: string;
+    path?: string;
+  }) => void;
   onRemoteStream?: (stream: MediaStream) => void;
   onVideoPlayoutDelay?: (delayMs: number | undefined) => void;
 }
@@ -522,6 +541,9 @@ export class BrowserWebRtcSession {
   private videoJitterStats: VideoJitterStatsState = {};
   private videoLatencyTargetMs = 0;
   private videoStatsTimer: number | undefined;
+  // Byte totals are cumulative, so a rate needs the previous reading.
+  private lastVideoBytes: number | undefined;
+  private lastVideoBytesAt: number | undefined;
   private peerConnection: RTCPeerConnection | null = null;
 
   get connected(): boolean {
@@ -825,6 +847,62 @@ export class BrowserWebRtcSession {
         }
         this.videoJitterStats = { delay, emitted, id: sample?.id };
         callbacks.onVideoPlayoutDelay?.(delayMs);
+
+        if (callbacks.onStreamStats) {
+          type Inbound = RTCStats & {
+            bytesReceived?: number;
+            packetsLost?: number;
+            framesPerSecond?: number;
+            framesDropped?: number;
+            jitter?: number;
+            codecId?: string;
+          };
+          const rtp = inbound as Inbound | undefined;
+          let roundTripMs: number | undefined;
+          let path: string | undefined;
+          let codec: string | undefined;
+          report.forEach((entry) => {
+            const e = entry as RTCStats & {
+              state?: string;
+              currentRoundTripTime?: number;
+              localCandidateId?: string;
+              remoteCandidateId?: string;
+              candidateType?: string;
+              mimeType?: string;
+            };
+            if (e.type === 'candidate-pair' && e.state === 'succeeded') {
+              if (typeof e.currentRoundTripTime === 'number') roundTripMs = e.currentRoundTripTime * 1000;
+              const local = report.get(e.localCandidateId ?? '') as { candidateType?: string } | undefined;
+              const remote = report.get(e.remoteCandidateId ?? '') as { candidateType?: string } | undefined;
+              const kinds = [local?.candidateType, remote?.candidateType];
+              path = kinds.includes('relay') ? 'relayed' : kinds.includes('host') ? 'direct' : 'direct (nat)';
+            }
+            if (e.type === 'codec' && rtp?.codecId === e.id) codec = e.mimeType?.split('/')[1];
+          });
+
+          // Bitrate has to be derived: the report gives a running byte total.
+          let bitrateKbps: number | undefined;
+          const bytes = rtp?.bytesReceived;
+          const now = performance.now();
+          if (typeof bytes === 'number' && this.lastVideoBytes !== undefined && this.lastVideoBytesAt) {
+            const seconds = (now - this.lastVideoBytesAt) / 1000;
+            if (seconds > 0) bitrateKbps = ((bytes - this.lastVideoBytes) * 8) / seconds / 1000;
+          }
+          this.lastVideoBytes = bytes;
+          this.lastVideoBytesAt = now;
+
+          callbacks.onStreamStats({
+            bitrateKbps,
+            fps: rtp?.framesPerSecond,
+            packetsLost: rtp?.packetsLost,
+            framesDropped: rtp?.framesDropped,
+            roundTripMs,
+            jitterMs: typeof rtp?.jitter === 'number' ? rtp.jitter * 1000 : undefined,
+            jitterBufferMs: delayMs,
+            codec,
+            path,
+          });
+        }
       } catch {
         // Stats are diagnostic input only; streaming must continue without them.
       }

@@ -166,60 +166,60 @@ onBeforeUnmount(() => {
       <div class="shoulders">
         <button
           class="tbtn tbtn--wide"
-          @pointerdown.prevent="press(6)"
-          @pointerup="release(6)"
-          @pointercancel="release(6)"
+          @pointerdown.stop.prevent="press(6)"
+          @pointerup.stop="release(6)"
+          @pointercancel.stop="release(6)"
         >
           LT
         </button>
         <button
           class="tbtn tbtn--wide"
-          @pointerdown.prevent="press(4)"
-          @pointerup="release(4)"
-          @pointercancel="release(4)"
+          @pointerdown.stop.prevent="press(4)"
+          @pointerup.stop="release(4)"
+          @pointercancel.stop="release(4)"
         >
           LB
         </button>
       </div>
       <div
         class="stick"
-        @pointerdown="stickDown($event, 0)"
-        @pointermove="stickMove($event, 0)"
-        @pointerup="stickUp(0)"
-        @pointercancel="stickUp(0)"
+        @pointerdown.stop="stickDown($event, 0)"
+        @pointermove.stop="stickMove($event, 0)"
+        @pointerup.stop="stickUp(0)"
+        @pointercancel.stop="stickUp(0)"
       >
         <div class="stick__cap" :style="stickStyle(0)"></div>
       </div>
       <div class="dpad">
         <button
           class="tbtn dpad__up"
-          @pointerdown.prevent="press(12)"
-          @pointerup="release(12)"
-          @pointercancel="release(12)"
+          @pointerdown.stop.prevent="press(12)"
+          @pointerup.stop="release(12)"
+          @pointercancel.stop="release(12)"
         >
           ▲
         </button>
         <button
           class="tbtn dpad__left"
-          @pointerdown.prevent="press(14)"
-          @pointerup="release(14)"
-          @pointercancel="release(14)"
+          @pointerdown.stop.prevent="press(14)"
+          @pointerup.stop="release(14)"
+          @pointercancel.stop="release(14)"
         >
           ◀
         </button>
         <button
           class="tbtn dpad__right"
-          @pointerdown.prevent="press(15)"
-          @pointerup="release(15)"
-          @pointercancel="release(15)"
+          @pointerdown.stop.prevent="press(15)"
+          @pointerup.stop="release(15)"
+          @pointercancel.stop="release(15)"
         >
           ▶
         </button>
         <button
           class="tbtn dpad__down"
-          @pointerdown.prevent="press(13)"
-          @pointerup="release(13)"
-          @pointercancel="release(13)"
+          @pointerdown.stop.prevent="press(13)"
+          @pointerup.stop="release(13)"
+          @pointercancel.stop="release(13)"
         >
           ▼
         </button>
@@ -229,17 +229,17 @@ onBeforeUnmount(() => {
     <div class="touchpad__centre">
       <button
         class="tbtn tbtn--small"
-        @pointerdown.prevent="press(8)"
-        @pointerup="release(8)"
-        @pointercancel="release(8)"
+        @pointerdown.stop.prevent="press(8)"
+        @pointerup.stop="release(8)"
+        @pointercancel.stop="release(8)"
       >
         Back
       </button>
       <button
         class="tbtn tbtn--small"
-        @pointerdown.prevent="press(9)"
-        @pointerup="release(9)"
-        @pointercancel="release(9)"
+        @pointerdown.stop.prevent="press(9)"
+        @pointerup.stop="release(9)"
+        @pointercancel.stop="release(9)"
       >
         Start
       </button>
@@ -249,17 +249,17 @@ onBeforeUnmount(() => {
       <div class="shoulders shoulders--right">
         <button
           class="tbtn tbtn--wide"
-          @pointerdown.prevent="press(5)"
-          @pointerup="release(5)"
-          @pointercancel="release(5)"
+          @pointerdown.stop.prevent="press(5)"
+          @pointerup.stop="release(5)"
+          @pointercancel.stop="release(5)"
         >
           RB
         </button>
         <button
           class="tbtn tbtn--wide"
-          @pointerdown.prevent="press(7)"
-          @pointerup="release(7)"
-          @pointercancel="release(7)"
+          @pointerdown.stop.prevent="press(7)"
+          @pointerup.stop="release(7)"
+          @pointercancel.stop="release(7)"
         >
           RT
         </button>
@@ -267,43 +267,43 @@ onBeforeUnmount(() => {
       <div class="face">
         <button
           class="tbtn face__y"
-          @pointerdown.prevent="press(3)"
-          @pointerup="release(3)"
-          @pointercancel="release(3)"
+          @pointerdown.stop.prevent="press(3)"
+          @pointerup.stop="release(3)"
+          @pointercancel.stop="release(3)"
         >
           Y
         </button>
         <button
           class="tbtn face__x"
-          @pointerdown.prevent="press(2)"
-          @pointerup="release(2)"
-          @pointercancel="release(2)"
+          @pointerdown.stop.prevent="press(2)"
+          @pointerup.stop="release(2)"
+          @pointercancel.stop="release(2)"
         >
           X
         </button>
         <button
           class="tbtn face__b"
-          @pointerdown.prevent="press(1)"
-          @pointerup="release(1)"
-          @pointercancel="release(1)"
+          @pointerdown.stop.prevent="press(1)"
+          @pointerup.stop="release(1)"
+          @pointercancel.stop="release(1)"
         >
           B
         </button>
         <button
           class="tbtn face__a"
-          @pointerdown.prevent="press(0)"
-          @pointerup="release(0)"
-          @pointercancel="release(0)"
+          @pointerdown.stop.prevent="press(0)"
+          @pointerup.stop="release(0)"
+          @pointercancel.stop="release(0)"
         >
           A
         </button>
       </div>
       <div
         class="stick"
-        @pointerdown="stickDown($event, 1)"
-        @pointermove="stickMove($event, 1)"
-        @pointerup="stickUp(1)"
-        @pointercancel="stickUp(1)"
+        @pointerdown.stop="stickDown($event, 1)"
+        @pointermove.stop="stickMove($event, 1)"
+        @pointerup.stop="stickUp(1)"
+        @pointercancel.stop="stickUp(1)"
       >
         <div class="stick__cap" :style="stickStyle(1)"></div>
       </div>
@@ -331,9 +331,13 @@ onBeforeUnmount(() => {
   align-items: flex-end;
   pointer-events: auto;
 }
+/* Bottom centre, not top. At the top these collided with the page's own Stats,
+   Quality, Fullscreen and Leave buttons — two sets of controls in the same
+   corner, one of them the game's. */
 .touchpad__centre {
-  align-self: flex-start;
+  align-self: flex-end;
   gap: 6px;
+  padding-bottom: 4px;
 }
 .shoulders {
   display: flex;
