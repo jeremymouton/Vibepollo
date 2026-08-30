@@ -223,6 +223,7 @@ const streamStats = ref<{
   jitterBufferMs?: number;
   codec?: string;
   path?: string;
+  remoteAddress?: string;
 }>({});
 
 const noopDetach = (): void => undefined;
