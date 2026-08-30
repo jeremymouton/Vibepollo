@@ -1498,6 +1498,8 @@ namespace webrtc_stream {
     // compiled ahead of `sessions` / `session_mutex` in this translation unit,
     // so they cannot touch the map directly.
     SessionInputGrant session_input_grant(std::string_view session_id);
+    void record_gamepad_claim(std::string_view session_id, int controller);
+    void release_gamepad_claim(std::string_view session_id, int controller);
 
     void handle_input_message(std::string_view payload, std::string_view session_id = {}) {
       if (payload.empty()) {
@@ -1598,6 +1600,7 @@ namespace webrtc_stream {
         if (!should_send) {
           return;
         }
+        record_gamepad_claim(session_id, controller);
         const uint8_t controller_type = parse_gamepad_type(message);
         const auto capabilities = static_cast<uint16_t>(message.value("capabilities", 0));
         const auto supported_buttons = static_cast<uint32_t>(message.value("supportedButtons", 0));
@@ -1675,6 +1678,7 @@ namespace webrtc_stream {
           std::lock_guard lg {gamepad_mutex};
           webrtc_gamepads.reset(controller);
         }
+        release_gamepad_claim(session_id, controller);
         const auto active_mask = static_cast<uint16_t>(message.value("activeMask", 0));
         input::passthrough(
           input_ctx,
@@ -1791,6 +1795,16 @@ namespace webrtc_stream {
       std::shared_ptr<int> channel_token;
       /// Last bitrate handed to this peer's encoder, for change-threshold damping.
       std::optional<int> published_bitrate_kbps;
+
+      /// Global gamepad slots this session claimed.
+      ///
+      /// webrtc_gamepads is process-wide and was only ever cleared by an explicit
+      /// gamepad_disconnect message. A browser tab that simply closes sends nothing, so
+      /// the slot stayed set forever and the next guest's arrival packet was silently
+      /// dropped — leaving their pad unallocated and every input discarded as
+      /// "ControllerNumber [N] not allocated". Recorded here so close_session can release
+      /// them however the session ends.
+      std::bitset<16> claimed_gamepad_slots;
       ring_buffer_t<EncodedVideoFrame> video_frames {kMaxVideoFrames};
       ring_buffer_t<EncodedAudioFrame> audio_frames {kMaxAudioFrames};
       ring_buffer_t<RawVideoFrame> raw_video_frames {kMaxVideoFrames};
@@ -1867,6 +1881,32 @@ namespace webrtc_stream {
 
     std::mutex session_mutex;
     std::unordered_map<std::string, Session> sessions;
+
+    /// Note that this session now holds a global gamepad slot.
+    ///
+    /// Called after gamepad_mutex has been released, never while holding it: the pairing
+    /// of gamepad_mutex and session_mutex is only ever taken in this order.
+    void record_gamepad_claim(std::string_view session_id, int controller) {
+      if (session_id.empty() || controller < 0 || controller >= 16) {
+        return;
+      }
+      std::lock_guard lg {session_mutex};
+      auto it = sessions.find(std::string {session_id});
+      if (it != sessions.end()) {
+        it->second.claimed_gamepad_slots.set(controller);
+      }
+    }
+
+    void release_gamepad_claim(std::string_view session_id, int controller) {
+      if (session_id.empty() || controller < 0 || controller >= 16) {
+        return;
+      }
+      std::lock_guard lg {session_mutex};
+      auto it = sessions.find(std::string {session_id});
+      if (it != sessions.end()) {
+        it->second.claimed_gamepad_slots.reset(controller);
+      }
+    }
 
     SessionInputGrant session_input_grant(std::string_view session_id) {
       SessionInputGrant grant;
@@ -5715,6 +5755,7 @@ namespace webrtc_stream {
     // Owned outside the WebRTC ifdef: the encoder exists whenever the session does.
     std::shared_ptr<safe::mail_raw_t> encoder_mail;
     std::thread encoder_thread;
+    std::bitset<16> claimed_gamepad_slots;
 
 #ifdef SUNSHINE_ENABLE_WEBRTC
     BOOST_LOG(debug) << "WebRTC: close_session enter id=" << id;
@@ -5759,6 +5800,7 @@ namespace webrtc_stream {
 #endif
         encoder_mail = std::move(it->second.encoder_mail);
         encoder_thread = std::move(it->second.encoder_thread);
+        claimed_gamepad_slots = it->second.claimed_gamepad_slots;
         sessions.erase(it);
         removed = true;
         // Publish the teardown reservation before removing the active owner.
@@ -5769,6 +5811,21 @@ namespace webrtc_stream {
     }
     if (removed) {
       local_answer_cv.notify_all();
+    }
+
+    // Hand back this session's gamepad slots. A closed browser tab never sends
+    // gamepad_disconnect, so without this the slot stayed claimed and the next guest's
+    // arrival packet was dropped as a duplicate — their pad was never allocated and every
+    // input they sent was discarded.
+    if (claimed_gamepad_slots.any()) {
+      std::lock_guard lg {gamepad_mutex};
+      for (std::size_t slot = 0; slot < claimed_gamepad_slots.size(); ++slot) {
+        if (claimed_gamepad_slots.test(slot)) {
+          webrtc_gamepads.reset(slot);
+        }
+      }
+      BOOST_LOG(debug) << "WebRTC: released gamepad slots " << claimed_gamepad_slots
+                       << " for session " << id;
     }
 
     // Stop this peer's encoder. Joined only after the session lock is released: the
