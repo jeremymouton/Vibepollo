@@ -61,6 +61,9 @@ export interface WebRtcConnectionCallbacks {
     jitterBufferMs?: number;
     codec?: string;
     path?: string;
+    /// Who we are actually streaming from. The most useful single value when a
+    /// stream is inexplicably slow: LAN address or not.
+    remoteAddress?: string;
   }) => void;
   onRemoteStream?: (stream: MediaStream) => void;
   onVideoPlayoutDelay?: (delayMs: number | undefined) => void;
@@ -126,6 +129,17 @@ const defaultLimits: WebRtcStreamLimits = {
 
 const receiverHintRefreshMs = 250;
 const videoStatsPollMs = 250;
+
+/// RFC1918 / CGNAT / link-local — "these packets never left the building".
+function isPrivateAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  if (address.startsWith('10.') || address.startsWith('192.168.')) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(address)) return true;
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(address)) return true;
+  if (address.startsWith('169.254.') || address === '127.0.0.1') return true;
+  if (address.startsWith('fe80:') || address.startsWith('fd')) return true;
+  return false;
+}
 
 function normalizedLatencyTargetMs(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value)
@@ -860,6 +874,7 @@ export class BrowserWebRtcSession {
           const rtp = inbound as Inbound | undefined;
           let roundTripMs: number | undefined;
           let path: string | undefined;
+          let remoteAddress: string | undefined;
           let codec: string | undefined;
           report.forEach((entry) => {
             const e = entry as RTCStats & {
@@ -872,10 +887,22 @@ export class BrowserWebRtcSession {
             };
             if (e.type === 'candidate-pair' && e.state === 'succeeded') {
               if (typeof e.currentRoundTripTime === 'number') roundTripMs = e.currentRoundTripTime * 1000;
-              const local = report.get(e.localCandidateId ?? '') as { candidateType?: string } | undefined;
-              const remote = report.get(e.remoteCandidateId ?? '') as { candidateType?: string } | undefined;
+              const local = report.get(e.localCandidateId ?? '') as
+                { candidateType?: string; address?: string; ip?: string } | undefined;
+              const remote = report.get(e.remoteCandidateId ?? '') as
+                { candidateType?: string; address?: string; ip?: string } | undefined;
               const kinds = [local?.candidateType, remote?.candidateType];
-              path = kinds.includes('relay') ? 'relayed' : kinds.includes('host') ? 'direct' : 'direct (nat)';
+              // Report WHO we are talking to, not just how. "direct" covered both a peer
+              // in the same room and one across an ocean, which cost hours of guessing
+              // when a stream was slow. The address answers it immediately.
+              remoteAddress = remote?.address ?? remote?.ip;
+              if (kinds.includes('relay')) {
+                path = 'relayed';
+              } else if (kinds.includes('host')) {
+                path = isPrivateAddress(remoteAddress) ? 'local' : 'direct';
+              } else {
+                path = 'direct (nat)';
+              }
             }
             if (e.type === 'codec' && rtp?.codecId === e.id) codec = e.mimeType?.split('/')[1];
           });
@@ -901,6 +928,7 @@ export class BrowserWebRtcSession {
             jitterBufferMs: delayMs,
             codec,
             path,
+            remoteAddress,
           });
         }
       } catch {

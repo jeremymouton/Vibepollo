@@ -1689,7 +1689,11 @@ onBeforeUnmount(() => {
         <TouchGamepad v-if="showTouchPad && inputReady" />
 
         <div v-if="showStats && isConnected" class="stream-stats">
-          <div>path {{ streamStats.path ?? '—' }}</div>
+          <div>
+            path {{ streamStats.path ?? '—'
+            }}<template v-if="streamStats.remoteAddress">
+              · {{ streamStats.remoteAddress }}</template>
+          </div>
           <div>rtt {{ Math.round(streamStats.roundTripMs ?? 0) }} ms</div>
           <div>jitter {{ Math.round(streamStats.jitterMs ?? 0) }} ms</div>
           <div>buffer {{ Math.round(streamStats.jitterBufferMs ?? 0) }} ms</div>
