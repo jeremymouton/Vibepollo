@@ -117,6 +117,29 @@ namespace webrtc_stream {
   bool has_teardown_in_progress();
   unsigned int teardown_session_count();
 
+  /**
+   * @brief The settings the running capture is actually using, if one is running.
+   *
+   * Every WebRTC peer shares a single encoder, so they must all use one codec.
+   * A joining peer therefore has to be reconciled onto these values BEFORE the
+   * session is built, not just before the capture is started: the session's own
+   * codec is derived from the options it was handed, so leaving them at what the
+   * joiner asked for builds a peer for a codec the encoder is not emitting.
+   */
+  struct ActiveCaptureSettings {
+    int width = 0;
+    int height = 0;
+    int fps = 0;
+    int bitrate_kbps = 0;
+    std::optional<std::string> codec;
+    bool hdr = false;
+    bool yuv444 = false;
+    int audio_channels = 2;
+    bool host_audio = false;
+  };
+
+  std::optional<ActiveCaptureSettings> active_capture_settings();
+
   std::optional<SessionState> create_session(const SessionOptions &options);
   std::optional<std::string> ensure_capture_started(const SessionOptions &options);
   bool close_session(std::string_view id);

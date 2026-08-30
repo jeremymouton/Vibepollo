@@ -4555,6 +4555,28 @@ namespace confighttp {
     // correct in the streaming code and dead on arrival for exactly that reason.
     if (guest) {
       options.adopt_active_capture = true;
+      // Reconcile onto the running capture here, on `options` itself, rather than
+      // only inside the capture start. create_session builds the peer from these
+      // same options and derives the session's codec from them, so adopting in the
+      // capture alone left the guest's peer negotiating its own codec against a
+      // shared encoder emitting a different one. One encoder means one codec for
+      // everybody; the joiner is the one who has to give way.
+      if (const auto active = webrtc_stream::active_capture_settings()) {
+        options.width = active->width;
+        options.height = active->height;
+        options.fps = active->fps;
+        options.bitrate_kbps = active->bitrate_kbps;
+        options.hdr = active->hdr;
+        options.yuv444 = active->yuv444;
+        options.audio_channels = active->audio_channels;
+        options.host_audio = active->host_audio;
+        if (active->codec) {
+          options.codec = *active->codec;
+        }
+        BOOST_LOG(info) << "WebRTC: guest reconciled onto the active capture ("sv
+                        << active->width << "x" << active->height << "@" << active->fps
+                        << " codec=" << active->codec.value_or("unknown") << ")"sv;
+      }
     }
 
     BOOST_LOG(debug) << "WebRTC: creating session";

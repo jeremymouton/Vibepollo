@@ -5493,6 +5493,30 @@ namespace webrtc_stream {
     return teardown_sessions.load(std::memory_order_acquire);
   }
 
+  std::optional<ActiveCaptureSettings> active_capture_settings() {
+    std::lock_guard<std::mutex> lock(webrtc_capture.mutex);
+    if (
+      !webrtc_capture.active.load(std::memory_order_acquire) ||
+      !webrtc_capture.active_video_config ||
+      !webrtc_capture.active_audio_config
+    ) {
+      return std::nullopt;
+    }
+    const auto &video = *webrtc_capture.active_video_config;
+    const auto &audio = *webrtc_capture.active_audio_config;
+    ActiveCaptureSettings settings;
+    settings.width = video.width;
+    settings.height = video.height;
+    settings.fps = video.framerate;
+    settings.bitrate_kbps = video.bitrate;
+    settings.codec = video_format_to_codec(video.videoFormat);
+    settings.hdr = video.dynamicRange != 0 && !video.prefer_sdr_10bit && !video.force_sdr;
+    settings.yuv444 = video.chromaSamplingType != 0;
+    settings.audio_channels = audio.channels;
+    settings.host_audio = audio.flags[audio::config_t::HOST_AUDIO];
+    return settings;
+  }
+
   std::optional<std::string> ensure_capture_started(const SessionOptions &options) {
     return start_webrtc_capture(options);
   }
