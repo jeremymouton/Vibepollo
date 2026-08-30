@@ -31,7 +31,6 @@ interface Invite {
   path: string;
   perm: number;
   permission_summary: string;
-  gamepad_base_slot: number;
   app_id: number;
   allow_browser: boolean;
   allow_pairing: boolean;
@@ -64,7 +63,6 @@ const draft = ref({
   preset: 'gamepad' as 'view' | 'gamepad' | 'full',
   allow_browser: true,
   allow_pairing: false,
-  gamepad_base_slot: 1,
   expires_in_hours: 24,
   max_uses: 0,
 });
@@ -138,7 +136,6 @@ async function create(): Promise<void> {
       preset: draft.value.preset,
       allow_browser: draft.value.allow_browser,
       allow_pairing: draft.value.allow_pairing,
-      gamepad_base_slot: draft.value.gamepad_base_slot,
       max_uses: draft.value.max_uses,
       expires_in_seconds: Math.round(draft.value.expires_in_hours * 3600),
     });
@@ -261,11 +258,6 @@ onBeforeUnmount(() => {
         </label>
 
         <label class="field">
-          <span>{{ t('ui.invites.field_slot') }}</span>
-          <input v-model.number="draft.gamepad_base_slot" type="number" min="0" max="15" />
-        </label>
-
-        <label class="field">
           <span>{{ t('ui.invites.field_expiry') }}</span>
           <input v-model.number="draft.expires_in_hours" type="number" min="0" step="1" />
         </label>
@@ -347,8 +339,7 @@ onBeforeUnmount(() => {
         </div>
 
         <p class="card__meta">
-          {{ expiryText(invite) }} · {{ usesText(invite) }} ·
-          {{ t('ui.invites.slot', { slot: invite.gamepad_base_slot }) }}
+          {{ expiryText(invite) }} · {{ usesText(invite) }}
         </p>
 
         <p class="card__ways">

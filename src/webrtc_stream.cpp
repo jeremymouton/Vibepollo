@@ -1491,15 +1491,19 @@ namespace webrtc_stream {
     // What a session is allowed to inject, and where its pads land on the host.
     struct SessionInputGrant {
       crypto::PERM permission = crypto::PERM::_all_inputs;
-      int gamepad_base = 0;
     };
 
     // Defined below, after the session registry. The input handlers are
     // compiled ahead of `sessions` / `session_mutex` in this translation unit,
     // so they cannot touch the map directly.
     SessionInputGrant session_input_grant(std::string_view session_id);
-    void record_gamepad_claim(std::string_view session_id, int controller);
-    void release_gamepad_claim(std::string_view session_id, int controller);
+    int resolve_gamepad_slot(
+      std::string_view session_id,
+      int local_index,
+      bool allocate,
+      bool *created = nullptr
+    );
+    void forget_gamepad_slot(std::string_view session_id, int local_index);
 
     void handle_input_message(std::string_view payload, std::string_view session_id = {}) {
       if (payload.empty()) {
@@ -1532,7 +1536,6 @@ namespace webrtc_stream {
       // enforces it — this path simply never consulted it.
       const auto grant = session_input_grant(session_id);
       const auto input_permission = grant.permission;
-      const int gamepad_base = grant.gamepad_base;
 
       if (type == "mouse_move") {
         const double x = message.value("x", 0.0);
@@ -1585,22 +1588,15 @@ namespace webrtc_stream {
         // pad than player 1. Each browser numbers its own gamepads from 0,
         // so without this every guest drives controller 0.
         const int raw_controller = message.value("id", -1);
-        const int controller = raw_controller < 0 ? -1 : raw_controller + gamepad_base;
-        if (controller < 0 || controller >= 16) {
+        bool created = false;
+        const int controller = resolve_gamepad_slot(session_id, raw_controller, true, &created);
+        if (controller < 0) {
           return;
         }
-        bool should_send = false;
-        {
-          std::lock_guard lg {gamepad_mutex};
-          if (!webrtc_gamepads.test(controller)) {
-            webrtc_gamepads.set(controller);
-            should_send = true;
-          }
-        }
-        if (!should_send) {
+        if (!created) {
+          // Already announced; the host has a pad for it.
           return;
         }
-        record_gamepad_claim(session_id, controller);
         const uint8_t controller_type = parse_gamepad_type(message);
         const auto capabilities = static_cast<uint16_t>(message.value("capabilities", 0));
         const auto supported_buttons = static_cast<uint32_t>(message.value("supportedButtons", 0));
@@ -1608,12 +1604,9 @@ namespace webrtc_stream {
         return;
       }
       if (type == "gamepad_state") {
-        // Offset by the session base so player 2 lands on a different host
-        // pad than player 1. Each browser numbers its own gamepads from 0,
-        // so without this every guest drives controller 0.
         const int raw_controller = message.value("id", -1);
-        const int controller = raw_controller < 0 ? -1 : raw_controller + gamepad_base;
-        if (controller < 0 || controller >= 16) {
+        const int controller = resolve_gamepad_slot(session_id, raw_controller, true);
+        if (controller < 0) {
           return;
         }
         bool should_send_arrival = false;
@@ -1670,15 +1663,11 @@ namespace webrtc_stream {
         // pad than player 1. Each browser numbers its own gamepads from 0,
         // so without this every guest drives controller 0.
         const int raw_controller = message.value("id", -1);
-        const int controller = raw_controller < 0 ? -1 : raw_controller + gamepad_base;
-        if (controller < 0 || controller >= 16) {
+        const int controller = resolve_gamepad_slot(session_id, raw_controller, false);
+        if (controller < 0) {
           return;
         }
-        {
-          std::lock_guard lg {gamepad_mutex};
-          webrtc_gamepads.reset(controller);
-        }
-        release_gamepad_claim(session_id, controller);
+        forget_gamepad_slot(session_id, raw_controller);
         const auto active_mask = static_cast<uint16_t>(message.value("activeMask", 0));
         input::passthrough(
           input_ctx,
@@ -1692,8 +1681,8 @@ namespace webrtc_stream {
         // pad than player 1. Each browser numbers its own gamepads from 0,
         // so without this every guest drives controller 0.
         const int raw_controller = message.value("id", -1);
-        const int controller = raw_controller < 0 ? -1 : raw_controller + gamepad_base;
-        if (controller < 0 || controller >= 16) {
+        const int controller = resolve_gamepad_slot(session_id, raw_controller, false);
+        if (controller < 0) {
           return;
         }
         const uint8_t motion_type = parse_motion_type(message);
@@ -1796,6 +1785,14 @@ namespace webrtc_stream {
       /// Last bitrate handed to this peer's encoder, for change-threshold damping.
       std::optional<int> published_bitrate_kbps;
 
+      /// This session's browser pad index -> the global slot it was given.
+      ///
+      /// Slots used to come from a base offset chosen when the invite was created, which
+      /// meant whoever made the invite had to hand out distinct numbers by hand and
+      /// nothing checked them. Now a pad is given the lowest free slot when it announces
+      /// itself, and gives it back when it leaves.
+      std::unordered_map<int, int> gamepad_slots;
+
       /// Global gamepad slots this session claimed.
       ///
       /// webrtc_gamepads is process-wide and was only ever cleared by an explicit
@@ -1882,31 +1879,82 @@ namespace webrtc_stream {
     std::mutex session_mutex;
     std::unordered_map<std::string, Session> sessions;
 
-    /// Note that this session now holds a global gamepad slot.
-    ///
-    /// Called after gamepad_mutex has been released, never while holding it: the pairing
-    /// of gamepad_mutex and session_mutex is only ever taken in this order.
-    void record_gamepad_claim(std::string_view session_id, int controller) {
-      if (session_id.empty() || controller < 0 || controller >= 16) {
-        return;
+    /// Lowest global slot nobody is using, or -1 when all 16 are taken.
+    /// Caller must hold gamepad_mutex.
+    int claim_free_gamepad_slot_locked() {
+      for (std::size_t slot = 0; slot < webrtc_gamepads.size(); ++slot) {
+        if (!webrtc_gamepads.test(slot)) {
+          webrtc_gamepads.set(slot);
+          return static_cast<int>(slot);
+        }
       }
-      std::lock_guard lg {session_mutex};
-      auto it = sessions.find(std::string {session_id});
-      if (it != sessions.end()) {
-        it->second.claimed_gamepad_slots.set(controller);
-      }
+      return -1;
     }
 
-    void release_gamepad_claim(std::string_view session_id, int controller) {
-      if (session_id.empty() || controller < 0 || controller >= 16) {
+    /// The global slot this session's pad is driving, allocating one if it is new.
+    /// Returns -1 when every slot is taken.
+    int resolve_gamepad_slot(
+      std::string_view session_id,
+      int local_index,
+      bool allocate,
+      bool *created
+    ) {
+      if (session_id.empty() || local_index < 0) {
+        return -1;
+      }
+      std::lock_guard lg {session_mutex};
+      auto it = sessions.find(std::string {session_id});
+      if (it == sessions.end()) {
+        return -1;
+      }
+      auto &slots = it->second.gamepad_slots;
+      if (const auto found = slots.find(local_index); found != slots.end()) {
+        return found->second;
+      }
+      if (!allocate) {
+        return -1;
+      }
+      int slot = -1;
+      {
+        std::lock_guard gp {gamepad_mutex};
+        slot = claim_free_gamepad_slot_locked();
+      }
+      if (slot < 0) {
+        BOOST_LOG(warning) << "WebRTC: no free gamepad slot for session " << session_id;
+        return -1;
+      }
+      slots.emplace(local_index, slot);
+      it->second.claimed_gamepad_slots.set(slot);
+      if (created) {
+        *created = true;
+      }
+      BOOST_LOG(info) << "WebRTC: gamepad " << local_index << " of session " << session_id
+                      << " assigned slot " << slot;
+      return slot;
+    }
+
+    void forget_gamepad_slot(std::string_view session_id, int local_index) {
+      if (session_id.empty()) {
         return;
       }
       std::lock_guard lg {session_mutex};
       auto it = sessions.find(std::string {session_id});
-      if (it != sessions.end()) {
-        it->second.claimed_gamepad_slots.reset(controller);
+      if (it == sessions.end()) {
+        return;
       }
+      auto &slots = it->second.gamepad_slots;
+      const auto found = slots.find(local_index);
+      if (found == slots.end()) {
+        return;
+      }
+      const int slot = found->second;
+      slots.erase(found);
+      it->second.claimed_gamepad_slots.reset(slot);
+      std::lock_guard gp {gamepad_mutex};
+      webrtc_gamepads.reset(slot);
     }
+
+
 
     SessionInputGrant session_input_grant(std::string_view session_id) {
       SessionInputGrant grant;
@@ -1917,7 +1965,6 @@ namespace webrtc_stream {
       auto it = sessions.find(std::string {session_id});
       if (it != sessions.end()) {
         grant.permission = it->second.input_permission;
-        grant.gamepad_base = it->second.gamepad_base_slot;
       }
       return grant;
     }
