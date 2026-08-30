@@ -4549,6 +4549,14 @@ namespace confighttp {
       }
     }
 
+    // Must be decided BEFORE the capture is started, not in the guest block further
+    // down: ensure_capture_started is what refuses a mismatch, so a flag set after it
+    // has already run has no effect at all. Two earlier attempts at this fix were
+    // correct in the streaming code and dead on arrival for exactly that reason.
+    if (guest) {
+      options.adopt_active_capture = true;
+    }
+
     BOOST_LOG(debug) << "WebRTC: creating session";
     std::optional<std::string> capture_start_error;
 #ifdef _WIN32
@@ -4580,12 +4588,6 @@ namespace confighttp {
       // is discarded, so asking for more cannot get more — the only way a guest's
       // grant changes is the owner editing the invite and the guest redeeming again.
       options.input_permission = guest->perm & static_cast<std::uint32_t>(crypto::PERM::_all_inputs);
-      // Take the stream as it is if one is already running. The capture is shared, so
-      // a guest asking for anything different is refused outright — and being told to
-      // "disconnect the other session first" is useless advice to someone who cannot
-      // see that session, let alone end it. Their own settings still apply whenever
-      // they are the one starting the stream.
-      options.adopt_active_capture = true;
       options.gamepad_base_slot = guest->gamepad_base_slot;
       if (guest->app_id >= 0) {
         options.app_id = guest->app_id;
