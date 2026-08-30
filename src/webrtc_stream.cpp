@@ -1017,6 +1017,8 @@ namespace webrtc_stream {
     std::bitset<16> webrtc_gamepads;
 
     std::shared_ptr<safe::mail_raw_t> current_capture_mail();
+    /// Dimensions of the running capture, if one is running.
+    std::optional<std::pair<int, int>> active_capture_dimensions();
 
     std::shared_ptr<input::input_t> current_input_context() {
       auto capture_mail = current_capture_mail();
@@ -1036,8 +1038,14 @@ namespace webrtc_stream {
         input_mail = capture_mail ? capture_mail : std::make_shared<safe::mail_raw_t>();
         input_context = input::alloc(input_mail);
 
-        // Set up a default touch port for WebRTC input when capture mail isn't available.
-        if (!capture_mail) {
+        // Seed the touch port unconditionally.
+        //
+        // This used to run only when there was no capture mail, because the shared
+        // video::capture() published touch_port onto that same mail. Encoders are now
+        // per session and run on their own mails, so nothing publishes geometry here any
+        // more — which left absolute mouse coordinates with nothing to map against and
+        // stopped the cursor moving while clicks and keys still worked.
+        {
           auto touch_port_event = input_mail->event<input::touch_port_t>(mail::touch_port);
 #ifdef _WIN32
           int screen_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -1048,6 +1056,12 @@ namespace webrtc_stream {
           int screen_width = 1920;
           int screen_height = 1080;
 #endif
+          // The capture's own dimensions beat the virtual desktop's: with a virtual
+          // display attached they are what the client is actually looking at.
+          if (const auto dims = active_capture_dimensions()) {
+            screen_width = dims->first;
+            screen_height = dims->second;
+          }
           if (screen_width <= 0) {
             screen_width = 1920;
           }
@@ -1983,6 +1997,18 @@ namespace webrtc_stream {
     std::atomic_uint32_t webrtc_launch_session_id {0};
     WebRtcCaptureState webrtc_capture;
 
+    std::optional<std::pair<int, int>> active_capture_dimensions() {
+      std::lock_guard<std::mutex> lock(webrtc_capture.mutex);
+      if (!webrtc_capture.active_video_config) {
+        return std::nullopt;
+      }
+      const auto &active = *webrtc_capture.active_video_config;
+      if (active.width <= 0 || active.height <= 0) {
+        return std::nullopt;
+      }
+      return std::make_pair(active.width, active.height);
+    }
+
     std::shared_ptr<safe::mail_raw_t> current_capture_mail() {
       std::lock_guard<std::mutex> lock(webrtc_capture.mutex);
       return webrtc_capture.mail;
@@ -2023,7 +2049,15 @@ namespace webrtc_stream {
     ///
     /// 100 would pin the bitrate exactly as Moonlight does; 0 would restore the previous
     /// behaviour of following the estimate all the way down.
-    constexpr int kEncoderBitrateFloorPercent = 50;
+    constexpr int kEncoderBitrateFloorPercent = 25;
+
+    /// ...but never hold more than this, whatever the percentage works out to.
+    ///
+    /// A floor at half of a 20Mbps setting meant a phone was pinned to 10Mbps on a link
+    /// that could not carry it, so frames queued and the stream fell steadily further
+    /// behind. Latency that grows without bound is worse than a soft picture, so the
+    /// floor is now capped low enough that a poor path can still escape it.
+    constexpr int kEncoderBitrateFloorMaxKbps = 4000;
 
     bool bitrate_change_is_significant(std::optional<int> previous, int target_kbps) {
       if (!previous) {
@@ -2101,9 +2135,10 @@ namespace webrtc_stream {
         // path is poor. Ours throttled the encoder on every loss signal and collapsed to
         // ~1.3Mbps at 1080p, which is mush. A floor keeps detail at the cost of dropping
         // packets on a genuinely bad path — the same trade Moonlight makes deliberately.
-        const int floor_kbps = std::max(
+        const int floor_kbps = std::clamp(
+          configured_bitrate_kbps * kEncoderBitrateFloorPercent / 100,
           1,
-          configured_bitrate_kbps * kEncoderBitrateFloorPercent / 100
+          std::min(configured_bitrate_kbps, kEncoderBitrateFloorMaxKbps)
         );
         const int target_kbps = std::clamp(
           std::max(requested_bitrate_kbps, floor_kbps),
