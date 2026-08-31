@@ -1502,6 +1502,13 @@ namespace webrtc_stream {
       }
 #endif
 
+      // Liveness heartbeat from the browser. The activity timestamp was already
+      // stamped at dispatch; returning before current_input_context() matters so a
+      // view-only page that sends nothing but pings never allocates input state.
+      if (type == "ping") {
+        return;
+      }
+
       auto input_ctx = current_input_context();
       if (!input_ctx) {
         return;
@@ -1688,6 +1695,13 @@ namespace webrtc_stream {
       std::atomic<bool> mouse_move_seq_initialized {false};
       std::atomic<std::uint16_t> last_mouse_move_seq {0};
       std::atomic<std::int64_t> last_mouse_move_at_ms {0};
+      /// steady-clock ms of the last data-channel message of any kind. The browser
+      /// sends a ping every few seconds, so this going stale is the only signal the
+      /// host gets that a peer vanished without closing the channel: the lwrtc wrapper
+      /// exposes no peer-connection or ICE state callback, and an abruptly closed tab
+      /// never completes the data-channel close handshake — the session would encode
+      /// for a dead peer forever (observed live: 5+ minutes, stopped only by hand).
+      std::atomic<std::int64_t> last_activity_ms {0};
     };
 
     struct SessionKeyframeContext {
@@ -3852,6 +3866,15 @@ namespace webrtc_stream {
       if (!ctx || !ctx->active.load(std::memory_order_acquire)) {
         return;
       }
+      // Every message counts as liveness — input, pings, anything. The sweep below
+      // reaps sessions whose browser stopped talking without closing the channel.
+      ctx->last_activity_ms.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()
+        )
+          .count(),
+        std::memory_order_release
+      );
       if (binary) {
         handle_input_message_binary(
           ctx,
@@ -3878,6 +3901,56 @@ namespace webrtc_stream {
       task_pool.push([session_id = std::move(session_id)]() {
         close_session(session_id);
       });
+    }
+
+    /// How long a session may go without any data-channel message before it is
+    /// presumed dead. The browser pings every 5 seconds on the (unreliable) input
+    /// channel, so this allows many consecutive losses before giving up. Sessions
+    /// that have never sent anything are exempt — connection setup has its own
+    /// timeout, and a client too old to ping should not be reaped for it.
+    constexpr auto kSessionActivityTimeout = std::chrono::seconds {45};
+    constexpr auto kSessionActivitySweepPeriod = std::chrono::seconds {15};
+
+    void sweep_inactive_sessions() {
+      const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()
+      )
+                            .count();
+      const auto timeout_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(kSessionActivityTimeout).count();
+      std::vector<std::pair<std::string, std::int64_t>> stale;
+      {
+        std::lock_guard lg {session_mutex};
+        for (auto &entry : sessions) {
+          const auto &ctx = entry.second.data_channel_context;
+          if (!ctx) {
+            continue;
+          }
+          const auto last = ctx->last_activity_ms.load(std::memory_order_acquire);
+          if (last == 0) {
+            continue;
+          }
+          const auto age_ms = now_ms - last;
+          if (age_ms > timeout_ms) {
+            stale.emplace_back(entry.first, age_ms);
+          }
+        }
+      }
+      for (const auto &[id, age_ms] : stale) {
+        BOOST_LOG(info) << "WebRTC: no data-channel activity for " << (age_ms / 1000)
+                        << "s; closing session " << id;
+        close_session(id);
+      }
+    }
+
+    void schedule_session_activity_sweep() {
+      task_pool.pushDelayed(
+        []() {
+          sweep_inactive_sessions();
+          schedule_session_activity_sweep();
+        },
+        kSessionActivitySweepPeriod
+      );
     }
 
     void on_data_channel(void *user, lwrtc_data_channel_t *channel) {
@@ -5772,6 +5845,10 @@ namespace webrtc_stream {
         // After insertion, so the first packets this encoder produces have somewhere to go.
         start_session_encoder(inserted->second);
       }
+      // One process-wide repeating sweep for peers that vanish without closing the
+      // data channel; armed on the first session ever created and cheap when idle.
+      static std::once_flag activity_sweep_armed;
+      std::call_once(activity_sweep_armed, schedule_session_activity_sweep);
       webrtc_capture.pending_session_creations.fetch_sub(1, std::memory_order_release);
       reservation_guard.disable();
     }
