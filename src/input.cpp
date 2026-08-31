@@ -1927,4 +1927,49 @@ namespace input {
 
     return input;
   }
+
+  void ensure_touch_port(std::shared_ptr<input_t> &input, std::optional<std::pair<int, int>> dims) {
+    if (!input) {
+      return;
+    }
+    const auto &port = input->touch_port;
+    bool stale = !port;
+    if (!stale && dims) {
+      stale = port.width != dims->first || port.height != dims->second;
+    }
+    if (!stale) {
+      return;
+    }
+
+    int screen_width = 1920;
+    int screen_height = 1080;
+#ifdef _WIN32
+    screen_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    screen_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+#endif
+    if (dims) {
+      screen_width = dims->first;
+      screen_height = dims->second;
+    }
+    if (screen_width <= 0) {
+      screen_width = 1920;
+    }
+    if (screen_height <= 0) {
+      screen_height = 1080;
+    }
+
+    input::touch_port_t new_port {};
+    new_port.offset_x = 0;
+    new_port.offset_y = 0;
+    new_port.width = screen_width;
+    new_port.height = screen_height;
+    new_port.env_width = screen_width;
+    new_port.env_height = screen_height;
+    new_port.client_offsetX = 0.0f;
+    new_port.client_offsetY = 0.0f;
+    new_port.scalar_inv = 1.0f;
+
+    input->touch_port = new_port;
+    input->touch_port_event->raise(new_port);
+  }
 }  // namespace input

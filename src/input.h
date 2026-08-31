@@ -33,6 +33,21 @@ namespace input {
 
   std::shared_ptr<input_t> alloc(safe::mail_t mail);
 
+  /**
+   * @brief Ensure the input context has a touch port matching the given dimensions.
+   *
+   * If the stored touch port is empty or its width/height don't match `dims`,
+   * re-raise a fresh touch port on the input mail. Used by the WebRTC session
+   * to recover from races where the first absolute mouse packet lands before
+   * a touch port has been published, and to keep the port in sync when the
+   * host's capture dimensions change.
+   *
+   * @param input The input context to update.
+   * @param dims  Current capture dimensions (width, height). If empty, no drift
+   *              check is performed — only the missing-port case is handled.
+   */
+  void ensure_touch_port(std::shared_ptr<input_t> &input, std::optional<std::pair<int, int>> dims);
+
   struct touch_port_t: public platf::touch_port_t {
     int env_width;
     int env_height;
