@@ -50,6 +50,10 @@ const invites = ref<Invite[]>([]);
 // Set from /api/invites — the `public_base_url` setting, or '' when unset.
 const linkBase = ref('');
 const loading = ref(false);
+// True only until the first load() finishes. Background refreshes keep the
+// existing list on screen instead of swapping it for a skeleton — that swap
+// is what makes the page look like it is reloading every few seconds.
+const initialLoad = ref(true);
 const error = ref('');
 const notice = ref('');
 const busyId = ref('');
@@ -118,13 +122,44 @@ async function load(): Promise<void> {
   error.value = '';
   try {
     const response = await apiGet<{ invites?: Invite[]; link_base?: string }>('/api/invites');
-    invites.value = Array.isArray(response.invites) ? response.invites : [];
-    linkBase.value = (response.link_base ?? '').replace(/\/+$/, '');
+    const next = Array.isArray(response.invites) ? response.invites : [];
+    const nextBase = (response.link_base ?? '').replace(/\/+$/, '');
+    // Skip the array replacement when nothing changed. A new ref on every poll
+    // forces every card to re-render even when the response is byte-identical,
+    // which the user sees as the list "flashing".
+    if (!sameInvites(invites.value, next)) {
+      invites.value = next;
+    }
+    if (linkBase.value !== nextBase) {
+      linkBase.value = nextBase;
+    }
   } catch (err) {
     error.value = describe(err);
   } finally {
     loading.value = false;
+    initialLoad.value = false;
   }
+}
+
+function sameInvites(a: Invite[], b: Invite[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    // Order is stable from the API; the only fields that change while the page
+    // is open are active_sessions, locked_for_seconds, uses, and revoked. A
+    // mismatch on any of those means the card needs to re-render.
+    if (
+      x.id !== y.id ||
+      x.active_sessions !== y.active_sessions ||
+      x.locked_for_seconds !== y.locked_for_seconds ||
+      x.uses !== y.uses ||
+      x.revoked !== y.revoked
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function create(): Promise<void> {
@@ -290,7 +325,7 @@ onBeforeUnmount(() => {
       />
     </form>
 
-    <LoadingSkeleton v-if="loading" />
+    <LoadingSkeleton v-if="loading && initialLoad" />
 
     <EmptyState
       v-else-if="!hasInvites"
