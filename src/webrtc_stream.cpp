@@ -1034,52 +1034,73 @@ namespace webrtc_stream {
           webrtc_gamepads.reset();
         }
       }
+
+      // Seed the touch port onto `mail`. Encoders are per session and run on their own
+      // mails, so nothing else publishes geometry here — without this, absolute mouse
+      // packets land in `client_to_touchport` with nothing to map against and the cursor
+      // never moves.
+      auto seed_touch_port = [](const std::shared_ptr<safe::mail_raw_t> &mail) {
+        auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
+#ifdef _WIN32
+        int screen_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int screen_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+#else
+        // For non-Windows platforms, use a default resolution.
+        // This will be updated when actual capture dimensions are known.
+        int screen_width = 1920;
+        int screen_height = 1080;
+#endif
+        // The capture's own dimensions beat the virtual desktop's: with a virtual
+        // display attached they are what the client is actually looking at.
+        if (const auto dims = active_capture_dimensions()) {
+          screen_width = dims->first;
+          screen_height = dims->second;
+        }
+        if (screen_width <= 0) {
+          screen_width = 1920;
+        }
+        if (screen_height <= 0) {
+          screen_height = 1080;
+        }
+
+        input::touch_port_t port {};
+        port.offset_x = 0;
+        port.offset_y = 0;
+        port.width = screen_width;
+        port.height = screen_height;
+        port.env_width = screen_width;
+        port.env_height = screen_height;
+        port.client_offsetX = 0.0f;
+        port.client_offsetY = 0.0f;
+        port.scalar_inv = 1.0f;
+        touch_port_event->raise(port);
+      };
+
       if (!input_context) {
         input_mail = capture_mail ? capture_mail : std::make_shared<safe::mail_raw_t>();
         input_context = input::alloc(input_mail);
-
-        // Seed the touch port unconditionally.
-        //
-        // This used to run only when there was no capture mail, because the shared
-        // video::capture() published touch_port onto that same mail. Encoders are now
-        // per session and run on their own mails, so nothing publishes geometry here any
-        // more — which left absolute mouse coordinates with nothing to map against and
-        // stopped the cursor moving while clicks and keys still worked.
-        {
-          auto touch_port_event = input_mail->event<input::touch_port_t>(mail::touch_port);
-#ifdef _WIN32
-          int screen_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-          int screen_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-#else
-          // For non-Windows platforms, use a default resolution
-          // This will be updated when actual capture dimensions are known
-          int screen_width = 1920;
-          int screen_height = 1080;
-#endif
-          // The capture's own dimensions beat the virtual desktop's: with a virtual
-          // display attached they are what the client is actually looking at.
+        seed_touch_port(input_mail);
+      } else {
+        // Re-seed when the stored port is missing or its dimensions no longer match the
+        // active capture. Three real-world cases this catches:
+        //   1. The first mouse_move arrives before anything else has populated
+        //      touch_port (the old one-shot seed inside `if (!input_context)` only
+        //      ran on context creation and could be popped before the move packet).
+        //   2. The admin changes resolution in the v2 stream page after the context
+        //      was created; the cached port's width/height drift from the new capture
+        //      and the cursor lands in the wrong place.
+        //   3. Any future code path that pops `touch_port_event` ahead of the move
+        //      packet — without re-seeding, the move silently no-ops.
+        // The drift check (one bool compare) keeps steady-state cost trivial.
+        bool stale = !input_context->touch_port;
+        if (!stale) {
           if (const auto dims = active_capture_dimensions()) {
-            screen_width = dims->first;
-            screen_height = dims->second;
+            stale = input_context->touch_port.width != dims->first ||
+              input_context->touch_port.height != dims->second;
           }
-          if (screen_width <= 0) {
-            screen_width = 1920;
-          }
-          if (screen_height <= 0) {
-            screen_height = 1080;
-          }
-
-          input::touch_port_t port {};
-          port.offset_x = 0;
-          port.offset_y = 0;
-          port.width = screen_width;
-          port.height = screen_height;
-          port.env_width = screen_width;
-          port.env_height = screen_height;
-          port.client_offsetX = 0.0f;
-          port.client_offsetY = 0.0f;
-          port.scalar_inv = 1.0f;
-          touch_port_event->raise(port);
+        }
+        if (stale) {
+          seed_touch_port(input_mail);
         }
       }
       return input_context;
