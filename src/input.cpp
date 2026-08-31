@@ -1968,6 +1968,11 @@ namespace input {
     new_port.client_offsetX = 0.0f;
     new_port.client_offsetY = 0.0f;
     new_port.scalar_inv = 1.0f;
+    // client_to_touchport divides by scalar_tpcoords on every non-Linux platform.
+    // Zero-init makes that x / 0.0f == inf, which move_absolute silently swallows:
+    // clicks and keys keep working while the cursor never moves. video.cpp's
+    // make_port uses 1.0f everywhere logical dimensions are unavailable — match it.
+    new_port.scalar_tpcoords = 1.0f;
 
     input->touch_port = new_port;
     input->touch_port_event->raise(new_port);
