@@ -954,6 +954,8 @@
         "height": "Height",
         "mute_host_audio": "Mute host speakers while streaming",
         "mute_host_audio_help": "Keep audio in this browser without playing it through the host speakers.",
+        "volume": "Volume",
+        "volume_help": "Adjusts the stream audio in this browser only.",
         "title": "Stream settings",
         "video": "Video",
         "width": "Width"

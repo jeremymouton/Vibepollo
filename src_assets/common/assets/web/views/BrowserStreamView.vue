@@ -43,6 +43,7 @@ interface StreamLaunchForm {
   hdr: boolean;
   height: number;
   muteHostAudio: boolean;
+  volume: number;
   width: number;
 }
 
@@ -315,6 +316,19 @@ const bitrateLabel = computed(() =>
     : `${(form.bitrateKbps / 1000).toFixed(form.bitrateKbps % 1000 ? 1 : 0)} Mbps`,
 );
 
+/// Volume is stored as 0-100 in the form so the slider has predictable integer
+/// steps. The audio element wants 0.0-1.0, so convert at the edge. Anything
+/// outside the range gets clamped; HTMLMediaElement.volume silently does that,
+/// but the slider would still let the user scrub past 1 if v-model.number fed
+/// back a non-finite value.
+function clampVolume(value: number): number {
+  if (!Number.isFinite(value)) return 1;
+  const clamped = Math.min(100, Math.max(0, value));
+  return clamped / 100;
+}
+
+const volumeLabel = computed(() => `${Math.round(form.volume)}%`);
+
 /// Newest first: at a given bitrate AV1 and HEVC hold detail that H.264 loses, and
 /// the difference is largest exactly where it matters, on a constrained link.
 function bestAvailableCodec(): EncodingType {
@@ -330,6 +344,7 @@ const form = reactive<StreamLaunchForm>({
   hdr: false,
   height: 1080,
   muteHostAudio: true,
+  volume: 100,
   width: 1920,
 });
 
@@ -898,6 +913,9 @@ function attachRemoteStream(stream: MediaStream): void {
   if (audioTracks.length && audioEl.value) {
     audioPlaybackStream = replaceTracks(audioPlaybackStream, audioTracks);
     audioEl.value.srcObject = audioPlaybackStream;
+    // Apply the current slider value to the element. A fresh srcObject reset
+    // clears the volume to 1, so reapply here whenever a new track lands.
+    audioEl.value.volume = clampVolume(form.volume);
   }
 
   void playAttachedMedia();
@@ -1483,6 +1501,17 @@ watch(inputForwarding, (enabled, wasEnabled) => {
   if (!enabled && wasEnabled) releaseForwardedInput();
 });
 
+/// Apply the slider value to the audio element whenever it changes, even
+/// mid-stream. Without this, the slider would only matter at the next attach
+/// — the owner would scrub the bar, see the percent move, and hear nothing
+/// change until the stream restarted.
+watch(
+  () => form.volume,
+  (value) => {
+    if (audioEl.value) audioEl.value.volume = clampVolume(value);
+  },
+);
+
 // inputReady already means connected + forwarding on + data channel open, which is
 // exactly when a controller can reach the host.
 watch(inputReady, (ready) => {
@@ -2064,6 +2093,25 @@ onBeforeUnmount(() => {
               <strong>{{ t('ui.browser_stream.settings.mute_host_audio') }}</strong>
               <small>{{ t('ui.browser_stream.settings.mute_host_audio_help') }}</small>
             </span>
+          </label>
+
+          <label class="vs-field" for="browser-stream-volume">
+            <span class="vs-field__label">
+              {{ t('ui.browser_stream.settings.volume', 'Volume') }} —
+              {{ volumeLabel }}
+            </span>
+            <input
+              id="browser-stream-volume"
+              v-model.number="form.volume"
+              class="vs-range"
+              type="range"
+              min="0"
+              max="100"
+              step="1"
+            />
+            <small class="vs-field__help">{{
+              t('ui.browser_stream.settings.volume_help', 'Adjusts the stream audio in this browser only.')
+            }}</small>
           </label>
 
           <p v-if="validationError" class="stream-form__validation" role="status">
