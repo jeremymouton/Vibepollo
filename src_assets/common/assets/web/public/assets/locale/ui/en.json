@@ -909,6 +909,9 @@
       "host_not_ready": "Browser streaming is not ready yet",
       "input_ready": "Input forwarding is ready",
       "input_unavailable": "Input forwarding is unavailable",
+      "gamepad_connected": "Controller connected ({count})",
+      "gamepad_connected_one": "Controller connected",
+      "gamepad_none": "No controller detected",
       "install": {
         "action": "Improve iPad fullscreen",
         "description": "To remove Safari's address bar before opening fullscreen, tap Safari's Share button, choose Add to Home Screen, keep Open as Web App enabled, then launch Vibepollo from its Home Screen icon. Safari may still briefly show its own fullscreen exit control.",

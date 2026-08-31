@@ -205,6 +205,36 @@ const isTouchDevice =
   typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window);
 const showTouchPad = ref(false);
 
+/// A small "Controller connected" chip so the owner can see, at a glance, whether
+/// the gamepad they grabbed is actually talking to the browser. The input capture
+/// already reads it (see attachInputCapture), but on its own the page has no way to
+/// show that — and "the controls did nothing" is the first thing the owner asks.
+/// Polled because gamepadconnect / gamepaddisconnect events miss a controller that
+/// is already paired when the page loads, and the count drops on the next disconnect
+/// whether or not the event fires on this tab.
+const connectedGamepads = ref(0);
+let gamepadPollTimer: number | undefined;
+function countGamepads(): number {
+  if (typeof navigator === 'undefined' || typeof navigator.getGamepads !== 'function') return 0;
+  return navigator.getGamepads().filter((pad) => pad !== null).length;
+}
+function refreshGamepadCount(): void {
+  connectedGamepads.value = countGamepads();
+}
+function startGamepadPolling(): void {
+  if (gamepadPollTimer !== undefined) return;
+  refreshGamepadCount();
+  gamepadPollTimer = window.setInterval(refreshGamepadCount, 1000);
+}
+function stopGamepadPolling(): void {
+  if (gamepadPollTimer === undefined) return;
+  window.clearInterval(gamepadPollTimer);
+  gamepadPollTimer = undefined;
+}
+function onGamepadConnectionChange(): void {
+  refreshGamepadCount();
+}
+
 /// Same numbers the guest page shows, for the same reason: "it looked bad" cannot
 /// tell a slow link from a lossy one from a host that cannot keep up.
 /// Publishes the running stream so the corner player can show it while the owner
@@ -1464,7 +1494,10 @@ onMounted(() => {
   standaloneWebApp.value = runningAsStandaloneWebApp();
   void refresh();
   startSessionStatusPolling();
+  startGamepadPolling();
   window.addEventListener('blur', onWindowBlur);
+  window.addEventListener('gamepadconnected', onGamepadConnectionChange);
+  window.addEventListener('gamepaddisconnected', onGamepadConnectionChange);
   document.addEventListener('fullscreenchange', onFullscreenChange);
   document.addEventListener('webkitfullscreenchange', onFullscreenChange as EventListener);
   document.addEventListener('visibilitychange', onVisibilityChange);
@@ -1474,11 +1507,14 @@ onMounted(() => {
 onBeforeUnmount(() => {
   releaseGamepads();
   stopSessionStatusPolling();
+  stopGamepadPolling();
   cancelFullscreenExitHold();
   finishFullscreenExitSwipe();
   exitPseudoFullscreen();
   releaseFullscreenKeyboardLock();
   window.removeEventListener('blur', onWindowBlur);
+  window.removeEventListener('gamepadconnected', onGamepadConnectionChange);
+  window.removeEventListener('gamepaddisconnected', onGamepadConnectionChange);
   document.removeEventListener('fullscreenchange', onFullscreenChange);
   document.removeEventListener('webkitfullscreenchange', onFullscreenChange as EventListener);
   document.removeEventListener('visibilitychange', onVisibilityChange);
@@ -1805,6 +1841,22 @@ onBeforeUnmount(() => {
             inputReady
               ? t('ui.browser_stream.input_ready')
               : t('ui.browser_stream.input_unavailable')
+          }}
+        </span>
+        <span
+          class="stream-stage__gamepad-status"
+          :data-connected="connectedGamepads > 0"
+          :title="connectedGamepads > 0
+            ? t('ui.browser_stream.gamepad_connected', { count: connectedGamepads })
+            : t('ui.browser_stream.gamepad_none')"
+        >
+          <UiIcon name="gamepad" :size="16" />
+          {{
+            connectedGamepads > 0
+              ? connectedGamepads === 1
+                ? t('ui.browser_stream.gamepad_connected_one')
+                : t('ui.browser_stream.gamepad_connected', { count: connectedGamepads })
+              : t('ui.browser_stream.gamepad_none')
           }}
         </span>
       </div>
@@ -2425,6 +2477,18 @@ onBeforeUnmount(() => {
 }
 
 .stream-stage__input-status[data-ready='true'] {
+  color: var(--vs-color-status-success);
+}
+
+.stream-stage__gamepad-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--vs-space-4);
+  color: var(--vs-color-text-muted);
+  font-size: var(--vs-type-size-helper);
+}
+
+.stream-stage__gamepad-status[data-connected='true'] {
   color: var(--vs-color-status-success);
 }
 
