@@ -399,14 +399,16 @@
               class="pad-body"
               d="M56 46H264C286 46 296 62 296 86V128C296 152 286 168 264 168H56C34 168 24 152 24 128V86C24 62 34 46 56 46Z"
             />
-            <!-- left stick -->
-            <circle class="pad-well" cx="92" cy="84" r="18" />
-            <circle class="pad-stick" id="s0" cx="92" cy="84" r="12" />
-            <!-- d-pad: arms meet so it reads as a cross -->
-            <rect class="pad-el" id="b12" x="85" y="115" width="14" height="14" rx="2" />
-            <rect class="pad-el" id="b14" x="71" y="129" width="14" height="14" rx="2" />
-            <rect class="pad-el" id="b15" x="99" y="129" width="14" height="14" rx="2" />
-            <rect class="pad-el" id="b13" x="85" y="143" width="14" height="14" rx="2" />
+            <!-- d-pad: arms meet so it reads as a cross. Sits where the left stick
+                 used to be — the real-world layout has the d-pad up here and the
+                 left stick down in the grip, not the way round. -->
+            <rect class="pad-el" id="b12" x="85" y="67" width="14" height="14" rx="2" />
+            <rect class="pad-el" id="b14" x="71" y="81" width="14" height="14" rx="2" />
+            <rect class="pad-el" id="b15" x="99" y="81" width="14" height="14" rx="2" />
+            <rect class="pad-el" id="b13" x="85" y="95" width="14" height="14" rx="2" />
+            <!-- left stick: down in the left grip, where it actually lives. -->
+            <circle class="pad-well" cx="92" cy="136" r="18" />
+            <circle class="pad-stick" id="s0" cx="92" cy="136" r="12" />
             <!-- face buttons -->
             <circle class="pad-el" id="b3" cx="228" cy="64" r="11" />
             <circle class="pad-el" id="b1" cx="248" cy="84" r="11" />
