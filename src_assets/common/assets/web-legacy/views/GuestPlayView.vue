@@ -12,7 +12,7 @@
  * the grant from the invite server-side, so anything this page asks for is
  * discarded — which is why it does not ask.
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import { http } from '@/http';
 import { WebRtcHttpApi } from '@/services/webrtcApi';
@@ -22,6 +22,7 @@ import {
   requestKeyboardLock,
 } from '@/utils/webrtc/input';
 import { WebRtcClient } from '@/utils/webrtc/client';
+import { attachVideoUpscaler } from '@/utils/webrtc/upscaler';
 import TouchGamepad from '@/components/TouchGamepad.vue';
 import type { EncodingType, StreamConfig, WebRtcStatsSnapshot } from '@/types/webrtc';
 
@@ -122,6 +123,56 @@ const phase = ref<Phase>('ready');
 const message = ref('Connecting to the host…');
 const videoEl = ref<HTMLVideoElement>();
 const stageEl = ref<HTMLDivElement>();
+
+/// Client-side FSR (EASU upscale + RCAS sharpen) between the decoded frame and the
+/// screen. Pays off exactly when a guest streams below display resolution — 720p on
+/// a constrained line shown on a 1440p screen — which is why it lives here and not
+/// in the stream config: it costs nothing on the wire and needs no reconnect.
+const ENHANCE_KEY = 'vibepollo.guest.enhance';
+const enhance = ref<boolean>(
+  (() => {
+    try {
+      return window.localStorage.getItem(ENHANCE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  })(),
+);
+/// WebGL2 missing or the pipeline died: the checkbox greys out rather than lying.
+const enhanceUnavailable = ref(false);
+const fxCanvas = ref<HTMLCanvasElement>();
+const noopDetach = (): void => undefined;
+let detachUpscaler: () => void = noopDetach;
+
+const upscalerActive = computed(
+  () => enhance.value && !enhanceUnavailable.value && phase.value === 'playing',
+);
+
+function syncUpscaler(): void {
+  detachUpscaler();
+  detachUpscaler = noopDetach;
+  if (!upscalerActive.value || !videoEl.value || !fxCanvas.value) return;
+  const attached = attachVideoUpscaler(videoEl.value, fxCanvas.value, {
+    onFailure: () => {
+      enhanceUnavailable.value = true;
+    },
+  });
+  if (!attached) {
+    enhanceUnavailable.value = true;
+    return;
+  }
+  detachUpscaler = () => attached.detach();
+}
+
+// flush: 'post' so the canvas exists in the DOM before an attach is attempted.
+watch(upscalerActive, () => syncUpscaler(), { flush: 'post' });
+watch(enhance, (on) => {
+  try {
+    window.localStorage.setItem(ENHANCE_KEY, on ? '1' : '0');
+  } catch {
+    /* private browsing; the choice just will not persist */
+  }
+});
 
 const client = new WebRtcClient(new WebRtcHttpApi());
 const sessionId = ref('');
@@ -329,6 +380,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   stopTelemetry();
   detachInput();
+  detachUpscaler();
   // keepalive so a reload does not strand the session on the host
   void client.disconnect({ keepalive: true }).catch(() => undefined);
 });
@@ -344,10 +396,19 @@ onBeforeUnmount(() => {
     <video
       ref="videoEl"
       class="w-full h-full object-contain bg-black"
+      :class="{ 'opacity-0': upscalerActive }"
       autoplay
       playsinline
       disablepictureinpicture
     ></video>
+    <!-- FSR output. The video stays mounted and playing underneath (it is the decode
+         surface and audio sink); opacity keeps it compositing so frame callbacks
+         still fire, unlike display:none. -->
+    <canvas
+      v-show="upscalerActive"
+      ref="fxCanvas"
+      class="absolute inset-0 w-full h-full pointer-events-none"
+    ></canvas>
 
     <!-- Scrolls when it has to. A phone held sideways has barely any height, and
          centring alone clips the overflow in both directions — the Start button
@@ -500,6 +561,24 @@ onBeforeUnmount(() => {
           <option :value="40000">40 Mbps</option>
         </select>
         <span class="text-white/50 text-xs">Automatic follows the connection.</span>
+      </label>
+      <label class="flex items-start gap-2">
+        <input
+          v-model="enhance"
+          type="checkbox"
+          class="mt-1"
+          :disabled="enhanceUnavailable"
+        />
+        <span>
+          Sharpen upscaled video (FSR)
+          <span class="block text-white/50 text-xs">
+            {{
+              enhanceUnavailable
+                ? 'Not available on this device.'
+                : 'Sharper picture when streaming below your screen resolution. Applies instantly.'
+            }}
+          </span>
+        </span>
       </label>
       <button class="w-full rounded bg-white/20 py-1.5" @click="applyQuality">
         Apply and reconnect
