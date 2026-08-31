@@ -348,14 +348,25 @@ const form = reactive<StreamLaunchForm>({
   width: 1920,
 });
 
-/// Bits per pixel per second for each codec at a streaming quality target. Picked
-/// from the same family of rules moonlight / sunshine already use: 0.10 bpp for
-/// H.264, 0.06 for HEVC, 0.04 for AV1. These give decent motion and full-screen
-/// text without overshooting the link.
-const BITS_PER_PIXEL_PER_SECOND: Record<EncodingType, number> = {
-  h264: 0.1,
-  hevc: 0.06,
-  av1: 0.04,
+/// Moonlight's default-bitrate curve: Mbps at 30 fps for H.264, interpolated
+/// linearly on pixel count between these anchors (1080p60 lands on the familiar
+/// 20 Mbps default). Game streaming needs these rates — conferencing-style
+/// bits-per-pixel constants recommend a quarter of this and smear in motion.
+const BITRATE_ANCHORS: ReadonlyArray<readonly [pixels: number, mbpsAt30: number]> = [
+  [640 * 360, 1],
+  [854 * 480, 2],
+  [1280 * 720, 5],
+  [1920 * 1080, 10],
+  [2560 * 1440, 20],
+  [3840 * 2160, 40],
+];
+
+/// HEVC and AV1 hold the same quality at a lower rate, but the discount in
+/// practice is nowhere near the 40-60% marketing figure at streaming latency.
+const CODEC_BITRATE_SCALE: Record<EncodingType, number> = {
+  h264: 1,
+  hevc: 0.75,
+  av1: 0.6,
 };
 
 /// Host-defined lower and upper bounds, used to clamp the recommendation so the
@@ -379,8 +390,33 @@ function recommendedBitrateKbps(): number {
   const pixels = form.width * form.height;
   if (!Number.isFinite(pixels) || pixels <= 0) return 0;
   if (!Number.isFinite(form.fps) || form.fps <= 0) return 0;
-  const bpp = BITS_PER_PIXEL_PER_SECOND[form.encoding] ?? BITS_PER_PIXEL_PER_SECOND.h264;
-  const rawKbps = (pixels * form.fps * bpp) / 1000;
+
+  // Interpolate the anchor table on pixel count; extrapolate proportionally
+  // past either end so odd resolutions still land somewhere sensible.
+  const first = BITRATE_ANCHORS[0];
+  const last = BITRATE_ANCHORS[BITRATE_ANCHORS.length - 1];
+  let mbpsAt30: number;
+  if (pixels <= first[0]) {
+    mbpsAt30 = (first[1] * pixels) / first[0];
+  } else if (pixels >= last[0]) {
+    mbpsAt30 = (last[1] * pixels) / last[0];
+  } else {
+    mbpsAt30 = last[1];
+    for (let i = 1; i < BITRATE_ANCHORS.length; i++) {
+      const [hiPx, hiMbps] = BITRATE_ANCHORS[i];
+      if (pixels <= hiPx) {
+        const [loPx, loMbps] = BITRATE_ANCHORS[i - 1];
+        mbpsAt30 = loMbps + ((hiMbps - loMbps) * (pixels - loPx)) / (hiPx - loPx);
+        break;
+      }
+    }
+  }
+
+  // Same shape moonlight uses: linear in fps up to 60, then square-root growth —
+  // doubling the frame rate does not double the information in the scene.
+  const fpsFactor = (form.fps <= 60 ? form.fps : Math.sqrt(form.fps / 60) * 60) / 30;
+  const scale = CODEC_BITRATE_SCALE[form.encoding] ?? CODEC_BITRATE_SCALE.h264;
+  const rawKbps = mbpsAt30 * fpsFactor * scale * 1000;
   const { min, max } = bitrateBounds();
   return Math.min(max, Math.max(min, roundToStep(rawKbps, 1000)));
 }
@@ -2153,7 +2189,7 @@ onBeforeUnmount(() => {
                 :max="hostCapabilities.limits.max_bitrate_kbps || 150000"
                 step="1000"
               />
-              <small class="vs-field__help">
+              <small class="vs-field__help stream-form__bitrate-help">
                 <template v-if="!bitrateMatchesRecommendation && recommendedBitrateKbps() > 0">
                   {{
                     t('ui.browser_stream.settings.bitrate_recommended_hint', {
@@ -2715,6 +2751,12 @@ onBeforeUnmount(() => {
   color: var(--vs-color-status-warning);
   font-size: var(--vs-type-size-helper);
   line-height: 1.4;
+}
+
+.stream-form__bitrate-help {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--vs-space-8);
 }
 
 .browser-capabilities {
