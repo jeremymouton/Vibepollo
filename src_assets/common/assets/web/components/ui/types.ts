@@ -33,6 +33,7 @@ export type UiIconName =
   | 'trash'
   | 'upload'
   | 'user'
+  | 'volume'
   | 'warning'
   | 'x'
   | 'x-circle';

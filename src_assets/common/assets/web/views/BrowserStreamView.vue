@@ -302,11 +302,21 @@ function syncFpsChoice(): void {
 }
 
 /// 0 means "let the host decide", which a slider cannot express, so it is a separate
-/// switch and the slider is disabled while it is on.
+/// switch and the slider is disabled while it is on. Turning it back off returns to
+/// the recommended value (and re-arms auto-tracking) rather than a hardcoded 20 Mbps.
+/// The referenced helpers are declared further down; the setter only runs on user
+/// interaction, long after module init.
 const useHostBitrate = computed({
   get: () => form.bitrateKbps === 0,
   set: (on: boolean) => {
-    form.bitrateKbps = on ? 0 : 20_000;
+    if (on) {
+      form.bitrateKbps = 0;
+      bitrateTracksRecommendation.value = false;
+      return;
+    }
+    const recommended = recommendedBitrateKbps();
+    form.bitrateKbps = recommended > 0 ? recommended : 20_000;
+    bitrateTracksRecommendation.value = recommended > 0;
   },
 });
 
@@ -421,12 +431,12 @@ function recommendedBitrateKbps(): number {
   return Math.min(max, Math.max(min, roundToStep(rawKbps, 1000)));
 }
 
-/// Tracks whether the slider is currently on the recommended value. Flipped
-/// true when the user clicks "Use recommended" and false the first time the
-/// user moves the slider off it. Used by the resolution / fps / codec watcher
-/// to decide whether to drag the slider for them — touch it and the watcher
-/// leaves it alone.
-const bitrateTracksRecommendation = ref(false);
+/// Tracks whether the slider follows the recommended value. On by default:
+/// settings are not persisted between visits, so every visit starts on the
+/// recommendation and follows it through resolution / fps / codec changes.
+/// Dragging the slider takes the wheel and turns this off; "Use recommended"
+/// hands it back.
+const bitrateTracksRecommendation = ref(true);
 
 function applyRecommendedBitrate(): void {
   const next = recommendedBitrateKbps();
@@ -446,10 +456,15 @@ watch(
   },
 );
 
+/// hostCapabilities is in the dependency list because the recommendation is
+/// clamped to the host's limits: until the capabilities response lands, the
+/// clamp collapses everything to 0 and nothing can be applied. The wholesale
+/// `hostCapabilities.value = ...` assignment on refresh triggers this watcher,
+/// which is what snaps the slider to the recommendation on page load.
 watch(
-  () => [form.width, form.height, form.fps, form.encoding] as const,
+  () => [form.width, form.height, form.fps, form.encoding, hostCapabilities.value] as const,
   () => {
-    if (bitrateTracksRecommendation.value) applyRecommendedBitrate();
+    if (bitrateTracksRecommendation.value && !useHostBitrate.value) applyRecommendedBitrate();
   },
 );
 
@@ -1758,7 +1773,7 @@ onBeforeUnmount(() => {
         </label>
       </div>
 
-      <LoadingSkeleton v-if="loading" variant="block" height="250px" aria-hidden="true" />
+      <LoadingSkeleton v-if="loading" variant="block" height="56px" aria-hidden="true" />
       <template v-else>
         <div
           class="app-picker__grid"
@@ -1766,30 +1781,22 @@ onBeforeUnmount(() => {
           :aria-label="t('ui.browser_stream.settings.application')"
         >
           <button
-            class="app-picker__card app-picker__card--desktop"
+            class="app-picker__card"
             :class="{ 'app-picker__card--selected': appSelected() }"
             type="button"
             role="option"
             :aria-selected="appSelected()"
             :disabled="connectionPending || isConnected"
+            :title="
+              resumeAvailable ? t('webrtc.no_selection') : t('ui.browser_stream.picker.desktop_detail')
+            "
             @click="selectApp()"
           >
             <span class="app-picker__artwork app-picker__artwork--desktop">
-              <UiIcon name="devices" :size="42" />
-              <span v-if="appSelected()" class="app-picker__selected-mark">
-                <UiIcon name="check" :size="16" />
-              </span>
+              <UiIcon name="devices" :size="18" />
             </span>
-            <span class="app-picker__copy">
-              <strong>{{ t('ui.browser_stream.desktop') }}</strong>
-              <small>
-                {{
-                  resumeAvailable
-                    ? t('webrtc.no_selection')
-                    : t('ui.browser_stream.picker.desktop_detail')
-                }}
-              </small>
-            </span>
+            <strong>{{ t('ui.browser_stream.desktop') }}</strong>
+            <UiIcon v-if="appSelected()" class="app-picker__check" name="check" :size="14" />
           </button>
 
           <button
@@ -1813,15 +1820,11 @@ onBeforeUnmount(() => {
                 @error="markAppCoverFailed(app.id)"
               />
               <span v-else class="app-picker__artwork-fallback" aria-hidden="true">
-                <UiIcon name="gamepad" :size="34" />
-              </span>
-              <span v-if="appSelected(app.id)" class="app-picker__selected-mark">
-                <UiIcon name="check" :size="16" />
+                <UiIcon name="gamepad" :size="16" />
               </span>
             </span>
-            <span class="app-picker__copy">
-              <strong>{{ app.name }}</strong>
-            </span>
+            <strong>{{ app.name }}</strong>
+            <UiIcon v-if="appSelected(app.id)" class="app-picker__check" name="check" :size="14" />
           </button>
         </div>
 
@@ -1976,6 +1979,22 @@ onBeforeUnmount(() => {
           variant="secondary"
           @click="installHelpOpen = true"
         />
+        <label
+          class="stream-stage__volume"
+          :title="t('ui.browser_stream.settings.volume_help', 'Adjusts the stream audio in this browser only.')"
+        >
+          <UiIcon name="volume" :size="16" />
+          <input
+            v-model.number="form.volume"
+            class="vs-range"
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            :aria-label="t('ui.browser_stream.settings.volume', 'Volume')"
+          />
+          <span class="stream-stage__volume-value">{{ volumeLabel }}</span>
+        </label>
         <span class="stream-stage__input-status" :data-ready="inputReady">
           <UiIcon :name="inputReady ? 'check-circle' : 'info'" :size="16" />
           {{
@@ -2020,28 +2039,126 @@ onBeforeUnmount(() => {
         <form class="stream-form" @submit.prevent="requestPrimaryAction">
           <fieldset class="stream-form__group" :disabled="connectionPending || isConnected">
             <legend>{{ t('ui.browser_stream.settings.video') }}</legend>
-            <label class="vs-field" for="browser-stream-codec">
-              <span class="vs-field__label">{{ t('ui.browser_stream.settings.codec') }}</span>
-              <select
-                id="browser-stream-codec"
-                v-model="codecChoice"
-                class="vs-select"
-                @change="onCodecChoiceChanged"
-              >
-                <option value="auto">
-                  {{ t('ui.browser_stream.codecs.auto', 'Automatic') }}
-                </option>
-                <option
-                  v-for="codec in codecs"
-                  :key="codec"
-                  :value="codec"
-                  :disabled="!codecAvailable(codec)"
+            <div class="stream-form__select-grid">
+              <label class="vs-field" for="browser-stream-codec">
+                <span class="vs-field__label">{{ t('ui.browser_stream.settings.codec') }}</span>
+                <select
+                  id="browser-stream-codec"
+                  v-model="codecChoice"
+                  class="vs-select"
+                  @change="onCodecChoiceChanged"
                 >
-                  {{ codecLabel(codec)
-                  }}{{ codecAvailable(codec) ? '' : ` - ${codecUnavailableReason(codec)}` }}
-                </option>
-              </select>
-            </label>
+                  <option value="auto">
+                    {{ t('ui.browser_stream.codecs.auto', 'Automatic') }}
+                  </option>
+                  <option
+                    v-for="codec in codecs"
+                    :key="codec"
+                    :value="codec"
+                    :disabled="!codecAvailable(codec)"
+                  >
+                    {{ codecLabel(codec)
+                    }}{{ codecAvailable(codec) ? '' : ` - ${codecUnavailableReason(codec)}` }}
+                  </option>
+                </select>
+              </label>
+
+              <label class="vs-field" for="browser-stream-resolution">
+                <span class="vs-field__label">{{
+                  t('ui.browser_stream.settings.resolution', 'Resolution')
+                }}</span>
+                <select
+                  id="browser-stream-resolution"
+                  v-model="resolutionChoice"
+                  class="vs-select"
+                  @change="onResolutionChanged"
+                >
+                  <option v-for="preset in RESOLUTIONS" :key="preset.label" :value="preset.label">
+                    {{ preset.label }} ({{ preset.width }}x{{ preset.height }})
+                  </option>
+                  <option value="custom">
+                    {{ t('ui.browser_stream.settings.custom', 'Custom') }}
+                  </option>
+                </select>
+              </label>
+
+              <div
+                v-if="resolutionChoice === 'custom'"
+                class="stream-form__numeric-grid stream-form__span"
+              >
+                <label class="vs-field" for="browser-stream-width">
+                  <span class="vs-field__label">{{ t('ui.browser_stream.settings.width') }}</span>
+                  <input
+                    id="browser-stream-width"
+                    v-model.number="form.width"
+                    class="vs-input"
+                    type="number"
+                    :min="hostCapabilities.limits.min_dimension"
+                    :max="hostCapabilities.limits.max_dimension"
+                    step="2"
+                  />
+                </label>
+                <label class="vs-field" for="browser-stream-height">
+                  <span class="vs-field__label">{{ t('ui.browser_stream.settings.height') }}</span>
+                  <input
+                    id="browser-stream-height"
+                    v-model.number="form.height"
+                    class="vs-input"
+                    type="number"
+                    :min="hostCapabilities.limits.min_dimension"
+                    :max="hostCapabilities.limits.max_dimension"
+                    step="2"
+                  />
+                </label>
+              </div>
+
+              <label class="vs-field" for="browser-stream-pacing">
+                <span class="vs-field__label">{{
+                  t('ui.browser_stream.settings.pacing', 'Smoothness')
+                }}</span>
+                <select id="browser-stream-pacing" v-model="pacingMode" class="vs-select">
+                  <option value="latency">Lowest latency — same network only</option>
+                  <option value="balanced">Balanced — recommended</option>
+                  <option value="smoothness">Smoothest — for a poor connection</option>
+                </select>
+              </label>
+
+              <label class="vs-field" for="browser-stream-fps-choice">
+                <span class="vs-field__label">{{ t('ui.browser_stream.settings.fps') }}</span>
+                <select
+                  id="browser-stream-fps-choice"
+                  v-model="fpsChoice"
+                  class="vs-select"
+                  @change="onFpsChanged"
+                >
+                  <option v-for="rate in FRAME_RATES" :key="rate" :value="String(rate)">
+                    {{ rate }} fps
+                  </option>
+                  <option value="custom">
+                    {{ t('ui.browser_stream.settings.custom', 'Custom') }}
+                  </option>
+                </select>
+              </label>
+
+              <label
+                v-if="fpsChoice === 'custom'"
+                class="vs-field stream-form__span"
+                for="browser-stream-fps"
+              >
+                <span class="vs-field__label">{{
+                  t('ui.browser_stream.settings.custom_fps', 'Custom frame rate')
+                }}</span>
+                <input
+                  id="browser-stream-fps"
+                  v-model.number="form.fps"
+                  class="vs-input"
+                  type="number"
+                  :min="hostCapabilities.limits.min_fps"
+                  :max="hostCapabilities.limits.max_fps"
+                  step="1"
+                />
+              </label>
+            </div>
 
             <label
               class="stream-form__check"
@@ -2059,120 +2176,33 @@ onBeforeUnmount(() => {
               </span>
             </label>
 
-            <label class="vs-field" for="browser-stream-resolution">
-              <span class="vs-field__label">{{
-                t('ui.browser_stream.settings.resolution', 'Resolution')
-              }}</span>
-              <select
-                id="browser-stream-resolution"
-                v-model="resolutionChoice"
-                class="vs-select"
-                @change="onResolutionChanged"
-              >
-                <option v-for="preset in RESOLUTIONS" :key="preset.label" :value="preset.label">
-                  {{ preset.label }} ({{ preset.width }}x{{ preset.height }})
-                </option>
-                <option value="custom">
-                  {{ t('ui.browser_stream.settings.custom', 'Custom') }}
-                </option>
-              </select>
-            </label>
-
-            <div v-if="resolutionChoice === 'custom'" class="stream-form__numeric-grid">
-              <label class="vs-field" for="browser-stream-width">
-                <span class="vs-field__label">{{ t('ui.browser_stream.settings.width') }}</span>
-                <input
-                  id="browser-stream-width"
-                  v-model.number="form.width"
-                  class="vs-input"
-                  type="number"
-                  :min="hostCapabilities.limits.min_dimension"
-                  :max="hostCapabilities.limits.max_dimension"
-                  step="2"
-                />
+            <div class="stream-form__toggles">
+              <label class="stream-form__check stream-form__check--plain">
+                <!-- Deliberately not gated on being connected. On a phone the controls
+                     need to be asked for BEFORE the stream starts, not after it is
+                     already running and there is nothing to press. The overlay itself
+                     still only appears once input can actually reach the host. -->
+                <input v-model="showStats" type="checkbox" />
+                <span>{{
+                  t('ui.browser_stream.settings.show_stats', 'Show performance stats')
+                }}</span>
               </label>
-              <label class="vs-field" for="browser-stream-height">
-                <span class="vs-field__label">{{ t('ui.browser_stream.settings.height') }}</span>
-                <input
-                  id="browser-stream-height"
-                  v-model.number="form.height"
-                  class="vs-input"
-                  type="number"
-                  :min="hostCapabilities.limits.min_dimension"
-                  :max="hostCapabilities.limits.max_dimension"
-                  step="2"
-                />
+
+              <label class="stream-form__check stream-form__check--plain">
+                <input v-model="showTouchPad" type="checkbox" />
+                <span>
+                  {{ t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller') }}
+                  <template v-if="!isTouchDevice"> — for a tablet or touchscreen</template>
+                </span>
+              </label>
+
+              <label class="stream-form__check stream-form__check--plain">
+                <input v-model="useHostBitrate" type="checkbox" />
+                <span>{{
+                  t('ui.browser_stream.settings.bitrate_host_default', 'Let the host choose bitrate')
+                }}</span>
               </label>
             </div>
-
-            <label class="vs-field" for="browser-stream-pacing">
-              <span class="vs-field__label">{{
-                t('ui.browser_stream.settings.pacing', 'Smoothness')
-              }}</span>
-              <select id="browser-stream-pacing" v-model="pacingMode" class="vs-select">
-                <option value="latency">Lowest latency — same network only</option>
-                <option value="balanced">Balanced — recommended</option>
-                <option value="smoothness">Smoothest — for a poor connection</option>
-              </select>
-            </label>
-
-            <label class="vs-field" for="browser-stream-fps-choice">
-              <span class="vs-field__label">{{ t('ui.browser_stream.settings.fps') }}</span>
-              <select
-                id="browser-stream-fps-choice"
-                v-model="fpsChoice"
-                class="vs-select"
-                @change="onFpsChanged"
-              >
-                <option v-for="rate in FRAME_RATES" :key="rate" :value="String(rate)">
-                  {{ rate }} fps
-                </option>
-                <option value="custom">
-                  {{ t('ui.browser_stream.settings.custom', 'Custom') }}
-                </option>
-              </select>
-            </label>
-
-            <label v-if="fpsChoice === 'custom'" class="vs-field" for="browser-stream-fps">
-              <span class="vs-field__label">{{
-                t('ui.browser_stream.settings.custom_fps', 'Custom frame rate')
-              }}</span>
-              <input
-                id="browser-stream-fps"
-                v-model.number="form.fps"
-                class="vs-input"
-                type="number"
-                :min="hostCapabilities.limits.min_fps"
-                :max="hostCapabilities.limits.max_fps"
-                step="1"
-              />
-            </label>
-
-            <label class="stream-form__check">
-              <!-- Deliberately not gated on being connected. On a phone the controls
-                   need to be asked for BEFORE the stream starts, not after it is
-                   already running and there is nothing to press. The overlay itself
-                   still only appears once input can actually reach the host. -->
-              <input v-model="showStats" type="checkbox" />
-              <span>{{
-                t('ui.browser_stream.settings.show_stats', 'Show performance stats')
-              }}</span>
-            </label>
-
-            <label class="stream-form__check">
-              <input v-model="showTouchPad" type="checkbox" />
-              <span>
-                {{ t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller') }}
-                <template v-if="!isTouchDevice"> — for a tablet or touchscreen</template>
-              </span>
-            </label>
-
-            <label class="stream-form__check">
-              <input v-model="useHostBitrate" type="checkbox" />
-              <span>{{
-                t('ui.browser_stream.settings.bitrate_host_default', 'Let the host choose bitrate')
-              }}</span>
-            </label>
 
             <label class="vs-field" for="browser-stream-bitrate">
               <span class="vs-field__label">
@@ -2224,25 +2254,6 @@ onBeforeUnmount(() => {
               <strong>{{ t('ui.browser_stream.settings.mute_host_audio') }}</strong>
               <small>{{ t('ui.browser_stream.settings.mute_host_audio_help') }}</small>
             </span>
-          </label>
-
-          <label class="vs-field" for="browser-stream-volume">
-            <span class="vs-field__label">
-              {{ t('ui.browser_stream.settings.volume', 'Volume') }} —
-              {{ volumeLabel }}
-            </span>
-            <input
-              id="browser-stream-volume"
-              v-model.number="form.volume"
-              class="vs-range"
-              type="range"
-              min="0"
-              max="100"
-              step="1"
-            />
-            <small class="vs-field__help">{{
-              t('ui.browser_stream.settings.volume_help', 'Adjusts the stream audio in this browser only.')
-            }}</small>
           </label>
 
           <p v-if="validationError" class="stream-form__validation" role="status">
@@ -2364,7 +2375,7 @@ onBeforeUnmount(() => {
 .app-picker__search {
   position: relative;
   display: flex;
-  min-width: min(22rem, 100%);
+  min-width: min(16rem, 100%);
   align-items: center;
 }
 
@@ -2382,29 +2393,24 @@ onBeforeUnmount(() => {
 }
 
 .app-picker__grid {
-  display: grid;
-  max-height: 34rem;
-  grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr));
-  gap: var(--vs-space-12);
-  padding: var(--vs-space-2);
-  overflow-y: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--vs-space-8);
 }
 
 .app-picker__card {
-  display: grid;
+  display: inline-flex;
   min-width: 0;
-  align-content: start;
-  padding: 0;
-  overflow: hidden;
+  align-items: center;
+  gap: var(--vs-space-8);
+  padding: var(--vs-space-4) var(--vs-space-12) var(--vs-space-4) var(--vs-space-4);
   border: var(--vs-border-width) solid var(--vs-color-border-subtle);
-  border-radius: var(--vs-radius-card);
+  border-radius: var(--vs-radius-pill);
   background: var(--vs-color-bg-surface);
   color: var(--vs-color-text-primary);
   text-align: left;
   cursor: pointer;
-  transition:
-    border-color var(--vs-motion-duration-control) var(--vs-motion-easing-standard),
-    transform var(--vs-motion-duration-control) var(--vs-motion-easing-standard);
+  transition: border-color var(--vs-motion-duration-control) var(--vs-motion-easing-standard);
 }
 
 .app-picker__card:hover:not(:disabled),
@@ -2413,12 +2419,8 @@ onBeforeUnmount(() => {
   border-color: var(--vs-color-accent-default);
 }
 
-.app-picker__card:hover:not(:disabled) {
-  transform: translateY(-2px);
-}
-
 .app-picker__card--selected {
-  box-shadow: inset 0 0 0 var(--vs-border-width) var(--vs-color-accent-default);
+  background: color-mix(in srgb, var(--vs-color-accent-default) 8%, var(--vs-color-bg-surface));
 }
 
 .app-picker__card:disabled {
@@ -2426,12 +2428,26 @@ onBeforeUnmount(() => {
   opacity: 0.66;
 }
 
-.app-picker__artwork {
-  position: relative;
-  display: grid;
-  aspect-ratio: 2 / 3;
+.app-picker__card strong {
   overflow: hidden;
+  max-width: 14rem;
+  font-size: var(--vs-type-size-control);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-picker__check {
+  color: var(--vs-color-accent-default);
+}
+
+.app-picker__artwork {
+  display: grid;
+  overflow: hidden;
+  width: 2rem;
+  height: 2.65rem;
+  flex: none;
   place-items: stretch;
+  border-radius: calc(var(--vs-radius-control) / 1.5);
   background: var(--vs-color-bg-subtle);
 }
 
@@ -2447,44 +2463,6 @@ onBeforeUnmount(() => {
   color: var(--vs-color-text-muted);
 }
 
-.app-picker__artwork--desktop {
-  background:
-    radial-gradient(
-      circle at 50% 30%,
-      color-mix(in srgb, var(--vs-color-accent-default) 24%, transparent),
-      transparent 55%
-    ),
-    var(--vs-color-bg-subtle);
-}
-
-.app-picker__selected-mark {
-  position: absolute;
-  top: var(--vs-space-8);
-  right: var(--vs-space-8);
-  display: grid;
-  width: 1.8rem;
-  height: 1.8rem;
-  place-items: center;
-  border-radius: var(--vs-radius-pill);
-  background: var(--vs-color-accent-default);
-  color: var(--vs-color-text-on-accent);
-  box-shadow: 0 0 0 2px var(--vs-color-bg-surface);
-}
-
-.app-picker__copy {
-  display: grid;
-  gap: var(--vs-space-2);
-  padding: var(--vs-space-12);
-}
-
-.app-picker__copy strong {
-  overflow: hidden;
-  font-size: var(--vs-type-size-control);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.app-picker__copy small,
 .app-picker__empty {
   color: var(--vs-color-text-secondary);
   font-size: var(--vs-type-size-helper);
@@ -2650,7 +2628,6 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   gap: var(--vs-space-4);
-  margin-inline-start: auto;
   color: var(--vs-color-text-muted);
   font-size: var(--vs-type-size-helper);
 }
@@ -2669,6 +2646,26 @@ onBeforeUnmount(() => {
 
 .stream-stage__gamepad-status[data-connected='true'] {
   color: var(--vs-color-status-success);
+}
+
+.stream-stage__volume {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--vs-space-8);
+  margin-inline-start: auto;
+  color: var(--vs-color-text-muted);
+  cursor: pointer;
+}
+
+.stream-stage__volume .vs-range {
+  width: 7.5rem;
+}
+
+.stream-stage__volume-value {
+  min-width: 2.6rem;
+  font-size: var(--vs-type-size-helper);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .browser-stream-loading,
@@ -2697,10 +2694,26 @@ onBeforeUnmount(() => {
   font-weight: var(--vs-type-weight-semibold);
 }
 
+.stream-form__select-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--vs-space-12) var(--vs-space-16);
+}
+
+.stream-form__span {
+  grid-column: 1 / -1;
+}
+
 .stream-form__numeric-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--vs-space-12);
+}
+
+.stream-form__toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--vs-space-8) var(--vs-space-24);
 }
 
 .stream-form__check {
@@ -2736,6 +2749,17 @@ onBeforeUnmount(() => {
   color: var(--vs-color-text-secondary);
   font-size: var(--vs-type-size-helper);
   line-height: 1.4;
+}
+
+.stream-form__check--plain {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  align-items: center;
+}
+
+.stream-form__check--plain input {
+  margin-top: 0;
 }
 
 .stream-form__check--disabled {
@@ -2807,19 +2831,19 @@ onBeforeUnmount(() => {
     min-width: 0;
   }
 
-  .app-picker__grid {
-    grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr));
-  }
-
   .stream-surface {
     min-height: 15rem;
   }
 
-  .stream-stage__input-status {
-    width: 100%;
+  .stream-stage__volume {
     margin-inline-start: 0;
   }
 
+  .stream-stage__input-status {
+    width: 100%;
+  }
+
+  .stream-form__select-grid,
   .stream-form__numeric-grid {
     grid-template-columns: 1fr;
   }

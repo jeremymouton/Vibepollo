@@ -946,7 +946,7 @@
         "bitrate": "Bitrate (Kbps; 0 = host default)",
         "bitrate_recommended_hint": "Recommended for this resolution and frame rate: {value}.",
         "bitrate_simple": "Bitrate",
-        "bitrate_tracks_recommendation": "Bitrate is tracking the recommended value for this resolution and frame rate.",
+        "bitrate_tracks_recommendation": "Set automatically for this resolution and frame rate \u2014 drag the slider to override.",
         "bitrate_use_recommended": "Use recommended",
         "codec": "Video codec",
         "description": "Unavailable options stay disabled instead of silently falling back to another codec or SDR.",
