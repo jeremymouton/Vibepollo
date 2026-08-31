@@ -348,6 +348,82 @@ const form = reactive<StreamLaunchForm>({
   width: 1920,
 });
 
+/// Bits per pixel per second for each codec at a streaming quality target. Picked
+/// from the same family of rules moonlight / sunshine already use: 0.10 bpp for
+/// H.264, 0.06 for HEVC, 0.04 for AV1. These give decent motion and full-screen
+/// text without overshooting the link.
+const BITS_PER_PIXEL_PER_SECOND: Record<EncodingType, number> = {
+  h264: 0.1,
+  hevc: 0.06,
+  av1: 0.04,
+};
+
+/// Host-defined lower and upper bounds, used to clamp the recommendation so the
+/// form never lands outside what the encoder actually accepts.
+function bitrateBounds(): { min: number; max: number } {
+  return {
+    min: hostCapabilities.value.limits.min_bitrate_kbps,
+    max: hostCapabilities.value.limits.max_bitrate_kbps,
+  };
+}
+
+function roundToStep(value: number, step: number): number {
+  return Math.round(value / step) * step;
+}
+
+/// What bitrate makes sense for the current resolution, fps, and codec. The
+/// slider step is 1000 kbps, so the recommendation snaps to the nearest 1000
+/// before clamping to the host's range. Returns 0 (host default) only if the
+/// form is in custom / unset territory and the formula is undefined.
+function recommendedBitrateKbps(): number {
+  const pixels = form.width * form.height;
+  if (!Number.isFinite(pixels) || pixels <= 0) return 0;
+  if (!Number.isFinite(form.fps) || form.fps <= 0) return 0;
+  const bpp = BITS_PER_PIXEL_PER_SECOND[form.encoding] ?? BITS_PER_PIXEL_PER_SECOND.h264;
+  const rawKbps = (pixels * form.fps * bpp) / 1000;
+  const { min, max } = bitrateBounds();
+  return Math.min(max, Math.max(min, roundToStep(rawKbps, 1000)));
+}
+
+/// Tracks whether the slider is currently on the recommended value. Flipped
+/// true when the user clicks "Use recommended" and false the first time the
+/// user moves the slider off it. Used by the resolution / fps / codec watcher
+/// to decide whether to drag the slider for them — touch it and the watcher
+/// leaves it alone.
+const bitrateTracksRecommendation = ref(false);
+
+function applyRecommendedBitrate(): void {
+  const next = recommendedBitrateKbps();
+  if (next > 0) {
+    form.bitrateKbps = next;
+    bitrateTracksRecommendation.value = true;
+  }
+}
+
+/// Dragging the slider off the recommendation means the user is taking the
+/// wheel, so stop auto-syncing until they ask again. A new resolution can
+/// re-trigger the "Use recommended" hint without re-engaging auto-tracking.
+watch(
+  () => form.bitrateKbps,
+  (value) => {
+    if (value !== recommendedBitrateKbps()) bitrateTracksRecommendation.value = false;
+  },
+);
+
+watch(
+  () => [form.width, form.height, form.fps, form.encoding] as const,
+  () => {
+    if (bitrateTracksRecommendation.value) applyRecommendedBitrate();
+  },
+);
+
+/// True when the slider currently matches the recommendation, so the template
+/// can show the right copy. Recomputed each render.
+const bitrateMatchesRecommendation = computed(() => {
+  if (form.bitrateKbps === 0) return false;
+  return form.bitrateKbps === recommendedBitrateKbps();
+});
+
 function unavailableCapabilities(reason: string): WebRtcHostCapabilities {
   return {
     ...unavailableHostCapabilities,
@@ -2077,6 +2153,25 @@ onBeforeUnmount(() => {
                 :max="hostCapabilities.limits.max_bitrate_kbps || 150000"
                 step="1000"
               />
+              <small class="vs-field__help">
+                <template v-if="!bitrateMatchesRecommendation && recommendedBitrateKbps() > 0">
+                  {{
+                    t('ui.browser_stream.settings.bitrate_recommended_hint', {
+                      value: `${(recommendedBitrateKbps() / 1000).toFixed(0)} Mbps`,
+                    })
+                  }}
+                </template>
+                <template v-else>
+                  {{ t('ui.browser_stream.settings.bitrate_tracks_recommendation') }}
+                </template>
+                <AppButton
+                  v-if="!bitrateMatchesRecommendation && recommendedBitrateKbps() > 0 && !useHostBitrate"
+                  size="compact"
+                  variant="tertiary"
+                  :label="t('ui.browser_stream.settings.bitrate_use_recommended', 'Use recommended')"
+                  @click="applyRecommendedBitrate"
+                />
+              </small>
             </label>
           </fieldset>
 

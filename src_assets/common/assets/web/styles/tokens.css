@@ -145,7 +145,7 @@
   --vs-color-bg-raised: #FAFAFA;
   --vs-color-bg-subtle: #F4F4F5;
   --vs-color-bg-surface: #FFFFFF;
-  --vs-color-border-strong: #A1A1AA;
+  --vs-color-border-strong: #7A7A82;
   --vs-color-border-subtle: #E4E4E7;
   --vs-color-data-accent: #3F3F46;
   --vs-color-focus: #0A0A0A;
@@ -154,12 +154,12 @@
   --vs-color-status-info: #1D4ED8;
   --vs-color-status-success: #15803D;
   --vs-color-status-warning: #B45309;
-  --vs-color-text-muted: #71717A;
+  --vs-color-text-muted: #64646B;
   --vs-color-text-on-accent: #FFFFFF;
   --vs-color-text-primary: #0A0A0A;
   --vs-color-text-secondary: #52525B;
   --vs-focus-ring: #0A0A0A;
-  --vs-input-border: #A1A1AA;
+  --vs-input-border: #7A7A82;
   --vs-overlay-backdrop: rgb(10 10 10 / .45);
 }
 
