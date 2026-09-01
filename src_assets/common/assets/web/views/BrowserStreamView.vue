@@ -3074,15 +3074,25 @@ onBeforeUnmount(() => {
   cursor: default;
 }
 
-/* The on-screen controller occupies the whole bottom band — sticks in the outer
-   corners, d-pad and face buttons inboard of them — so bottom-right sits directly
-   on top of A and B. Overlapping a button you press during play is worse than
-   overlapping video: the exit lands under a thumb aiming for something else. Moved
-   to the top edge, which the controller leaves empty; the swipe hint there is
-   centred and narrow, so the corner stays free. */
+/* Clear of the controller, which now claims every corner: sticks and clusters
+   along the bottom, bumpers and triggers along the top edge at both ends. Moving
+   this to the top right only traded a collision with A and B for one with RT and
+   RB. What the pad leaves free is the middle of the top edge, under its own row
+   of small controls — so this sits there, and shrinks to match them, because a
+   full-size button in that gap would reach the triggers again. */
 .stream-surface__exit-fullscreen--clear-of-pad {
-  top: max(var(--vs-space-16), env(safe-area-inset-top));
+  top: calc(max(var(--vs-space-16), env(safe-area-inset-top)) + 2.25rem);
+  right: auto;
   bottom: auto;
+  left: 50%;
+  translate: -50% 0;
+}
+
+.stream-surface__exit-fullscreen--clear-of-pad :where(button, a) {
+  min-height: 0;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 11px;
 }
 
 .stream-surface__exit-swipe {

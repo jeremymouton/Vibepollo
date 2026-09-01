@@ -540,12 +540,12 @@ onBeforeUnmount(() => {
     class="touchpad"
     :class="{ 'touchpad--editing': editing }"
     aria-label="On-screen controller"
-    @pointerdown="onPointerDown"
-    @pointermove="onPointerMove"
-    @pointerup="onPointerUp"
-    @pointercancel="onPointerUp"
-    @lostpointercapture="onPointerUp"
-    @contextmenu.prevent
+    @pointerdown.stop="onPointerDown"
+    @pointermove.stop="onPointerMove"
+    @pointerup.stop="onPointerUp"
+    @pointercancel.stop="onPointerUp"
+    @lostpointercapture.stop="onPointerUp"
+    @contextmenu.stop.prevent
   >
     <!-- Bumpers and triggers ride the top edge, where the index fingers already
          rest when a phone is held in landscape. They used to sit in a column
@@ -660,7 +660,15 @@ onBeforeUnmount(() => {
 
 /* The whole surface takes pointers now, because a finger that slides off a
    button still has to be tracked. Nothing is drawn here, so the video is
-   unobscured either way. */
+   unobscured either way.
+
+   Every pointer handler stops propagation, which together with this means the
+   mouse is inert while the on-screen controller is up. That is deliberate: the
+   page forwards pointermove on the stream surface as host mouse movement, so
+   without it a thumb on the left stick both steered the stick AND dragged the
+   mouse across the game. The old per-button handlers each carried .stop and it
+   was lost when they were centralised here. A pad and a mouse cannot share one
+   finger. */
 .touchpad {
   pointer-events: auto;
 }
