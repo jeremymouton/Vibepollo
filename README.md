@@ -4,78 +4,84 @@
 > itself a fork of Apollo/Sunshine. Everything below the line is Nonary's; this
 > section covers only what this fork adds. Upstream's README follows unchanged.
 
-## Guest invites
+Hand someone a link and they can play. No account, no password, and nothing to
+install if they would rather use a browser. The owner creates an invite; the guest
+opens the link, types a PIN sent separately, and either plays in the browser or
+pairs a Moonlight client they already have. A guest never reaches the admin
+interface.
 
-Hand someone a link and they can play. No account, no password, nothing to install
-if they would rather use a browser.
+## What an invite decides
 
-The owner creates an invite; the guest opens the link, types a PIN sent separately,
-and chooses to play in the browser or to pair a Moonlight client they already have.
-A guest never reaches the admin interface — the pages they touch are the only ones
-their credential opens.
+- **What they can do** — watch only, gamepad only, or full keyboard and mouse.
+- **How long, and how many times** — invites expire, can be capped to a number of
+  uses, and survive a restart.
+- **Where the link points** — set `public_base_url` and links are built from the
+  address guests actually reach the host on.
 
-**What an invite decides**
+Permissions are applied on the host, never asked of the client:
 
-* **What they can do.** Watch only, gamepad only, or full keyboard and mouse. The
-  grant is applied on the host, not asked of the client: a browser session has its
-  permissions overwritten every time one is created, and a paired Moonlight client
-  is re-checked against the invite at launch, so narrowing an invite narrows a
-  device that was paired under the old terms.
-* **Which controller they are.** Each invite carries a pad slot, so two people do
-  not end up fighting over controller one.
-* **How long, and how many times.** Links expire, can be limited to a number of
-  uses, and survive a restart. Revoking one ends any stream running on it — the
-  browser session is closed and a Moonlight client paired through it is unpaired —
-  rather than merely refusing the next connection.
-* **Where the link points.** Set `public_base_url` to the address guests reach the
-  host on, and invite links are built from it rather than from whatever address the
-  owner happens to have open.
+- A browser session has its permissions overwritten every time one is created.
+- A paired Moonlight client is re-checked against the invite at launch, so
+  narrowing an invite narrows a device that was paired under the old terms.
+- Revoking ends what is already running — the browser session is closed and a
+  Moonlight client paired through the invite is unpaired — rather than merely
+  refusing the next connection.
 
 ## Playing on a phone
 
-An on-screen controller — twin sticks, d-pad, face buttons, bumpers and triggers —
-is available to guests and to the owner's own browser stream. It is not a second
-input path: it publishes a gamepad the existing capture reads as hardware, so it
-inherits the same permissions and the host cannot tell the difference. Android
-phones get rumble through the vibration motor, approximated with a duty cycle
-because the API has no notion of intensity. iOS does not expose vibration at all.
+- On-screen controller with twin sticks, d-pad, face buttons, bumpers and triggers,
+  for guests and for the owner's own browser stream.
+- Not a second input path: it publishes a gamepad the existing capture reads as
+  hardware, so it inherits the same permissions and the host cannot tell it apart.
+- Slide a finger from one button to another to hold both — combos do not need a
+  third thumb.
+- Triggers are analog: a tap is a full pull, sliding eases off.
+- Bumpers and triggers sit along the top edge, where the index fingers already rest.
+- Every cluster can be dragged and resized, saved per browser.
+- Tilt can drive the right stick while no thumb is on it, so aiming and pressing
+  face buttons stop competing for the same thumb.
+- Rumble works on Android through the vibration motor, approximated with a duty
+  cycle because the API has no notion of intensity. iOS does not expose vibration.
+- Add it to a homescreen and it opens without browser chrome.
 
-The guest page asks for resolution, frame rate and bitrate before connecting rather
-than after, since the encoder is fixed when a session starts, and remembers the
-answer. It offers whichever of H.264, HEVC and AV1 the browser reports it can
-decode, defaulting to the newest.
+## Streaming in a browser
+
+- Quality is chosen before connecting rather than after, because the encoder is
+  fixed when a session starts, and the choice is remembered.
+- Offers whichever of H.264, HEVC and AV1 the browser reports it can decode.
+- **Every viewer gets their own encoder.** Peers no longer share one, so they no
+  longer share a codec, a bitrate or a keyframe stream — one guest on a poor line
+  cannot drag everyone else down, and a guest asking for keyframes no longer
+  injects them into the owner's stream.
+- Optional client-side FSR sharpening for streams displayed larger than they are
+  encoded.
+- Gamepad slots are handed out on join and returned on leave, so two people do not
+  fight over controller one.
+
+## Knowing whether it works
+
+- **Connection test** on both the admin page and the guest pre-flight: reports
+  whether the route would be direct or relayed, and names the reason when it is
+  neither. It talks only to the ICE servers, so it starts no stream and uses no
+  invite.
+- **Link quality** as signal bars during a stream, from round-trip time, jitter and
+  packet loss — reporting the worst of the three and which one it is, since the
+  fixes are unrelated.
 
 ## Relay and access
 
-* `webrtc_ice_servers` configures STUN and TURN for guests whose network will not
+- `webrtc_ice_servers` configures STUN and TURN for guests whose network will not
   allow a direct connection.
-* `webrtc_turn_secret` turns those into short-lived credentials minted per session
-  (coturn's REST scheme), so a guest who was let in once cannot keep using the relay
-  afterwards, and cutting one guest off does not mean changing a password every
-  other guest holds.
-
-## Fixes to the browser stream
-
-Several of these are upstream bugs rather than anything to do with invites, and are
-kept separable so they can be offered back:
-
-* Launching an application from the v2 interface sent the app's position in the
-  list where the host expects its id, so every launch failed with "Cannot find
-  requested application".
-* The v2 stream page could not read a controller at all, and its input channel was
-  write-only, so nobody felt rumble.
-* Frame pacing was hardcoded to the most aggressive low-latency setting, which
-  discards frames that arrive slightly late. Correct on a LAN, punishing over
-  anything with jitter — it is now a choice, defaulting to balanced.
-* Resolution, frame rate and bitrate are presets and a slider rather than four
-  numeric boxes, and the codec can be left to pick the best both ends support.
+- `webrtc_turn_secret` mints short-lived credentials per session (coturn's REST
+  scheme), so a guest let in once cannot keep using the relay, and cutting one off
+  does not mean changing a password every other guest holds.
 
 ## Maturity
 
-The guest path is new and has had far more attention than mileage. It has been
-exercised end to end — a guest joining from another continent, on a phone, over a
-VPN — but by two people over a couple of days, not by a userbase. Treat the
-permission model as the load-bearing part and the rest as young.
+The guest path has had far more attention than mileage. It has been exercised end to
+end — a guest joining from another continent, on a phone, over a VPN — but by two
+people over a few days, not by a userbase. Treat the permission model as the
+load-bearing part and the rest as young.
 
 ---
 
