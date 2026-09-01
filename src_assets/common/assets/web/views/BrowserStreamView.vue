@@ -27,6 +27,7 @@ import TouchGamepad from '@/components/TouchGamepad.vue';
 import { useActiveStream } from '@/stores/activeStream';
 import { applyGamepadFeedback, attachInputCapture } from '@/utils/webrtc/input';
 import type { SessionStatus } from '@/types/sessions';
+import { attachVideoUpscaler } from '@/utils/webrtc/upscaler';
 import type { EncodingType, StreamConfig } from '@/types/webrtc';
 
 interface LaunchableApp {
@@ -183,6 +184,7 @@ interface SavedStreamSettings {
   bitrateKbps: number;
   bitrateTracksRecommendation: boolean;
   codecChoice: EncodingType | 'auto';
+  enhance: boolean;
   fps: number;
   hdr: boolean;
   height: number;
@@ -198,6 +200,7 @@ function defaultStreamSettings(): SavedStreamSettings {
     bitrateKbps: 20_000,
     bitrateTracksRecommendation: true,
     codecChoice: 'auto',
+    enhance: false,
     fps: 60,
     hdr: false,
     height: 1080,
@@ -237,6 +240,7 @@ function loadStreamSettings(): SavedStreamSettings {
         (typeof saved.codecChoice === 'string' && codecs.includes(saved.codecChoice))
           ? saved.codecChoice
           : fallback.codecChoice,
+      enhance: typeof saved.enhance === 'boolean' ? saved.enhance : fallback.enhance,
       fps: positive(saved.fps, fallback.fps),
       hdr: typeof saved.hdr === 'boolean' ? saved.hdr : fallback.hdr,
       height: positive(saved.height, fallback.height),
@@ -265,6 +269,20 @@ function loadStreamSettings(): SavedStreamSettings {
 }
 
 const savedStreamSettings = loadStreamSettings();
+
+/// Client-side FSR (EASU upscale + RCAS sharpen) between the decoded frame and the
+/// screen, the same pipeline the guest page uses — shared from utils/webrtc so the
+/// two surfaces cannot drift apart. It was guest-only at first, which repeated the
+/// mistake rumble made: a feature added to one view and quietly missing from the
+/// next. It pays off whenever the stream runs below the size it is displayed at,
+/// costs nothing on the wire, and needs no reconnect.
+const enhance = ref<boolean>(savedStreamSettings.enhance);
+/// WebGL2 missing or the pipeline died: the checkbox greys out rather than lying.
+const enhanceUnavailable = ref(false);
+const fxCanvas = ref<HTMLCanvasElement>();
+// noopDetach itself is declared further down, beside the gamepad detach it also
+// serves; this initialiser cannot reference it yet, so it spells the same thing out.
+let detachUpscaler: () => void = (): void => undefined;
 
 /// 'auto' is not an encoding the server understands — it is resolved to the best
 /// codec both ends actually support, at the moment the stream starts, so the answer
@@ -593,6 +611,7 @@ watch(
     [
       form.appId,
       form.bitrateKbps,
+      enhance.value,
       form.fps,
       form.hdr,
       form.height,
@@ -609,6 +628,7 @@ watch(
       bitrateKbps: form.bitrateKbps,
       bitrateTracksRecommendation: bitrateTracksRecommendation.value,
       codecChoice: codecChoice.value,
+      enhance: enhance.value,
       fps: form.fps,
       hdr: form.hdr,
       height: form.height,
@@ -754,6 +774,30 @@ const effectiveHdr = computed(() =>
   hdrForcedOn.value ? true : hdrForcedOff.value ? false : form.hdr,
 );
 const isConnected = computed(() => connectionState.value === 'connected');
+
+const upscalerActive = computed(
+  () => enhance.value && !enhanceUnavailable.value && isConnected.value,
+);
+
+function syncUpscaler(): void {
+  detachUpscaler();
+  detachUpscaler = noopDetach;
+  if (!upscalerActive.value || !videoEl.value || !fxCanvas.value) return;
+  const attached = attachVideoUpscaler(videoEl.value, fxCanvas.value, {
+    onFailure: () => {
+      enhanceUnavailable.value = true;
+    },
+  });
+  if (!attached) {
+    enhanceUnavailable.value = true;
+    return;
+  }
+  detachUpscaler = () => attached.detach();
+}
+
+// flush: 'post' so the canvas is in the DOM before an attach is attempted.
+watch(upscalerActive, () => syncUpscaler(), { flush: 'post' });
+
 const connectionPending = computed(
   () =>
     isConnecting.value || connectionState.value === 'new' || connectionState.value === 'connecting',
@@ -2034,6 +2078,10 @@ onBeforeUnmount(() => {
         @wheel="sendWheel"
       >
         <video ref="videoEl" autoplay muted playsinline disablepictureinpicture />
+        <!-- FSR output. The video stays mounted and playing underneath (it is the
+             decode surface and audio sink); v-show keeps it compositing so frame
+             callbacks still fire, unlike display:none on the video itself. -->
+        <canvas v-show="upscalerActive" ref="fxCanvas" class="stream-surface__fx"></canvas>
         <audio ref="audioEl" autoplay hidden />
         <TouchGamepad v-if="showTouchPad && inputReady" />
 
@@ -2358,6 +2406,13 @@ onBeforeUnmount(() => {
               </label>
 
               <label class="stream-form__check stream-form__check--plain">
+                <input v-model="enhance" type="checkbox" :disabled="enhanceUnavailable" />
+                <span>{{
+                  t('ui.browser_stream.settings.enhance', 'Sharpen upscaled video (FSR)')
+                }}</span>
+              </label>
+
+              <label class="stream-form__check stream-form__check--plain">
                 <input v-model="showTouchPad" type="checkbox" />
                 <span>
                   {{ t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller') }}
@@ -2624,7 +2679,7 @@ onBeforeUnmount(() => {
   height: 1.75rem;
   flex: none;
   place-items: stretch;
-  border-radius: calc(var(--vs-radius-control) / 1.5);
+  border-radius: 50%;
   background: var(--vs-color-bg-subtle);
 }
 
@@ -2634,16 +2689,9 @@ onBeforeUnmount(() => {
   object-fit: cover;
 }
 
-/* With no artwork there is nothing to frame, so drop the filled box and leave the
- * icon on the chip's own background. One less rectangle per chip, and the row reads
- * as a row of labels rather than a row of placeholders. The fallback is an inner
- * span, so the box it sits in is cleared via :has() on the parent rather than on
- * the span itself. */
-.app-picker__artwork--desktop,
-.app-picker__artwork:has(.app-picker__artwork-fallback) {
-  background: none;
-}
-
+/* The circle is kept even with no cover to put in it: an app with artwork and one
+ * without then read as the same kind of thing, the way avatars do, instead of some
+ * chips carrying a disc and others a bare glyph. */
 .app-picker__artwork--desktop,
 .app-picker__artwork-fallback {
   place-items: center;
@@ -2698,6 +2746,16 @@ onBeforeUnmount(() => {
   height: 100%;
   max-height: 42rem;
   object-fit: contain;
+}
+
+/* Sits exactly over the video, which keeps playing underneath as the decode
+   surface. Never takes pointer events — the surface below owns input forwarding. */
+.stream-surface__fx {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
 }
 
 .stream-surface:fullscreen,
