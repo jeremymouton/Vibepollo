@@ -3245,9 +3245,23 @@ onBeforeUnmount(() => {
     color var(--vs-motion-duration-control) var(--vs-motion-easing-standard);
 }
 
+/* A wash, not the accent.
+ *
+ * The accent is #0A0A0A in the light theme, so putting it on the border and the
+ * glyph turned a 2rem button into a black ring around a black icon — which both
+ * read as "this went black" and, worse, looked almost exactly like the pressed
+ * state below. Hover has to say "you are over this", not "this is on". Grey says
+ * the first; black is reserved for the second. */
 .stream-stage__toggle:hover:not(:disabled) {
-  border-color: var(--vs-color-accent-default);
+  background: var(--vs-color-bg-subtle);
   color: var(--vs-color-text-primary);
+}
+
+/* Already on: darken rather than lighten, so hovering never looks like turning
+   it off. */
+.stream-stage__toggle--on:hover:not(:disabled) {
+  background: var(--vs-color-accent-hover);
+  color: var(--vs-color-text-on-accent);
 }
 
 .stream-stage__toggle--on {
