@@ -2471,32 +2471,6 @@ onBeforeUnmount(() => {
 
             <div class="stream-form__toggles">
               <label class="stream-form__check stream-form__check--plain">
-                <!-- Deliberately not gated on being connected. On a phone the controls
-                     need to be asked for BEFORE the stream starts, not after it is
-                     already running and there is nothing to press. The overlay itself
-                     still only appears once input can actually reach the host. -->
-                <input v-model="showStats" type="checkbox" />
-                <span>{{
-                  t('ui.browser_stream.settings.show_stats', 'Show performance stats')
-                }}</span>
-              </label>
-
-              <label class="stream-form__check stream-form__check--plain">
-                <input v-model="enhance" type="checkbox" :disabled="enhanceUnavailable" />
-                <span>{{
-                  t('ui.browser_stream.settings.enhance', 'Sharpen upscaled video (FSR)')
-                }}</span>
-              </label>
-
-              <label class="stream-form__check stream-form__check--plain">
-                <input v-model="showTouchPad" type="checkbox" />
-                <span>
-                  {{ t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller') }}
-                  <template v-if="!isTouchDevice"> — for a tablet or touchscreen</template>
-                </span>
-              </label>
-
-              <label class="stream-form__check stream-form__check--plain">
                 <input v-model="useHostBitrate" type="checkbox" />
                 <span>{{
                   t('ui.browser_stream.settings.bitrate_host_default', 'Let the host choose bitrate')
@@ -2540,6 +2514,53 @@ onBeforeUnmount(() => {
                 />
               </small>
             </label>
+          </fieldset>
+
+          <!-- Outside the fieldset above on purpose.
+               That one is disabled while connected because everything in it —
+               codec, resolution, frame rate, HDR, bitrate — is fixed when the
+               encoder starts, and there is no endpoint to change any of them
+               mid-session. None of that is true of these three: they are drawn
+               entirely in this browser and never reach the host, so locking them
+               during a stream was collateral damage from disabling the group
+               rather than the controls. The overlay you most want mid-stream was
+               the one you had to stop streaming to switch on. -->
+          <fieldset class="stream-form__group">
+            <legend>{{ t('ui.browser_stream.settings.this_browser', 'This browser') }}</legend>
+            <p class="stream-form__group-help">
+              {{
+                t(
+                  'ui.browser_stream.settings.this_browser_help',
+                  'Changes apply straight away, including while streaming.',
+                )
+              }}
+            </p>
+            <div class="stream-form__toggles">
+              <label class="stream-form__check stream-form__check--plain">
+                <input v-model="showStats" type="checkbox" />
+                <span>{{
+                  t('ui.browser_stream.settings.show_stats', 'Show performance stats')
+                }}</span>
+              </label>
+
+              <label class="stream-form__check stream-form__check--plain">
+                <input v-model="enhance" type="checkbox" :disabled="enhanceUnavailable" />
+                <span>{{
+                  t('ui.browser_stream.settings.enhance', 'Sharpen upscaled video (FSR)')
+                }}</span>
+              </label>
+
+              <label class="stream-form__check stream-form__check--plain">
+                <!-- On a phone the controls have to be reachable BEFORE the stream
+                     starts, and switchable after it has. The overlay itself still
+                     only appears once input can actually reach the host. -->
+                <input v-model="showTouchPad" type="checkbox" />
+                <span>
+                  {{ t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller') }}
+                  <template v-if="!isTouchDevice"> — for a tablet or touchscreen</template>
+                </span>
+              </label>
+            </div>
           </fieldset>
 
           <label
@@ -3153,6 +3174,12 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--vs-space-12);
+}
+
+.stream-form__group-help {
+  margin: 0 0 var(--vs-space-8);
+  color: var(--vs-color-text-secondary);
+  font-size: var(--vs-type-size-helper);
 }
 
 .stream-form__toggles {
