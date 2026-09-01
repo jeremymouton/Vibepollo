@@ -872,7 +872,9 @@ export class BrowserWebRtcSession {
             codecId?: string;
           };
           const rtp = inbound as Inbound | undefined;
-          let roundTripMs: number | undefined;
+          let selectedPairId: string | undefined;
+          let remoteInboundRoundTripMs: number | undefined;
+          const candidatePairRoundTripMs = new Map<string, number>();
           let path: string | undefined;
           let remoteAddress: string | undefined;
           let codec: string | undefined;
@@ -880,13 +882,29 @@ export class BrowserWebRtcSession {
             const e = entry as RTCStats & {
               state?: string;
               currentRoundTripTime?: number;
+              roundTripTime?: number;
+              selectedCandidatePairId?: string;
               localCandidateId?: string;
               remoteCandidateId?: string;
               candidateType?: string;
               mimeType?: string;
             };
+            // The nominated pair is the one carrying media. Several pairs can sit in
+            // 'succeeded', and taking whichever happened to come last reported RTT
+            // for a path the stream is not using.
+            if (e.type === 'transport' && typeof e.selectedCandidatePairId === 'string') {
+              selectedPairId = e.selectedCandidatePairId;
+            }
+            // RTCP's round trip, from the receiver reports the sender gets back. This
+            // is the media path rather than the STUN checks, and it is present in
+            // cases where the candidate pair's own figure never appears.
+            if (e.type === 'remote-inbound-rtp' && typeof e.roundTripTime === 'number') {
+              remoteInboundRoundTripMs = e.roundTripTime * 1000;
+            }
             if (e.type === 'candidate-pair' && e.state === 'succeeded') {
-              if (typeof e.currentRoundTripTime === 'number') roundTripMs = e.currentRoundTripTime * 1000;
+              if (typeof e.currentRoundTripTime === 'number') {
+                candidatePairRoundTripMs.set(e.id, e.currentRoundTripTime * 1000);
+              }
               const local = report.get(e.localCandidateId ?? '') as
                 { candidateType?: string; address?: string; ip?: string } | undefined;
               const remote = report.get(e.remoteCandidateId ?? '') as
@@ -906,6 +924,14 @@ export class BrowserWebRtcSession {
             }
             if (e.type === 'codec' && rtp?.codecId === e.id) codec = e.mimeType?.split('/')[1];
           });
+
+          // Resolved only now, because the transport entry naming the selected pair
+          // can appear after the pair itself. Order of preference: the pair actually
+          // carrying media, then RTCP's media-path figure, then any succeeded pair.
+          const roundTripMs =
+            (selectedPairId ? candidatePairRoundTripMs.get(selectedPairId) : undefined) ??
+            remoteInboundRoundTripMs ??
+            candidatePairRoundTripMs.values().next().value;
 
           // Bitrate has to be derived: the report gives a running byte total.
           let bitrateKbps: number | undefined;

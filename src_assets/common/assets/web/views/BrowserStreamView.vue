@@ -190,7 +190,6 @@ interface SavedStreamSettings {
   fps: number;
   hdr: boolean;
   height: number;
-  muteHostAudio: boolean;
   pacingMode: 'latency' | 'balanced' | 'smoothness';
   volume: number;
   width: number;
@@ -206,7 +205,6 @@ function defaultStreamSettings(): SavedStreamSettings {
     fps: 60,
     hdr: false,
     height: 1080,
-    muteHostAudio: true,
     pacingMode: 'balanced',
     volume: 100,
     width: 1920,
@@ -246,8 +244,6 @@ function loadStreamSettings(): SavedStreamSettings {
       fps: positive(saved.fps, fallback.fps),
       hdr: typeof saved.hdr === 'boolean' ? saved.hdr : fallback.hdr,
       height: positive(saved.height, fallback.height),
-      muteHostAudio:
-        typeof saved.muteHostAudio === 'boolean' ? saved.muteHostAudio : fallback.muteHostAudio,
       pacingMode:
         saved.pacingMode === 'latency' ||
         saved.pacingMode === 'balanced' ||
@@ -534,6 +530,13 @@ function clampVolume(value: number): number {
   return clamped / 100;
 }
 
+/// Milliseconds, or an em dash when the browser has not reported the figure.
+/// Distinguishing "not measured yet" from "measured as zero" matters most for RTT,
+/// where zero is not a value any real connection takes.
+function statMs(value: number | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value) ? `${Math.round(value)} ms` : '—';
+}
+
 const volumeLabel = computed(() => `${Math.round(form.volume)}%`);
 
 /// Newest first: at a given bitrate AV1 and HEVC hold detail that H.264 loses, and
@@ -551,7 +554,11 @@ const form = reactive<StreamLaunchForm>({
   fps: savedStreamSettings.fps,
   hdr: savedStreamSettings.hdr,
   height: savedStreamSettings.height,
-  muteHostAudio: savedStreamSettings.muteHostAudio,
+  // Deliberately not restored. This decides whether the game comes out of the
+  // speakers of a PC that is usually in another room, so the safe state has to be
+  // re-chosen each visit rather than inherited from whatever was set once weeks
+  // ago. Persisting it made a formerly per-visit default sticky.
+  muteHostAudio: true,
   volume: savedStreamSettings.volume,
   width: savedStreamSettings.width,
 });
@@ -683,7 +690,6 @@ watch(
       form.fps,
       form.hdr,
       form.height,
-      form.muteHostAudio,
       form.volume,
       form.width,
       codecChoice.value,
@@ -700,7 +706,6 @@ watch(
       fps: form.fps,
       hdr: form.hdr,
       height: form.height,
-      muteHostAudio: form.muteHostAudio,
       pacingMode: pacingMode.value,
       volume: form.volume,
       width: form.width,
@@ -2159,11 +2164,14 @@ onBeforeUnmount(() => {
             }}<template v-if="streamStats.remoteAddress">
               · {{ streamStats.remoteAddress }}</template>
           </div>
-          <div>rtt {{ Math.round(streamStats.roundTripMs ?? 0) }} ms</div>
-          <div>jitter {{ Math.round(streamStats.jitterMs ?? 0) }} ms</div>
-          <div>buffer {{ Math.round(streamStats.jitterBufferMs ?? 0) }} ms</div>
-          <div>lost {{ streamStats.packetsLost ?? 0 }}</div>
-          <div>dropped {{ streamStats.framesDropped ?? 0 }}</div>
+          <!-- `?? 0` printed "0 ms" for a figure the browser had not reported yet,
+               which reads as a measurement rather than a gap — and 0 ms RTT is a
+               number no real connection produces. Missing stays missing. -->
+          <div>rtt {{ statMs(streamStats.roundTripMs) }}</div>
+          <div>jitter {{ statMs(streamStats.jitterMs) }}</div>
+          <div>buffer {{ statMs(streamStats.jitterBufferMs) }}</div>
+          <div>lost {{ streamStats.packetsLost ?? '—' }}</div>
+          <div>dropped {{ streamStats.framesDropped ?? '—' }}</div>
           <div>
             {{ Math.round(streamStats.bitrateKbps ?? 0) }} kbps ·
             {{ Math.round(streamStats.fps ?? 0) }} fps
