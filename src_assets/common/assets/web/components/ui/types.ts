@@ -26,6 +26,7 @@ export type UiIconName =
   | 'play'
   | 'plus'
   | 'refresh'
+  | 'sparkle'
   | 'search'
   | 'sessions'
   | 'settings'

@@ -36,6 +36,9 @@ const iconPaths: Record<UiIconName, IconDefinition> = {
   play: ['m8 5 11 7-11 7Z'],
   plus: ['M12 5v14', 'M5 12h14'],
   refresh: ['M20 6v5h-5', 'M4 18v-5h5', 'M18.5 9A7 7 0 0 0 6.2 6.2L4 11', 'M5.5 15A7 7 0 0 0 17.8 17.8L20 13'],
+  // Sharpening / enhancement. A sparkle is the common metaphor for it, and there
+  // was no icon in the set that read as "make the picture better".
+  sparkle: ['M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z', 'M18 16l.8 2.2L21 19l-2.2.8L18 22l-.8-2.2L15 19l2.2-.8Z'],
   search: ['m21 21-4.3-4.3', 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z'],
   sessions: ['M4 5h16v12H4z', 'M8 21h8', 'M12 17v4', 'm10 9 5 2.5-5 2.5Z'],
   settings: ['M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z', 'M12 2v3', 'M12 19v3', 'm4.93 4.93 2.12 2.12', 'm16.95 16.95 2.12 2.12', 'M2 12h3', 'M19 12h3', 'm4.93 19.07 2.12-2.12', 'm16.95 7.05 2.12-2.12'],

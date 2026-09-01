@@ -2288,6 +2288,52 @@ onBeforeUnmount(() => {
           />
           <span class="stream-stage__volume-value">{{ volumeLabel }}</span>
         </label>
+        <!-- These three are drawn entirely in this browser and never reach the host,
+             so unlike the encoder settings they change instantly, mid-stream. They
+             sit under the video rather than in the settings form because that is
+             where you are looking when you want them. -->
+        <div class="stream-stage__toggles" role="group" :aria-label="t('ui.browser_stream.settings.this_browser', 'This browser')">
+          <button
+            type="button"
+            class="stream-stage__toggle"
+            :class="{ 'stream-stage__toggle--on': showStats }"
+            :aria-pressed="showStats"
+            :title="t('ui.browser_stream.settings.show_stats', 'Show performance stats')"
+            @click="showStats = !showStats"
+          >
+            <UiIcon name="activity" :size="18" />
+            <span class="vs-sr-only">{{
+              t('ui.browser_stream.settings.show_stats', 'Show performance stats')
+            }}</span>
+          </button>
+          <button
+            type="button"
+            class="stream-stage__toggle"
+            :class="{ 'stream-stage__toggle--on': enhance }"
+            :aria-pressed="enhance"
+            :disabled="enhanceUnavailable"
+            :title="t('ui.browser_stream.settings.enhance', 'Sharpen upscaled video (FSR)')"
+            @click="enhance = !enhance"
+          >
+            <UiIcon name="sparkle" :size="18" />
+            <span class="vs-sr-only">{{
+              t('ui.browser_stream.settings.enhance', 'Sharpen upscaled video (FSR)')
+            }}</span>
+          </button>
+          <button
+            type="button"
+            class="stream-stage__toggle"
+            :class="{ 'stream-stage__toggle--on': showTouchPad }"
+            :aria-pressed="showTouchPad"
+            :title="t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller')"
+            @click="showTouchPad = !showTouchPad"
+          >
+            <UiIcon name="gamepad" :size="18" />
+            <span class="vs-sr-only">{{
+              t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller')
+            }}</span>
+          </button>
+        </div>
         <span class="stream-stage__input-status" :data-ready="inputReady">
           <UiIcon :name="inputReady ? 'check-circle' : 'info'" :size="16" />
           {{
@@ -2514,53 +2560,6 @@ onBeforeUnmount(() => {
                 />
               </small>
             </label>
-          </fieldset>
-
-          <!-- Outside the fieldset above on purpose.
-               That one is disabled while connected because everything in it —
-               codec, resolution, frame rate, HDR, bitrate — is fixed when the
-               encoder starts, and there is no endpoint to change any of them
-               mid-session. None of that is true of these three: they are drawn
-               entirely in this browser and never reach the host, so locking them
-               during a stream was collateral damage from disabling the group
-               rather than the controls. The overlay you most want mid-stream was
-               the one you had to stop streaming to switch on. -->
-          <fieldset class="stream-form__group">
-            <legend>{{ t('ui.browser_stream.settings.this_browser', 'This browser') }}</legend>
-            <p class="stream-form__group-help">
-              {{
-                t(
-                  'ui.browser_stream.settings.this_browser_help',
-                  'Changes apply straight away, including while streaming.',
-                )
-              }}
-            </p>
-            <div class="stream-form__toggles">
-              <label class="stream-form__check stream-form__check--plain">
-                <input v-model="showStats" type="checkbox" />
-                <span>{{
-                  t('ui.browser_stream.settings.show_stats', 'Show performance stats')
-                }}</span>
-              </label>
-
-              <label class="stream-form__check stream-form__check--plain">
-                <input v-model="enhance" type="checkbox" :disabled="enhanceUnavailable" />
-                <span>{{
-                  t('ui.browser_stream.settings.enhance', 'Sharpen upscaled video (FSR)')
-                }}</span>
-              </label>
-
-              <label class="stream-form__check stream-form__check--plain">
-                <!-- On a phone the controls have to be reachable BEFORE the stream
-                     starts, and switchable after it has. The overlay itself still
-                     only appears once input can actually reach the host. -->
-                <input v-model="showTouchPad" type="checkbox" />
-                <span>
-                  {{ t('ui.browser_stream.settings.touch_pad', 'Show on-screen controller') }}
-                  <template v-if="!isTouchDevice"> — for a tablet or touchscreen</template>
-                </span>
-              </label>
-            </div>
           </fieldset>
 
           <label
@@ -3112,6 +3111,46 @@ onBeforeUnmount(() => {
 
 .stream-stage__gamepad-status[data-connected='true'] {
   color: var(--vs-color-status-success);
+}
+
+/* aria-pressed carries the state for assistive tech; the fill carries it visually.
+   A pressed toggle has to be unmistakable at icon size, so it inverts rather than
+   shifting a border colour. */
+.stream-stage__toggles {
+  display: flex;
+  gap: var(--vs-space-4);
+}
+
+.stream-stage__toggle {
+  display: grid;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  border: var(--vs-border-width) solid var(--vs-color-border-subtle);
+  border-radius: var(--vs-radius-control);
+  background: var(--vs-color-bg-surface);
+  color: var(--vs-color-text-secondary);
+  cursor: pointer;
+  transition:
+    background-color var(--vs-motion-duration-control) var(--vs-motion-easing-standard),
+    border-color var(--vs-motion-duration-control) var(--vs-motion-easing-standard),
+    color var(--vs-motion-duration-control) var(--vs-motion-easing-standard);
+}
+
+.stream-stage__toggle:hover:not(:disabled) {
+  border-color: var(--vs-color-accent-default);
+  color: var(--vs-color-text-primary);
+}
+
+.stream-stage__toggle--on {
+  border-color: var(--vs-color-accent-default);
+  background: var(--vs-color-accent-default);
+  color: var(--vs-color-text-on-accent);
+}
+
+.stream-stage__toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .stream-stage__volume {
