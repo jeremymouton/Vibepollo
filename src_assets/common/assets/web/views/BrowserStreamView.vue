@@ -29,6 +29,7 @@ import { applyGamepadFeedback, attachInputCapture } from '@/utils/webrtc/input';
 import type { SessionStatus } from '@/types/sessions';
 import { attachVideoUpscaler } from '@/utils/webrtc/upscaler';
 import { fetchIceServers, probeConnectivity } from '@/utils/webrtc/connectivity';
+import { assessLinkQuality } from '@/utils/webrtc/linkQuality';
 import type { ConnectivityReport } from '@/utils/webrtc/connectivity';
 import type { EncodingType, StreamConfig } from '@/types/webrtc';
 
@@ -432,6 +433,7 @@ const streamStats = ref<{
   packetsLost?: number;
   framesDropped?: number;
   roundTripMs?: number;
+  lossPercent?: number;
   jitterMs?: number;
   jitterBufferMs?: number;
   codec?: string;
@@ -847,6 +849,19 @@ const effectiveHdr = computed(() =>
   hdrForcedOn.value ? true : hdrForcedOff.value ? false : form.hdr,
 );
 const isConnected = computed(() => connectionState.value === 'connected');
+
+/// The stats overlay answers "is this link any good" only for someone who already
+/// reads rtt and jitter. This is the same figures turned into a verdict, so the
+/// answer is available without switching the overlay on and without knowing what
+/// the numbers mean.
+const linkQuality = computed(() =>
+  assessLinkQuality({
+    roundTripMs: streamStats.value.roundTripMs,
+    jitterMs: streamStats.value.jitterMs,
+    lossPercent: streamStats.value.lossPercent,
+    relayed: streamStats.value.path === 'relayed',
+  }),
+);
 
 const upscalerActive = computed(
   () => enhance.value && !enhanceUnavailable.value && isConnected.value,
@@ -2197,6 +2212,7 @@ onBeforeUnmount(() => {
         <div
           v-if="fullscreenActive"
           class="stream-surface__exit-fullscreen"
+          :class="{ 'stream-surface__exit-fullscreen--clear-of-pad': showTouchPad && inputReady }"
           @click.stop
           @keydown.stop
           @keyup.stop
@@ -2288,6 +2304,24 @@ onBeforeUnmount(() => {
           />
           <span class="stream-stage__volume-value">{{ volumeLabel }}</span>
         </label>
+        <!-- Bars rather than a number, because the number is the thing people cannot
+             read. The title carries the specific measurement and what to do about
+             it, which is the part worth having when it is not green. -->
+        <span
+          v-if="isConnected"
+          class="stream-stage__link"
+          :data-tier="linkQuality.tier"
+          :title="`${linkQuality.headline} — ${linkQuality.detail}`"
+        >
+          <span class="stream-stage__link-bars" aria-hidden="true">
+            <i v-for="bar in 4" :key="bar" :class="{ 'is-lit': bar <= linkQuality.bars }" />
+          </span>
+          <span class="vs-sr-only">
+            {{ t('ui.browser_stream.link_quality', 'Connection quality') }}:
+            {{ linkQuality.headline }}. {{ linkQuality.detail }}
+          </span>
+          <span aria-hidden="true">{{ linkQuality.headline }}</span>
+        </span>
         <!-- These three are drawn entirely in this browser and never reach the host,
              so unlike the encoder settings they change instantly, mid-stream. They
              sit under the video rather than in the settings form because that is
@@ -3029,6 +3063,17 @@ onBeforeUnmount(() => {
   cursor: default;
 }
 
+/* The on-screen controller occupies the whole bottom band — sticks in the outer
+   corners, d-pad and face buttons inboard of them — so bottom-right sits directly
+   on top of A and B. Overlapping a button you press during play is worse than
+   overlapping video: the exit lands under a thumb aiming for something else. Moved
+   to the top edge, which the controller leaves empty; the swipe hint there is
+   centred and narrow, so the corner stays free. */
+.stream-surface__exit-fullscreen--clear-of-pad {
+  top: max(var(--vs-space-16), env(safe-area-inset-top));
+  bottom: auto;
+}
+
 .stream-surface__exit-swipe {
   position: absolute;
   z-index: 2;
@@ -3116,6 +3161,48 @@ onBeforeUnmount(() => {
 /* aria-pressed carries the state for assistive tech; the fill carries it visually.
    A pressed toggle has to be unmistakable at icon size, so it inverts rather than
    shifting a border colour. */
+/* Bars grow left to right and colour by tier. The unlit ones stay visible so the
+   indicator reads as "2 of 4" rather than as two floating marks. */
+.stream-stage__link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--vs-space-8);
+  color: var(--vs-color-text-secondary);
+  font-size: var(--vs-type-size-helper);
+  white-space: nowrap;
+}
+
+.stream-stage__link-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 1rem;
+}
+
+.stream-stage__link-bars i {
+  width: 3px;
+  border-radius: 1px;
+  background: var(--vs-color-border-strong);
+}
+
+.stream-stage__link-bars i:nth-child(1) { height: 25%; }
+.stream-stage__link-bars i:nth-child(2) { height: 50%; }
+.stream-stage__link-bars i:nth-child(3) { height: 75%; }
+.stream-stage__link-bars i:nth-child(4) { height: 100%; }
+
+.stream-stage__link[data-tier='excellent'] .is-lit,
+.stream-stage__link[data-tier='good'] .is-lit {
+  background: var(--vs-color-status-success);
+}
+
+.stream-stage__link[data-tier='fair'] .is-lit {
+  background: var(--vs-color-status-warning);
+}
+
+.stream-stage__link[data-tier='poor'] .is-lit {
+  background: var(--vs-color-status-danger);
+}
+
 .stream-stage__toggles {
   display: flex;
   gap: var(--vs-space-4);

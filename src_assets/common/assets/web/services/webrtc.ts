@@ -55,6 +55,8 @@ export interface WebRtcConnectionCallbacks {
     bitrateKbps?: number;
     fps?: number;
     packetsLost?: number;
+    /** Loss over the last sampling window, as a percentage. */
+    lossPercent?: number;
     framesDropped?: number;
     roundTripMs?: number;
     jitterMs?: number;
@@ -558,6 +560,8 @@ export class BrowserWebRtcSession {
   // Byte totals are cumulative, so a rate needs the previous reading.
   private lastVideoBytes: number | undefined;
   private lastVideoBytesAt: number | undefined;
+  private lastPacketsLost: number | undefined;
+  private lastPacketsReceived: number | undefined;
   private peerConnection: RTCPeerConnection | null = null;
 
   get connected(): boolean {
@@ -866,6 +870,7 @@ export class BrowserWebRtcSession {
           type Inbound = RTCStats & {
             bytesReceived?: number;
             packetsLost?: number;
+            packetsReceived?: number;
             framesPerSecond?: number;
             framesDropped?: number;
             jitter?: number;
@@ -944,10 +949,29 @@ export class BrowserWebRtcSession {
           this.lastVideoBytes = bytes;
           this.lastVideoBytesAt = now;
 
+          // packetsLost is cumulative for the whole session, so on its own it can
+          // only ever grow and says nothing about the last few seconds. The rate
+          // over the sampling window is what tells you whether it is happening now.
+          let lossPercent: number | undefined;
+          const lost = rtp?.packetsLost;
+          const received = rtp?.packetsReceived;
+          if (typeof lost === 'number' && typeof received === 'number') {
+            if (this.lastPacketsLost !== undefined && this.lastPacketsReceived !== undefined) {
+              const dLost = lost - this.lastPacketsLost;
+              const dReceived = received - this.lastPacketsReceived;
+              const total = dLost + dReceived;
+              // A window with no packets at all is not 0% loss, it is no data.
+              if (total > 0) lossPercent = Math.max(0, (dLost / total) * 100);
+            }
+            this.lastPacketsLost = lost;
+            this.lastPacketsReceived = received;
+          }
+
           callbacks.onStreamStats({
             bitrateKbps,
             fps: rtp?.framesPerSecond,
             packetsLost: rtp?.packetsLost,
+            lossPercent,
             framesDropped: rtp?.framesDropped,
             roundTripMs,
             jitterMs: typeof rtp?.jitter === 'number' ? rtp.jitter * 1000 : undefined,
