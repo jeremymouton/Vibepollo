@@ -537,10 +537,12 @@ onBeforeUnmount(() => {
 
 .field input,
 .field select {
-  padding: 9px 10px;
+  /* Right padding clears the shared caret; background-color rather than the
+     `background` shorthand, which would reset background-image and remove it. */
+  padding: 9px var(--vs-space-32) 9px 10px;
   border: 1px solid var(--vs-color-border-subtle);
   border-radius: 8px;
-  background: var(--vs-color-bg-subtle);
+  background-color: var(--vs-color-bg-subtle);
   color: inherit;
 }
 
