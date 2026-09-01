@@ -2971,6 +2971,16 @@ onBeforeUnmount(() => {
 }
 
 .stream-surface {
+  /* One colour for the stage, defined once.
+     It used to be written as #090b10 here and #000 in the fullscreen rule, so the
+     same surface was two different blacks depending on mode, and the letterboxing
+     around a video that does not match the stage aspect showed whichever one the
+     rule underneath happened to set. The video element gets it too: its own
+     background is transparent, so before the first frame arrives — which is
+     exactly the loading case — whatever sits behind it shows through, and that
+     has to be the same colour or the seam is visible. */
+  --stream-stage-bg: #090b10;
+
   position: relative;
   display: grid;
   min-height: min(60vw, 42rem);
@@ -2979,7 +2989,7 @@ onBeforeUnmount(() => {
   border: 1px solid var(--vs-color-border-strong);
   border-radius: var(--vs-radius-card);
   outline: none;
-  background: #090b10;
+  background: var(--stream-stage-bg);
 }
 
 .stream-surface:focus-visible {
@@ -2996,6 +3006,7 @@ onBeforeUnmount(() => {
 
 .stream-surface video {
   display: block;
+  background: var(--stream-stage-bg);
   width: 100%;
   height: 100%;
   max-height: 42rem;
@@ -3021,7 +3032,7 @@ onBeforeUnmount(() => {
   min-height: 0;
   border: 0;
   border-radius: 0;
-  background: #000;
+  background: var(--stream-stage-bg);
 }
 
 .stream-surface--pseudo-fullscreen {
