@@ -123,6 +123,17 @@ namespace webrtc_stream {
     constexpr int kDefaultAudioPacketMs = 10;
     constexpr std::size_t kEncodedPrefixLogLimit = 5;
     constexpr auto kKeyframeRequestInterval = std::chrono::milliseconds {100};
+
+    /// How far the keyframe request interval may double while a request goes unanswered.
+    ///
+    /// A dependency gap asks for an IDR, and an IDR is many times the size of the
+    /// P-frames it replaces. When the gap is caused by the encoded queue overflowing,
+    /// asking again every 100ms feeds the overflow that caused it: on 2026-09-01 a
+    /// stalled session emitted 8,786 IDRs in 19 minutes, roughly 8 per second, and
+    /// never recovered. Backing off to at most one request per 3.2s keeps the fast
+    /// first retries that make a transient gap recover quickly, while denying a
+    /// sustained overflow the fuel it runs on.
+    constexpr std::uint32_t kKeyframeRequestBackoffShiftMax = 5;
     constexpr auto kVideoPacingSlackLatency = std::chrono::milliseconds {0};
     constexpr auto kVideoPacingSlackBalanced = std::chrono::milliseconds {2};
     constexpr auto kVideoPacingSlackSmooth = std::chrono::milliseconds {3};
@@ -1752,6 +1763,19 @@ namespace webrtc_stream {
     struct Session {
       SessionState state;
 
+      /// When this session was inserted, which is also when its encoder starts.
+      ///
+      /// The encoder is started at insertion so the first frames it produces have
+      /// somewhere to go, but the peer connection is built later, from the signalling
+      /// exchange. If that exchange never finishes, the session owns a running encoder
+      /// and no data channel — invisible to the activity sweep, which watches
+      /// data-channel traffic. Observed 2026-09-01: a session whose setup stalled after
+      /// a failed virtual-display retry encoded 1440p90 AV1 into a queue nobody drained
+      /// for 19 minutes, requesting a keyframe every 100ms, until the host stopped
+      /// answering HTTP at all. This is the anchor for the setup deadline in
+      /// sweep_inactive_sessions().
+      std::chrono::steady_clock::time_point created_at = std::chrono::steady_clock::now();
+
       // Guest access control (see SessionOptions). Defaults keep an
       // unrestricted session behaving exactly as before.
       crypto::PERM input_permission = crypto::PERM::_all_inputs;
@@ -1850,6 +1874,9 @@ namespace webrtc_stream {
       std::optional<std::chrono::steady_clock::time_point> startup_keyframe_until;
       std::optional<std::chrono::steady_clock::time_point> startup_keyframe_deadline;
       std::optional<std::chrono::steady_clock::time_point> last_keyframe_request;
+      /// Keyframe requests issued since the last one actually landed. Drives the
+      /// backoff in mark_video_dependency_gap; reset when a keyframe is sent.
+      std::uint32_t consecutive_keyframe_requests = 0;
       std::optional<std::chrono::steady_clock::time_point> last_keyframe_sent;
       std::optional<std::chrono::steady_clock::time_point> last_latency_resync;
       std::uint64_t video_delivery_epoch = 0;
@@ -2278,9 +2305,17 @@ namespace webrtc_stream {
                          << session.state.id << " reason=" << reason;
       }
 
-      if (!session.last_keyframe_request ||
-          now - *session.last_keyframe_request >= kKeyframeRequestInterval) {
+      // Each unanswered request doubles the wait before the next one. A gap that
+      // clears on the first or second IDR still recovers in ~100-200ms; one caused by
+      // an overflowing queue stops being fed by its own remedy.
+      const auto interval =
+        kKeyframeRequestInterval *
+        (1u << std::min(session.consecutive_keyframe_requests, kKeyframeRequestBackoffShiftMax));
+      if (!session.last_keyframe_request || now - *session.last_keyframe_request >= interval) {
         session.last_keyframe_request = now;
+        if (session.consecutive_keyframe_requests < kKeyframeRequestBackoffShiftMax) {
+          session.consecutive_keyframe_requests++;
+        }
         request_keyframe(session, reason);
       }
     }
@@ -3905,10 +3940,22 @@ namespace webrtc_stream {
 
     /// How long a session may go without any data-channel message before it is
     /// presumed dead. The browser pings every 5 seconds on the (unreliable) input
-    /// channel, so this allows many consecutive losses before giving up. Sessions
-    /// that have never sent anything are exempt — connection setup has its own
-    /// timeout, and a client too old to ping should not be reaped for it.
+    /// channel, so this allows many consecutive losses before giving up. A session
+    /// that has a data channel but has never spoken on it is exempt — a client too
+    /// old to ping should not be reaped for it.
     constexpr auto kSessionActivityTimeout = std::chrono::seconds {45};
+
+    /// How long a session may hold an encoder without ever opening a data channel.
+    ///
+    /// This bounds the case the activity timeout above cannot see. That one keys off
+    /// data-channel traffic, so a session whose signalling never completed — no peer,
+    /// no channel, nothing to be silent on — was skipped entirely and ran forever.
+    /// The claim that "connection setup has its own timeout" was simply wrong: there
+    /// was none, and on 2026-09-01 that cost a 19-minute keyframe storm that took the
+    /// host's HTTP thread down with it. A real setup completes in well under a second
+    /// (measured: encoder start to peer-connection-ready was 430ms), so 30s is far
+    /// past any legitimate handshake while still ending a stall promptly.
+    constexpr auto kSessionSetupTimeout = std::chrono::seconds {30};
     constexpr auto kSessionActivitySweepPeriod = std::chrono::seconds {15};
 
     void sweep_inactive_sessions() {
@@ -3918,12 +3965,27 @@ namespace webrtc_stream {
                             .count();
       const auto timeout_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(kSessionActivityTimeout).count();
+      const auto setup_timeout_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(kSessionSetupTimeout).count();
+      const auto now = std::chrono::steady_clock::now();
       std::vector<std::pair<std::string, std::int64_t>> stale;
+      std::vector<std::pair<std::string, std::int64_t>> unestablished;
       {
         std::lock_guard lg {session_mutex};
         for (auto &entry : sessions) {
           const auto &ctx = entry.second.data_channel_context;
           if (!ctx) {
+            // No data channel was ever opened, so the activity timeout below has
+            // nothing to measure. The encoder is already running regardless — it
+            // starts at session insertion — so bound the wait on setup instead of
+            // skipping the session and letting it encode into a queue nobody reads.
+            const auto setup_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        now - entry.second.created_at
+            )
+                                        .count();
+            if (setup_age_ms > setup_timeout_ms) {
+              unestablished.emplace_back(entry.first, setup_age_ms);
+            }
             continue;
           }
           const auto last = ctx->last_activity_ms.load(std::memory_order_acquire);
@@ -3935,6 +3997,11 @@ namespace webrtc_stream {
             stale.emplace_back(entry.first, age_ms);
           }
         }
+      }
+      for (const auto &[id, age_ms] : unestablished) {
+        BOOST_LOG(warning) << "WebRTC: session never completed setup after " << (age_ms / 1000)
+                           << "s; closing session " << id;
+        close_session(id);
       }
       for (const auto &[id, age_ms] : stale) {
         BOOST_LOG(info) << "WebRTC: no data-channel activity for " << (age_ms / 1000)
@@ -5408,6 +5475,9 @@ namespace webrtc_stream {
                   it->second.startup_keyframe_until || it->second.startup_keyframe_deadline;
                 if (it->second.needs_keyframe && !startup_active) {
                   it->second.needs_keyframe = false;
+                  // The request was answered, so the next gap starts from the fast
+                  // end of the backoff again.
+                  it->second.consecutive_keyframe_requests = 0;
                   it->second.video_pacing_state.anchor_capture.reset();
                   it->second.video_pacing_state.anchor_send.reset();
                   it->second.video_pacing_state.last_drift_reset.reset();
