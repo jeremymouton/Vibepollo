@@ -2658,10 +2658,26 @@ onBeforeUnmount(() => {
               </li>
             </ul>
             <!-- The error codes are the useful part when something is wrong: 401 is
-                 TURN refusing the credentials, which candidate counts never show. -->
+                 TURN refusing the credentials, which candidate counts never show.
+                 Informational ones are shown but never in red — a 701 against a
+                 host that connected is its missing IPv6 record, not a fault, and
+                 colouring it as one sends people chasing a problem they do not
+                 have. -->
             <ul v-if="connReport.errors.length" class="conn-test__errors">
-              <li v-for="(e, i) in connReport.errors" :key="i">
+              <li
+                v-for="(e, i) in connReport.errors"
+                :key="i"
+                :class="{ 'conn-test__errors--info': e.informational }"
+              >
                 {{ e.url }} — {{ e.errorCode }} {{ e.errorText }}
+                <template v-if="e.informational">
+                  {{
+                    t(
+                      'ui.browser_stream.conn.ipv6_note',
+                      '(expected — this server has no IPv6 address; the IPv4 connection succeeded)',
+                    )
+                  }}
+                </template>
               </li>
             </ul>
           </div>
@@ -2842,6 +2858,10 @@ onBeforeUnmount(() => {
 .conn-test__errors li {
   color: var(--vs-color-status-danger);
   overflow-wrap: anywhere;
+}
+
+.conn-test__errors--info {
+  color: var(--vs-color-text-secondary);
 }
 
 .app-picker__artwork {

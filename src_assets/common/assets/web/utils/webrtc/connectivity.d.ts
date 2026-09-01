@@ -11,6 +11,7 @@ export interface IceServerError {
   url: string;
   errorCode: number;
   errorText: string;
+  informational: boolean;
 }
 
 export interface ConnectivityReport {

@@ -36,9 +36,21 @@ export type CandidateKind = 'host' | 'srflx' | 'prflx' | 'relay';
 export interface IceServerError {
   /** STUN/TURN URL that failed, as the browser reported it. */
   url: string;
-  /** 401 means the TURN credentials were rejected; 701 is a gather timeout. */
+  /** 401 means the TURN credentials were rejected. */
   errorCode: number;
   errorText: string;
+  /**
+   * Not a fault: expected noise that would otherwise read as a failure.
+   *
+   * Browsers resolve each ICE server once per address family and report a 701
+   * for the family that has no record. A host with an A record and no AAAA —
+   * which is the normal case — therefore emits a 701 for its IPv6 attempt on
+   * every single probe, while IPv4 connects perfectly. Showing that in red
+   * sends people hunting for a network fault that does not exist, so it is
+   * flagged here and de-emphasised in the UI rather than dropped, because on a
+   * probe where nothing connected the same line is the actual answer.
+   */
+  informational: boolean;
 }
 
 export interface ConnectivityReport {
@@ -123,6 +135,8 @@ async function gather(
         url: e.url ?? '(unknown)',
         errorCode: e.errorCode ?? 0,
         errorText: e.errorText ?? '',
+        // Decided below, once it is known whether anything actually connected.
+        informational: false,
       });
     };
 
@@ -213,6 +227,13 @@ export async function probeConnectivity(iceServers: RTCIceServer[]): Promise<Con
     seen.add(key);
     return true;
   });
+
+  // A 701 only means something when nothing got through. If candidates were
+  // gathered, the server was reachable and the 701 is the other address family.
+  const connected = full.counts.srflx > 0 || full.counts.relay > 0 || relayOnlyWorks;
+  for (const error of errors) {
+    error.informational = error.errorCode === 701 && connected;
+  }
 
   return {
     counts: full.counts,
