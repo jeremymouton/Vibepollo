@@ -28,6 +28,8 @@ import { useActiveStream } from '@/stores/activeStream';
 import { applyGamepadFeedback, attachInputCapture } from '@/utils/webrtc/input';
 import type { SessionStatus } from '@/types/sessions';
 import { attachVideoUpscaler } from '@/utils/webrtc/upscaler';
+import { fetchIceServers, probeConnectivity } from '@/utils/webrtc/connectivity';
+import type { ConnectivityReport } from '@/utils/webrtc/connectivity';
 import type { EncodingType, StreamConfig } from '@/types/webrtc';
 
 interface LaunchableApp {
@@ -269,6 +271,72 @@ function loadStreamSettings(): SavedStreamSettings {
 }
 
 const savedStreamSettings = loadStreamSettings();
+
+/// Connection test.
+///
+/// Answers the question the stats overlay can only answer once a stream is
+/// already running: which route would this connection actually take? It talks to
+/// the ICE servers only — no session, and so no encoder. That restraint is the
+/// point: a session whose signalling stalls leaves an encoder running against a
+/// queue nobody drains, which is what took the host down on 2026-09-01. A
+/// reachability check must never be able to do that.
+const connTesting = ref(false);
+const connReport = ref<ConnectivityReport | null>(null);
+const connError = ref('');
+
+async function runConnectionTest(): Promise<void> {
+  connTesting.value = true;
+  connError.value = '';
+  connReport.value = null;
+  try {
+    connReport.value = await probeConnectivity(await fetchIceServers());
+  } catch (err) {
+    connError.value = messageFromError(err, t('ui.browser_stream.conn.failed', 'Connection test failed'));
+  } finally {
+    connTesting.value = false;
+  }
+}
+
+/// Phrased as what to do about it, not as what was measured — "relayed via the
+/// TURN server" is actionable, "3 srflx candidates" is not.
+const connSummary = computed(() => {
+  const r = connReport.value;
+  if (!r) return '';
+  switch (r.verdict) {
+    case 'good':
+      return t('ui.browser_stream.conn.good', 'Direct connection available. STUN and TURN both reachable.');
+    case 'relay-only':
+      return t(
+        'ui.browser_stream.conn.relay_only',
+        'No local network candidates — this browser is hiding them, often a VPN or privacy extension. Traffic will be relayed.',
+      );
+    case 'degraded':
+      return t(
+        'ui.browser_stream.conn.degraded',
+        'No TURN relay available. Anyone who cannot reach this host directly will fail to connect.',
+      );
+    default:
+      return t(
+        'ui.browser_stream.conn.blocked',
+        'Neither STUN nor TURN answered. This network is blocking the connection.',
+      );
+  }
+});
+
+const connTone = computed<StatusTone>(() => {
+  switch (connReport.value?.verdict) {
+    case 'good':
+      return 'success';
+    case 'relay-only':
+      return 'info';
+    case 'degraded':
+      return 'warning';
+    case 'blocked':
+      return 'danger';
+    default:
+      return 'neutral';
+  }
+});
 
 /// Client-side FSR (EASU upscale + RCAS sharpen) between the decoded frame and the
 /// screen, the same pipeline the guest page uses — shared from utils/webrtc so the
@@ -2539,6 +2607,65 @@ onBeforeUnmount(() => {
             </li>
           </ul>
         </div>
+        <div class="conn-test" aria-labelledby="browser-stream-conn-title">
+          <h3 id="browser-stream-conn-title">
+            {{ t('ui.browser_stream.conn.title', 'Connection test') }}
+          </h3>
+          <p class="conn-test__help">
+            {{
+              t(
+                'ui.browser_stream.conn.help',
+                'Checks which route a stream would take. Starts no stream and uses no invite.',
+              )
+            }}
+          </p>
+          <AppButton
+            variant="secondary"
+            :disabled="connTesting"
+            :loading="connTesting"
+            @click="runConnectionTest"
+          >
+            {{
+              connTesting
+                ? t('ui.browser_stream.conn.testing', 'Testing…')
+                : t('ui.browser_stream.conn.run', 'Test connection')
+            }}
+          </AppButton>
+
+          <InlineAlert v-if="connError" tone="danger" :message="connError" />
+
+          <div v-if="connReport" class="conn-test__result">
+            <StatusBadge :label="connReport.verdict" :tone="connTone" compact />
+            <p class="conn-test__summary">{{ connSummary }}</p>
+            <ul class="conn-test__facts">
+              <li>
+                <span>{{ t('ui.browser_stream.conn.local', 'Local network') }}</span>
+                <small>{{ connReport.hasHost ? connReport.counts.host : 0 }}</small>
+              </li>
+              <li>
+                <span>{{ t('ui.browser_stream.conn.stun', 'STUN (public address)') }}</span>
+                <small>{{ connReport.publicAddress ?? '—' }}</small>
+              </li>
+              <li>
+                <span>{{ t('ui.browser_stream.conn.turn', 'TURN relay') }}</span>
+                <small>
+                  {{
+                    connReport.relayOnlyWorks
+                      ? `${connReport.relayLatencyMs ?? '?'} ms`
+                      : t('ui.browser_stream.conn.none', 'unavailable')
+                  }}
+                </small>
+              </li>
+            </ul>
+            <!-- The error codes are the useful part when something is wrong: 401 is
+                 TURN refusing the credentials, which candidate counts never show. -->
+            <ul v-if="connReport.errors.length" class="conn-test__errors">
+              <li v-for="(e, i) in connReport.errors" :key="i">
+                {{ e.url }} — {{ e.errorCode }} {{ e.errorText }}
+              </li>
+            </ul>
+          </div>
+        </div>
       </section>
     </div>
 
@@ -2672,6 +2799,51 @@ onBeforeUnmount(() => {
  * wedged into a rounded row — and for the many apps with no cover at all it was an
  * empty block with a small glyph floating in it. A square sits inside the pill's
  * radius without fighting it, and the covers that do exist still fill it. */
+.conn-test {
+  display: grid;
+  gap: var(--vs-space-8);
+  padding-block-start: var(--vs-space-16);
+  border-block-start: var(--vs-border-width) solid var(--vs-color-border-subtle);
+}
+
+.conn-test__help,
+.conn-test__summary {
+  margin: 0;
+  color: var(--vs-color-text-secondary);
+  font-size: var(--vs-type-size-helper);
+}
+
+.conn-test__result {
+  display: grid;
+  gap: var(--vs-space-8);
+}
+
+.conn-test__facts,
+.conn-test__errors {
+  display: grid;
+  gap: var(--vs-space-4);
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  font-size: var(--vs-type-size-helper);
+}
+
+.conn-test__facts li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--vs-space-8);
+}
+
+.conn-test__facts small {
+  color: var(--vs-color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.conn-test__errors li {
+  color: var(--vs-color-status-danger);
+  overflow-wrap: anywhere;
+}
+
 .app-picker__artwork {
   display: grid;
   overflow: hidden;

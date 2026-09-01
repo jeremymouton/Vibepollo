@@ -23,6 +23,8 @@ import {
 } from '@/utils/webrtc/input';
 import { WebRtcClient } from '@/utils/webrtc/client';
 import { attachVideoUpscaler } from '@/utils/webrtc/upscaler';
+import { fetchIceServers, probeConnectivity } from '@/utils/webrtc/connectivity';
+import type { ConnectivityReport } from '@/utils/webrtc/connectivity';
 import TouchGamepad from '@/components/TouchGamepad.vue';
 import type { EncodingType, StreamConfig, WebRtcStatsSnapshot } from '@/types/webrtc';
 
@@ -128,6 +130,47 @@ const stageEl = ref<HTMLDivElement>();
 /// screen. Pays off exactly when a guest streams below display resolution — 720p on
 /// a constrained line shown on a 1440p screen — which is why it lives here and not
 /// in the stream config: it costs nothing on the wire and needs no reconnect.
+/// Connection check, offered before the guest starts anything.
+///
+/// A guest who cannot connect, or who connects badly, currently has no way to say
+/// anything more useful than "it doesn't work" — and the owner has no way to tell
+/// a blocked network from a relayed one from a busy host. This asks the ICE
+/// servers directly. It starts no stream, so it costs the host no encoder and the
+/// guest no invite use.
+const connTesting = ref(false);
+const connReport = ref<ConnectivityReport | null>(null);
+const connError = ref('');
+
+async function runConnectionTest(): Promise<void> {
+  connTesting.value = true;
+  connError.value = '';
+  connReport.value = null;
+  try {
+    connReport.value = await probeConnectivity(await fetchIceServers());
+  } catch (err) {
+    connError.value = err instanceof Error ? err.message : 'Connection test failed';
+  } finally {
+    connTesting.value = false;
+  }
+}
+
+/// Written for someone who did not set any of this up and cannot fix the host.
+/// Each line says what it means for them, not what was measured.
+const connSummary = computed(() => {
+  const r = connReport.value;
+  if (!r) return '';
+  switch (r.verdict) {
+    case 'good':
+      return 'Looks good — a direct connection is available.';
+    case 'relay-only':
+      return 'Your browser is hiding your local network, often a VPN or privacy extension. It should still work, routed through the relay.';
+    case 'degraded':
+      return 'No relay is available. If you cannot reach the host directly, this will not connect.';
+    default:
+      return 'This network is blocking the connection. Try a different network, or turn off a VPN.';
+  }
+});
+
 const ENHANCE_KEY = 'vibepollo.guest.enhance';
 const enhance = ref<boolean>(
   (() => {
@@ -456,6 +499,24 @@ onBeforeUnmount(() => {
           <button class="w-full rounded bg-white/25 py-2 text-base" @click="startChosen">
             Start streaming
           </button>
+
+          <!-- Below Start on purpose: it is a diagnostic for when something is
+               wrong, not a step everyone has to work through first. -->
+          <button
+            class="w-full rounded border border-white/25 py-2 text-sm disabled:opacity-50"
+            :disabled="connTesting"
+            @click="runConnectionTest"
+          >
+            {{ connTesting ? 'Checking your connection…' : 'Check my connection' }}
+          </button>
+          <p v-if="connError" class="text-xs text-red-300">{{ connError }}</p>
+          <div v-if="connReport" class="space-y-1 rounded bg-white/10 p-2 text-xs">
+            <p>{{ connSummary }}</p>
+            <p class="text-white/50">
+              Local network: {{ connReport.hasHost ? 'yes' : 'hidden' }} ·
+              Relay: {{ connReport.relayOnlyWorks ? `${connReport.relayLatencyMs ?? '?'} ms` : 'unavailable' }}
+            </p>
+          </div>
         </div>
 
         <p v-else class="text-lg">{{ message }}</p>

@@ -4226,6 +4226,31 @@ namespace confighttp {
     send_response(response, output);
   }
 
+  /**
+   * @brief The ICE servers a connectivity test should probe.
+   *
+   * Split out of session creation so a client can find out whether STUN and TURN
+   * are reachable WITHOUT starting a session. That distinction matters: creating a
+   * session starts an encoder, and on 2026-09-01 a session whose signalling stalled
+   * left one encoding into a queue nobody drained until the host stopped answering
+   * HTTP. A reachability check should not be able to do that.
+   *
+   * Guest-or-owner, matching createWebRTCSession: the guest is the one who most
+   * needs to know their own path before burning an invite use, and the credentials
+   * handed back are the same ephemeral ones their session would have received.
+   */
+  void getWebRTCIceConfig(resp_https_t response, req_https_t request) {
+    const auto guest = invite::guest::lookup(extract_guest_token_from_cookie(request->header));
+    if (!guest && !authenticate(response, request)) {
+      return;
+    }
+
+    nlohmann::json output;
+    output["status"] = true;
+    output["ice_servers"] = load_webrtc_ice_servers();
+    send_response(response, output);
+  }
+
   void getWebRTCCapabilities(resp_https_t response, req_https_t request) {
     if (!authenticate(response, request)) {
       return;
@@ -6841,6 +6866,13 @@ namespace confighttp {
     register_api_route("^/api/host/info$", "GET", getHostInfo);
     register_api_route("^/api/rtsp/sessions$", "GET", listRTSPSessions);
     register_blocking_api_route("^/api/webrtc/capabilities$", "GET", getWebRTCCapabilities);
+    // Self-authenticating: a redeemed guest reaches this before any owner login,
+    // the same way they reach createWebRTCSession.
+    register_blocking_api_route_self_authenticating(
+      "^/api/webrtc/ice-config$",
+      "GET",
+      getWebRTCIceConfig
+    );
     register_api_route("^/api/webrtc/sessions$", "GET", listWebRTCSessions);
     register_api_route("^/api/history/sessions$", "GET", listSessionHistory);
     register_api_route("^/api/history/sessions/active$", "GET", getActiveSessionHistory);
