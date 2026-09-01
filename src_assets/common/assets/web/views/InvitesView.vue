@@ -8,7 +8,7 @@
  * answer computed in one place rather than three clients each decoding a
  * bitmask slightly differently.
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 
 import { ApiError, apiDelete, apiGet, apiPatch, apiPost } from '@/api/client';
@@ -62,14 +62,88 @@ const showCreate = ref(false);
 const creating = ref(false);
 const confirmDelete = ref<Invite | null>(null);
 
-const draft = ref({
-  label: '',
-  preset: 'gamepad' as 'view' | 'gamepad' | 'full',
-  allow_browser: true,
-  allow_pairing: false,
-  expires_in_hours: 24,
-  max_uses: 0,
-});
+/// The create form remembers its last shape, per browser.
+///
+/// Everything here except the label is a policy decision the owner makes the same
+/// way most times — a 24h gamepad-only browser link, say — and resetting it on
+/// every reload meant re-picking all five, with no way to see what the last invite
+/// was cut from while adjusting. The label is deliberately not persisted: it names
+/// one guest, so carrying it forward would mislabel the next invite.
+const DRAFT_KEY = 'vibepollo.invites.draft';
+
+interface InviteDraft {
+  label: string;
+  preset: 'view' | 'gamepad' | 'full';
+  allow_browser: boolean;
+  allow_pairing: boolean;
+  expires_in_hours: number;
+  max_uses: number;
+}
+
+function defaultDraft(): InviteDraft {
+  return {
+    label: '',
+    preset: 'gamepad',
+    allow_browser: true,
+    allow_pairing: false,
+    expires_in_hours: 24,
+    max_uses: 0,
+  };
+}
+
+function loadDraft(): InviteDraft {
+  const fallback = defaultDraft();
+  try {
+    const raw = window.localStorage.getItem(DRAFT_KEY);
+    if (!raw) return fallback;
+    const saved = JSON.parse(raw) as Partial<InviteDraft>;
+    return {
+      label: fallback.label,
+      preset:
+        saved.preset === 'view' || saved.preset === 'gamepad' || saved.preset === 'full'
+          ? saved.preset
+          : fallback.preset,
+      allow_browser:
+        typeof saved.allow_browser === 'boolean' ? saved.allow_browser : fallback.allow_browser,
+      allow_pairing:
+        typeof saved.allow_pairing === 'boolean' ? saved.allow_pairing : fallback.allow_pairing,
+      // 0 would mean an invite that expires instantly; a negative one is nonsense.
+      expires_in_hours:
+        Number.isFinite(Number(saved.expires_in_hours)) && Number(saved.expires_in_hours) > 0
+          ? Number(saved.expires_in_hours)
+          : fallback.expires_in_hours,
+      // 0 is meaningful here — it is "unlimited uses" — so only reject negatives.
+      max_uses:
+        Number.isFinite(Number(saved.max_uses)) && Number(saved.max_uses) >= 0
+          ? Number(saved.max_uses)
+          : fallback.max_uses,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+const draft = ref<InviteDraft>(loadDraft());
+
+watch(
+  () => [
+    draft.value.preset,
+    draft.value.allow_browser,
+    draft.value.allow_pairing,
+    draft.value.expires_in_hours,
+    draft.value.max_uses,
+  ],
+  () => {
+    try {
+      window.localStorage.setItem(
+        DRAFT_KEY,
+        JSON.stringify({ ...draft.value, label: '' } satisfies InviteDraft),
+      );
+    } catch {
+      // Never let a storage failure block creating an invite.
+    }
+  },
+);
 
 /// The API returns a relative path, so the origin is chosen here. Prefer the
 /// configured public base URL: the owner is looking at this page on the LAN, so

@@ -166,10 +166,110 @@ let videoRenderOverloadedSince: number | null = null;
 let videoLatencyResetAt: number | null = null;
 let videoPlaybackStream: MediaStream | null = null;
 
+/// Stream settings persist per browser.
+///
+/// Resolution, fps, codec, bitrate and the rest used to reset on every visit, so
+/// anyone who does not stream at the defaults re-entered the same five choices each
+/// time — and had no way to see what they last used while adjusting. Saved per
+/// browser rather than on the host: two people driving the same host from different
+/// machines want their own answers, and the host already has its own defaults.
+///
+/// `encoding` is deliberately absent. It is derived from codecChoice, and storing
+/// both invites them to disagree.
+const STREAM_SETTINGS_KEY = 'vibepollo.browser-stream.settings';
+
+interface SavedStreamSettings {
+  appId: string;
+  bitrateKbps: number;
+  bitrateTracksRecommendation: boolean;
+  codecChoice: EncodingType | 'auto';
+  fps: number;
+  hdr: boolean;
+  height: number;
+  muteHostAudio: boolean;
+  pacingMode: 'latency' | 'balanced' | 'smoothness';
+  volume: number;
+  width: number;
+}
+
+function defaultStreamSettings(): SavedStreamSettings {
+  return {
+    appId: '',
+    bitrateKbps: 20_000,
+    bitrateTracksRecommendation: true,
+    codecChoice: 'auto',
+    fps: 60,
+    hdr: false,
+    height: 1080,
+    muteHostAudio: true,
+    pacingMode: 'balanced',
+    volume: 100,
+    width: 1920,
+  };
+}
+
+/// Every field is validated individually against the default. Storage is shared
+/// across host versions and browsers, so a value saved by an older build — or edited
+/// by hand — must never be able to launch a stream at 0x0 or a codec that does not
+/// exist. Codec *availability* is not checked here: capabilities have not loaded yet
+/// at module init, so that clamp happens in refresh().
+function loadStreamSettings(): SavedStreamSettings {
+  const fallback = defaultStreamSettings();
+  try {
+    const raw = window.localStorage.getItem(STREAM_SETTINGS_KEY);
+    if (!raw) return fallback;
+    const saved = JSON.parse(raw) as Partial<SavedStreamSettings>;
+    const positive = (value: unknown, fromDefault: number): number =>
+      Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : fromDefault;
+    return {
+      appId: typeof saved.appId === 'string' ? saved.appId : fallback.appId,
+      // 0 is meaningful — it is "let the host decide" — so it cannot use `positive`.
+      bitrateKbps:
+        Number.isFinite(Number(saved.bitrateKbps)) && Number(saved.bitrateKbps) >= 0
+          ? Number(saved.bitrateKbps)
+          : fallback.bitrateKbps,
+      bitrateTracksRecommendation:
+        typeof saved.bitrateTracksRecommendation === 'boolean'
+          ? saved.bitrateTracksRecommendation
+          : fallback.bitrateTracksRecommendation,
+      codecChoice:
+        saved.codecChoice === 'auto' ||
+        (typeof saved.codecChoice === 'string' && codecs.includes(saved.codecChoice))
+          ? saved.codecChoice
+          : fallback.codecChoice,
+      fps: positive(saved.fps, fallback.fps),
+      hdr: typeof saved.hdr === 'boolean' ? saved.hdr : fallback.hdr,
+      height: positive(saved.height, fallback.height),
+      muteHostAudio:
+        typeof saved.muteHostAudio === 'boolean' ? saved.muteHostAudio : fallback.muteHostAudio,
+      pacingMode:
+        saved.pacingMode === 'latency' ||
+        saved.pacingMode === 'balanced' ||
+        saved.pacingMode === 'smoothness'
+          ? saved.pacingMode
+          : fallback.pacingMode,
+      volume: Math.min(
+        100,
+        Math.max(
+          0,
+          Number.isFinite(Number(saved.volume)) ? Number(saved.volume) : fallback.volume,
+        ),
+      ),
+      width: positive(saved.width, fallback.width),
+    };
+  } catch {
+    // A private window, cleared site data, or a browser refusing storage entirely.
+    // Falling back to defaults is always correct here; never let this break the page.
+    return fallback;
+  }
+}
+
+const savedStreamSettings = loadStreamSettings();
+
 /// 'auto' is not an encoding the server understands — it is resolved to the best
 /// codec both ends actually support, at the moment the stream starts, so the answer
 /// reflects the adapter and browser in play rather than one chosen weeks ago.
-const codecChoice = ref<EncodingType | 'auto'>('auto');
+const codecChoice = ref<EncodingType | 'auto'>(savedStreamSettings.codecChoice);
 
 /// Named resolutions, because typing 2560 and 1440 into two boxes is a worse way to
 /// say "1440p". Custom keeps the boxes for anything not on the list — an ultrawide,
@@ -190,7 +290,7 @@ const resolutionChoice = ref<string>('1080p');
 /// away frames faster than it saves time, and the stream reads as stuttery and
 /// smeared, which is exactly how it compared against the invite page: that one
 /// sends nothing and so gets the host's own default of 'balanced'.
-const pacingMode = ref<'latency' | 'balanced' | 'smoothness'>('balanced');
+const pacingMode = ref<'latency' | 'balanced' | 'smoothness'>(savedStreamSettings.pacingMode);
 
 /// Gamepads, and only gamepads.
 ///
@@ -320,6 +420,17 @@ const useHostBitrate = computed({
   },
 });
 
+/// Where the bitrate handle sits within the host's allowed range, as a percentage,
+/// for the filled part of the track. The bounds come from the host and the low one
+/// is rarely 0, so the raw value is not a percentage of anything useful on its own.
+const bitrateFillPercent = computed(() => {
+  const min = Math.max(hostCapabilities.value.limits.min_bitrate_kbps, 1000);
+  const max = hostCapabilities.value.limits.max_bitrate_kbps || 150_000;
+  if (max <= min) return 0;
+  const clamped = Math.min(max, Math.max(min, form.bitrateKbps));
+  return ((clamped - min) / (max - min)) * 100;
+});
+
 const bitrateLabel = computed(() =>
   form.bitrateKbps === 0
     ? t('ui.browser_stream.settings.bitrate_host_default', 'Host default')
@@ -347,15 +458,16 @@ function bestAvailableCodec(): EncodingType {
 }
 
 const form = reactive<StreamLaunchForm>({
-  appId: '',
-  bitrateKbps: 20_000,
+  appId: savedStreamSettings.appId,
+  bitrateKbps: savedStreamSettings.bitrateKbps,
+  // Derived from codecChoice in refresh(), once both ends have reported support.
   encoding: 'h264',
-  fps: 60,
-  hdr: false,
-  height: 1080,
-  muteHostAudio: true,
-  volume: 100,
-  width: 1920,
+  fps: savedStreamSettings.fps,
+  hdr: savedStreamSettings.hdr,
+  height: savedStreamSettings.height,
+  muteHostAudio: savedStreamSettings.muteHostAudio,
+  volume: savedStreamSettings.volume,
+  width: savedStreamSettings.width,
 });
 
 /// Moonlight's default-bitrate curve: Mbps at 30 fps for H.264, interpolated
@@ -431,12 +543,14 @@ function recommendedBitrateKbps(): number {
   return Math.min(max, Math.max(min, roundToStep(rawKbps, 1000)));
 }
 
-/// Tracks whether the slider follows the recommended value. On by default:
-/// settings are not persisted between visits, so every visit starts on the
-/// recommendation and follows it through resolution / fps / codec changes.
-/// Dragging the slider takes the wheel and turns this off; "Use recommended"
-/// hands it back.
-const bitrateTracksRecommendation = ref(true);
+/// Tracks whether the slider follows the recommended value. On for a browser that
+/// has never streamed here, so a first visit starts on the recommendation and
+/// follows it through resolution / fps / codec changes. Dragging the slider takes
+/// the wheel and turns this off; "Use recommended" hands it back. Persisted with
+/// the rest of the settings — restoring a hand-picked bitrate without also
+/// restoring that the user picked it would let the next capabilities refresh
+/// overwrite their choice.
+const bitrateTracksRecommendation = ref(savedStreamSettings.bitrateTracksRecommendation);
 
 function applyRecommendedBitrate(): void {
   const next = recommendedBitrateKbps();
@@ -465,6 +579,50 @@ watch(
   () => [form.width, form.height, form.fps, form.encoding, hostCapabilities.value] as const,
   () => {
     if (bitrateTracksRecommendation.value && !useHostBitrate.value) applyRecommendedBitrate();
+  },
+);
+
+/// Write the settings back on every change.
+///
+/// Watching the individual fields rather than the `form` object deeply keeps the
+/// transient stream state that also lives on it from triggering writes. localStorage
+/// is synchronous, but these fire at most once per Vue flush and the payload is a
+/// dozen scalars, so no debounce is warranted.
+watch(
+  () =>
+    [
+      form.appId,
+      form.bitrateKbps,
+      form.fps,
+      form.hdr,
+      form.height,
+      form.muteHostAudio,
+      form.volume,
+      form.width,
+      codecChoice.value,
+      pacingMode.value,
+      bitrateTracksRecommendation.value,
+    ] as const,
+  () => {
+    const settings: SavedStreamSettings = {
+      appId: form.appId,
+      bitrateKbps: form.bitrateKbps,
+      bitrateTracksRecommendation: bitrateTracksRecommendation.value,
+      codecChoice: codecChoice.value,
+      fps: form.fps,
+      hdr: form.hdr,
+      height: form.height,
+      muteHostAudio: form.muteHostAudio,
+      pacingMode: pacingMode.value,
+      volume: form.volume,
+      width: form.width,
+    };
+    try {
+      window.localStorage.setItem(STREAM_SETTINGS_KEY, JSON.stringify(settings));
+    } catch {
+      // Storage full, or a browser that refuses it. Losing the preference is a far
+      // better outcome than breaking the settings form.
+    }
   },
 );
 
@@ -820,10 +978,20 @@ async function refresh(): Promise<void> {
   // be available before this point.
   syncResolutionChoice();
   syncFpsChoice();
-  if (codecChoice.value === 'auto') {
-    applyCodecChoice();
-    if (form.hdr && !hdrAvailable(form.encoding)) form.hdr = false;
+  // A restored app may have been deleted since. '' is the desktop, which always
+  // exists, so it is the safe landing place rather than a launch that 404s.
+  if (form.appId && !apps.value.some((app) => String(app.id) === form.appId)) {
+    form.appId = '';
   }
+  // A codec saved on another machine, or one this browser has since lost, must not
+  // strand the page on an encoding neither end can do.
+  if (codecChoice.value !== 'auto' && !codecAvailable(codecChoice.value)) {
+    codecChoice.value = 'auto';
+  }
+  // Unconditional now: a restored explicit codec still has to reach form.encoding,
+  // which only ever holds the module-init default until this runs.
+  applyCodecChoice();
+  if (form.hdr && !hdrAvailable(form.encoding)) form.hdr = false;
 
   if (browserResult.status === 'rejected' && !refreshError.value) {
     refreshError.value = t('ui.browser_stream.errors.inspect_browser');
@@ -1991,6 +2159,7 @@ onBeforeUnmount(() => {
             min="0"
             max="100"
             step="1"
+            :style="{ '--vs-range-fill': `${form.volume}%` }"
             :aria-label="t('ui.browser_stream.settings.volume', 'Volume')"
           />
           <span class="stream-stage__volume-value">{{ volumeLabel }}</span>
@@ -2218,6 +2387,7 @@ onBeforeUnmount(() => {
                 :min="Math.max(hostCapabilities.limits.min_bitrate_kbps, 1000)"
                 :max="hostCapabilities.limits.max_bitrate_kbps || 150000"
                 step="1000"
+                :style="{ '--vs-range-fill': `${bitrateFillPercent}%` }"
               />
               <small class="vs-field__help stream-form__bitrate-help">
                 <template v-if="!bitrateMatchesRecommendation && recommendedBitrateKbps() > 0">
@@ -2440,11 +2610,18 @@ onBeforeUnmount(() => {
   color: var(--vs-color-accent-default);
 }
 
+/* A square, not a portrait slab.
+ *
+ * These were 2rem x 2.65rem, the aspect of box art, back when the picker was a grid
+ * of large cover cards. In a pill-shaped chip that reads as a tall grey rectangle
+ * wedged into a rounded row — and for the many apps with no cover at all it was an
+ * empty block with a small glyph floating in it. A square sits inside the pill's
+ * radius without fighting it, and the covers that do exist still fill it. */
 .app-picker__artwork {
   display: grid;
   overflow: hidden;
-  width: 2rem;
-  height: 2.65rem;
+  width: 1.75rem;
+  height: 1.75rem;
   flex: none;
   place-items: stretch;
   border-radius: calc(var(--vs-radius-control) / 1.5);
@@ -2455,6 +2632,16 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+/* With no artwork there is nothing to frame, so drop the filled box and leave the
+ * icon on the chip's own background. One less rectangle per chip, and the row reads
+ * as a row of labels rather than a row of placeholders. The fallback is an inner
+ * span, so the box it sits in is cleared via :has() on the parent rather than on
+ * the span itself. */
+.app-picker__artwork--desktop,
+.app-picker__artwork:has(.app-picker__artwork-fallback) {
+  background: none;
 }
 
 .app-picker__artwork--desktop,

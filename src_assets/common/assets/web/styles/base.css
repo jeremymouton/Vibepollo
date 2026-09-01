@@ -261,9 +261,28 @@ hr {
   border-color: var(--vs-color-accent-default);
 }
 
+/* The caret is drawn here rather than left to the browser.
+ *
+ * A native select puts its arrow hard against the field's right edge, with spacing
+ * the page cannot influence — `padding-inline-end` moves the text and leaves the
+ * arrow where it was. Replacing it costs one background image and buys a caret that
+ * sits on the same 12px gutter as every other control's inner spacing.
+ *
+ * Two rules because a data: URI is its own document: `currentColor` does not reach
+ * into it, so each theme needs its stroke baked in. Dark is the default and light
+ * overrides, matching the order in tokens.css. */
 .vs-select {
+  appearance: none;
   padding-inline-end: var(--vs-space-40);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='M1.5 1.75 6 6.25l4.5-4.5' stroke='%2399A7BD' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right var(--vs-space-12) center;
+  background-size: 0.75rem 0.5rem;
   text-overflow: ellipsis;
+}
+
+html[data-theme='light'] .vs-select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='M1.5 1.75 6 6.25l4.5-4.5' stroke='%2364646B' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
 .vs-control::placeholder,
@@ -286,6 +305,17 @@ hr {
 .vs-textarea:disabled {
   background: var(--vs-color-bg-subtle);
   color: var(--vs-color-text-secondary);
+}
+
+/* Must follow the rule above: that one uses the `background` shorthand, which resets
+ * background-image to none and would strip the caret off every disabled select. */
+.vs-select:disabled {
+  background-color: var(--vs-color-bg-subtle);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='M1.5 1.75 6 6.25l4.5-4.5' stroke='%2399A7BD' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+html[data-theme='light'] .vs-select:disabled {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='M1.5 1.75 6 6.25l4.5-4.5' stroke='%2364646B' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
 .vs-textarea {
@@ -524,8 +554,16 @@ hr {
 }
 
 /* Range input, themed like the other controls. Sliders inherit almost nothing by
-   default, so the track and thumb are drawn explicitly for both engines. */
+   default, so the track and thumb are drawn explicitly for both engines.
+
+   The track shows how far along the value is. WebKit and Blink have no equivalent of
+   Firefox's ::-moz-range-progress, so the filled part is painted as a hard-stopped
+   gradient driven by --vs-range-fill, which the component sets as it changes. It
+   defaults to 0%, so a slider that never sets it looks exactly like an empty track
+   rather than breaking. */
 .vs-range {
+  --vs-range-fill: 0%;
+
   inline-size: 100%;
   block-size: 1.5rem;
   accent-color: var(--vs-color-accent-default);
@@ -539,31 +577,76 @@ hr {
 }
 
 .vs-range::-webkit-slider-runnable-track {
-  block-size: 0.375rem;
+  block-size: 0.5rem;
   border-radius: 999px;
-  background: var(--vs-color-bg-subtle);
+  background:
+    linear-gradient(
+      to right,
+      var(--vs-color-accent-default) var(--vs-range-fill),
+      var(--vs-color-bg-subtle) var(--vs-range-fill)
+    );
 }
 
+/* Firefox fills the track itself, so it needs no custom property. */
 .vs-range::-moz-range-track {
-  block-size: 0.375rem;
+  block-size: 0.5rem;
   border-radius: 999px;
   background: var(--vs-color-bg-subtle);
 }
 
+.vs-range::-moz-range-progress {
+  block-size: 0.5rem;
+  border-radius: 999px;
+  background: var(--vs-color-accent-default);
+}
+
+/* The ring keeps the thumb legible where it sits on its own fill colour — without
+   it the two merge and the handle disappears at high values. */
 .vs-range::-webkit-slider-thumb {
   margin-block-start: -0.3125rem;
   appearance: none;
-  inline-size: 1rem;
-  block-size: 1rem;
-  border: 0;
+  inline-size: 1.125rem;
+  block-size: 1.125rem;
+  border: 2px solid var(--vs-color-bg-surface);
   border-radius: 50%;
   background: var(--vs-color-accent-default);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 32%);
+  transition:
+    transform var(--vs-motion-duration-control) var(--vs-motion-easing-standard),
+    box-shadow var(--vs-motion-duration-control) var(--vs-motion-easing-standard);
 }
 
 .vs-range::-moz-range-thumb {
-  inline-size: 1rem;
-  block-size: 1rem;
-  border: 0;
+  inline-size: 1.125rem;
+  block-size: 1.125rem;
+  border: 2px solid var(--vs-color-bg-surface);
   border-radius: 50%;
   background: var(--vs-color-accent-default);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 32%);
+}
+
+.vs-range:hover:not(:disabled)::-webkit-slider-thumb {
+  transform: scale(1.12);
+}
+
+.vs-range:active:not(:disabled)::-webkit-slider-thumb {
+  transform: scale(1.12);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 32%), 0 0 0 0.375rem
+    color-mix(in srgb, var(--vs-color-accent-default) 20%, transparent);
+}
+
+/* The focus ring belongs on the handle, not as a box around the whole 100%-wide
+   input, which is what the global :focus-visible rule would otherwise draw. */
+.vs-range:focus-visible {
+  outline: none;
+}
+
+.vs-range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 1px 3px rgb(0 0 0 / 32%), 0 0 0 0.375rem
+    color-mix(in srgb, var(--vs-color-focus) 32%, transparent);
+}
+
+.vs-range:focus-visible::-moz-range-thumb {
+  box-shadow: 0 1px 3px rgb(0 0 0 / 32%), 0 0 0 0.375rem
+    color-mix(in srgb, var(--vs-color-focus) 32%, transparent);
 }
