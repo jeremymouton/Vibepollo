@@ -2626,7 +2626,10 @@ onBeforeUnmount(() => {
   margin: 0;
   overflow-wrap: anywhere;
   font-size: 1rem;
-  font-weight: 650;
+  /* 650 is not a point on the weight scale and this font stack has no face at
+     it, so the browser synthesises one and the glyph edges smear. The legacy
+     tree does not load the design tokens, hence the literal. */
+  font-weight: 600;
   line-height: 1.35;
 }
 
@@ -2765,7 +2768,10 @@ onBeforeUnmount(() => {
 }
 
 .client-empty span {
-  font-weight: 650;
+  /* 650 is not a point on the weight scale and this font stack has no face at
+     it, so the browser synthesises one and the glyph edges smear. The legacy
+     tree does not load the design tokens, hence the literal. */
+  font-weight: 600;
 }
 
 .client-empty small {

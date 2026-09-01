@@ -28,7 +28,11 @@
   min-width: 0;
   align-items: center;
   color: var(--vs-color-text-primary);
-  font-weight: 650;
+  /* Snapped to the weight scale. 520 and 650 are not points on it, and the UI
+     font stack has no face at either, so the browser synthesises one — which
+     smears the glyph edges and reads as blurry, most obviously as dark text
+     on the light theme's white. */
+  font-weight: var(--vs-type-weight-semibold);
   text-decoration: none;
 }
 
@@ -82,7 +86,11 @@
   border-radius: var(--vs-radius-control);
   color: var(--vs-color-text-secondary);
   font-size: 14px;
-  font-weight: 520;
+  /* Snapped to the weight scale. 520 and 650 are not points on it, and the UI
+     font stack has no face at either, so the browser synthesises one — which
+     smears the glyph edges and reads as blurry, most obviously as dark text
+     on the light theme's white. */
+  font-weight: var(--vs-type-weight-medium);
   text-decoration: none;
 }
 

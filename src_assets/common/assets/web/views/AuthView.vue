@@ -157,7 +157,11 @@ async function submit(): Promise<void> {
   margin-bottom: var(--vs-space-32);
   color: var(--vs-color-text-primary);
   font-size: 18px;
-  font-weight: 650;
+  /* Snapped to the weight scale. 520 and 650 are not points on it, and the UI
+     font stack has no face at either, so the browser synthesises one — which
+     smears the glyph edges and reads as blurry, most obviously as dark text
+     on the light theme's white. */
+  font-weight: var(--vs-type-weight-semibold);
 }
 
 .auth-heading {
