@@ -53,7 +53,9 @@ namespace webrtc_stream {
       // Guest access control. Both default to today's behaviour when unset:
       // full input, controller slot 0. A guest is created with a narrower
       // grant — crypto::PERM::input_controller alone yields a gamepad-only
-      // player — and a slot offset so players do not share a virtual pad.
+      // player — and a preferred slot, so players do not share a virtual pad.
+      // The slot is a preference: the pad lands there when it is free and on
+      // the lowest free slot otherwise, so a taken seat never blocks a guest.
       std::optional<std::uint32_t> input_permission;
       std::optional<int> gamepad_base_slot;
 
@@ -147,7 +149,14 @@ namespace webrtc_stream {
   std::vector<SessionState> list_sessions();
   void shutdown_all_sessions();
 
-  void submit_video_packet(video::packet_raw_t &packet);
+  /**
+   * @brief Offer an encoded packet to the browser peer whose encoder produced it.
+   * @return true when the packet belongs to a WebRTC encoder — delivered, or dropped
+   *   because that peer is gone — and so must NOT be raised into the Moonlight
+   *   broadcast queue, which treats channel_data as a session_t*. false when the
+   *   packet is not ours and the caller should route it as before.
+   */
+  bool submit_video_packet(video::packet_raw_t &packet);
   void submit_audio_packet(const audio::buffer_t &packet);
   void submit_video_frame(const std::shared_ptr<platf::img_t> &frame);
   void submit_audio_frame(const std::vector<float> &samples, int sample_rate, int channels, int frames);

@@ -842,6 +842,12 @@ int main(int argc, char *argv[]) {
   // watchdog threads or queue watchdog work from signal context.
   shutdown_deadline.arm();
 
+  // Every browser session owns an encoder thread. Nothing else ends them at exit,
+  // and destroying a joinable std::thread during static destruction is
+  // std::terminate — so close them here, while the capture pipeline they depend
+  // on is still alive to be stopped cleanly.
+  webrtc_stream::shutdown_all_sessions();
+
 #ifdef WIN32
   // Join the hidden shutdown-notification window while the deadline watchdog
   // is still armed. The guard remains for early-return paths only.

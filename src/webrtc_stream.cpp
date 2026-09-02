@@ -1477,7 +1477,11 @@ namespace webrtc_stream {
 
     // What a session is allowed to inject, and where its pads land on the host.
     struct SessionInputGrant {
-      crypto::PERM permission = crypto::PERM::_all_inputs;
+      /// Nothing, until a live session says otherwise. A message whose session is
+      /// not in the registry — it is being torn down, or never existed — must be
+      /// dropped, not treated as the owner's. The teardown window is real: the
+      /// session leaves the map before its data channel context is deactivated.
+      crypto::PERM permission = crypto::PERM::_no;
     };
 
     // Defined below, after the session registry. The input handlers are
@@ -1491,6 +1495,7 @@ namespace webrtc_stream {
       bool *created = nullptr
     );
     void forget_gamepad_slot(std::string_view session_id, int local_index);
+    std::uint16_t session_gamepad_mask(std::string_view session_id);
 
     void handle_input_message(std::string_view payload, std::string_view session_id = {}) {
       if (payload.empty()) {
@@ -1599,19 +1604,16 @@ namespace webrtc_stream {
       }
       if (type == "gamepad_state") {
         const int raw_controller = message.value("id", -1);
-        const int controller = resolve_gamepad_slot(session_id, raw_controller, true);
+        // A pad first seen through a state packet, with no gamepad_connect before it,
+        // still needs an arrival on the host. resolve_gamepad_slot claims the slot bit
+        // as it allocates, so testing that bit afterwards — as this used to — could
+        // never say "new"; the allocation itself is what says it.
+        bool created = false;
+        const int controller = resolve_gamepad_slot(session_id, raw_controller, true, &created);
         if (controller < 0) {
           return;
         }
-        bool should_send_arrival = false;
-        {
-          std::lock_guard lg {gamepad_mutex};
-          if (!webrtc_gamepads.test(controller)) {
-            webrtc_gamepads.set(controller);
-            should_send_arrival = true;
-          }
-        }
-        if (should_send_arrival) {
+        if (created) {
           const uint8_t controller_type = parse_gamepad_type(message);
           const auto capabilities = static_cast<uint16_t>(message.value("capabilities", 0));
           const auto supported_buttons = static_cast<uint32_t>(message.value("supportedButtons", 0));
@@ -1621,7 +1623,13 @@ namespace webrtc_stream {
             input_permission
           );
         }
-        const auto active_mask = static_cast<uint16_t>(message.value("activeMask", 0));
+        // The browser's activeMask is over ITS pad indices. The host tests the bit for
+        // the global slot this pad was given — input.cpp allocates when it is set and
+        // frees when it is clear — so passing the browser's mask through meant a pad on
+        // any slot other than its local index was freed by its own first state packet,
+        // and every packet after that was dropped as "not allocated". Rebuilt here from
+        // the slots this session actually holds.
+        const auto active_mask = session_gamepad_mask(session_id);
         const auto buttons = static_cast<uint32_t>(message.value("buttons", 0));
         const auto clamp_u8 = [](int value) -> uint8_t {
           return static_cast<uint8_t>(std::clamp(value, 0, 255));
@@ -1662,7 +1670,9 @@ namespace webrtc_stream {
           return;
         }
         forget_gamepad_slot(session_id, raw_controller);
-        const auto active_mask = static_cast<uint16_t>(message.value("activeMask", 0));
+        // Rebuilt after the slot was forgotten, so this pad's bit is clear and the host
+        // frees it, while the session's other pads stay marked present.
+        const auto active_mask = session_gamepad_mask(session_id);
         input::passthrough(
           input_ctx,
           make_gamepad_state_packet(controller, active_mask, 0, 0, 0, 0, 0, 0, 0),
@@ -1896,9 +1906,23 @@ namespace webrtc_stream {
     std::mutex session_mutex;
     std::unordered_map<std::string, Session> sessions;
 
-    /// Lowest global slot nobody is using, or -1 when all 16 are taken.
-    /// Caller must hold gamepad_mutex.
-    int claim_free_gamepad_slot_locked() {
+    /// Every channel token an encoder may still stamp on a packet: those of live
+    /// sessions, and of sessions closing whose encoder thread has not yet been
+    /// joined. video.cpp asks submit_video_packet whether a packet is ours before
+    /// deciding where it goes, and the answer has to stay "yes" for the whole time
+    /// the encoder can produce one — which outlives the session's map entry.
+    std::mutex encoder_token_mutex;
+    std::unordered_set<const void *> encoder_tokens;
+
+    /// The slot the owner asked for, if it is free, else the lowest free one; -1
+    /// when all 16 are taken. The preference is the invite's gamepad_base_slot plus
+    /// the pad's own index, so "player two" lands on pad two whenever it can, and
+    /// still lands somewhere when it cannot. Caller must hold gamepad_mutex.
+    int claim_free_gamepad_slot_locked(int preferred = -1) {
+      if (preferred >= 0 && preferred < static_cast<int>(webrtc_gamepads.size()) && !webrtc_gamepads.test(preferred)) {
+        webrtc_gamepads.set(preferred);
+        return preferred;
+      }
       for (std::size_t slot = 0; slot < webrtc_gamepads.size(); ++slot) {
         if (!webrtc_gamepads.test(slot)) {
           webrtc_gamepads.set(slot);
@@ -1934,7 +1958,7 @@ namespace webrtc_stream {
       int slot = -1;
       {
         std::lock_guard gp {gamepad_mutex};
-        slot = claim_free_gamepad_slot_locked();
+        slot = claim_free_gamepad_slot_locked(it->second.gamepad_base_slot + local_index);
       }
       if (slot < 0) {
         BOOST_LOG(warning) << "WebRTC: no free gamepad slot for session " << session_id;
@@ -1972,6 +1996,27 @@ namespace webrtc_stream {
     }
 
 
+
+    /// The host-side view of this session's pads: one bit per global slot it holds.
+    /// This is what input.cpp's activeGamepadMask means, and what the browser's own
+    /// mask — over its local indices — must be translated into.
+    std::uint16_t session_gamepad_mask(std::string_view session_id) {
+      if (session_id.empty()) {
+        return 0;
+      }
+      std::lock_guard lg {session_mutex};
+      const auto it = sessions.find(std::string {session_id});
+      if (it == sessions.end()) {
+        return 0;
+      }
+      std::uint16_t mask = 0;
+      for (const auto &[local_index, slot] : it->second.gamepad_slots) {
+        if (slot >= 0 && slot < 16) {
+          mask |= static_cast<std::uint16_t>(1u << slot);
+        }
+      }
+      return mask;
+    }
 
     SessionInputGrant session_input_grant(std::string_view session_id) {
       SessionInputGrant grant;
@@ -2030,6 +2075,10 @@ namespace webrtc_stream {
         return;
       }
       session.channel_token = std::make_shared<int>(0);
+      {
+        std::lock_guard lg {encoder_token_mutex};
+        encoder_tokens.insert(session.channel_token.get());
+      }
       session.encoder_mail = std::make_shared<safe::mail_raw_t>();
 
       auto mail = session.encoder_mail;
@@ -3853,7 +3902,7 @@ namespace webrtc_stream {
       // Same grant as the JSON path. Without this a gamepad-only guest
       // could still move the host mouse by sending binary input, which
       // would defeat the permission entirely.
-      const auto input_permission = ctx ? session_input_grant(ctx->id).permission : crypto::PERM::_all_inputs;
+      const auto input_permission = ctx ? session_input_grant(ctx->id).permission : crypto::PERM::_no;
 
       const auto type = buffer[0];
       if (type != kInputBinaryMouseMove || length < kInputBinaryMouseMoveSize) {
@@ -3990,6 +4039,17 @@ namespace webrtc_stream {
           }
           const auto last = ctx->last_activity_ms.load(std::memory_order_acquire);
           if (last == 0) {
+            // The context exists from the offer onwards — before ICE has connected and
+            // before any channel has opened — so "no message yet" also describes a
+            // peer whose connection never came up, with an encoder running for nobody.
+            // Bound that on setup time, exactly like the no-context case above.
+            const auto setup_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        now - entry.second.created_at
+            )
+                                        .count();
+            if (setup_age_ms > setup_timeout_ms) {
+              unestablished.emplace_back(entry.first, setup_age_ms);
+            }
             continue;
           }
           const auto age_ms = now_ms - last;
@@ -5967,6 +6027,10 @@ namespace webrtc_stream {
     // Owned outside the WebRTC ifdef: the encoder exists whenever the session does.
     std::shared_ptr<safe::mail_raw_t> encoder_mail;
     std::thread encoder_thread;
+    // Kept alive until the encoder thread is joined: the thread stamps this address
+    // on every packet it produces, and a token freed at map erase could be handed to
+    // a new session's make_shared while the old encoder was still writing it.
+    std::shared_ptr<int> channel_token;
     std::bitset<16> claimed_gamepad_slots;
 
 #ifdef SUNSHINE_ENABLE_WEBRTC
@@ -6012,6 +6076,7 @@ namespace webrtc_stream {
 #endif
         encoder_mail = std::move(it->second.encoder_mail);
         encoder_thread = std::move(it->second.encoder_thread);
+        channel_token = std::move(it->second.channel_token);
         claimed_gamepad_slots = it->second.claimed_gamepad_slots;
         sessions.erase(it);
         removed = true;
@@ -6030,6 +6095,27 @@ namespace webrtc_stream {
     // arrival packet was dropped as a duplicate — their pad was never allocated and every
     // input they sent was discarded.
     if (claimed_gamepad_slots.any()) {
+      // Tell the host the pads are gone. Releasing the slot bits below only frees them
+      // for the NEXT session; the virtual controllers themselves stay plugged in until
+      // a state packet with the slot's bit clear reaches input.cpp. Without this a
+      // guest who closed the tab left a ghost pad the game still saw, and the next
+      // guest given that slot was refused as "already allocated".
+      std::shared_ptr<input::input_t> input_ctx;
+      {
+        std::lock_guard lg {input_mutex};
+        input_ctx = input_context;
+      }
+      if (input_ctx) {
+        for (std::size_t slot = 0; slot < claimed_gamepad_slots.size(); ++slot) {
+          if (claimed_gamepad_slots.test(slot)) {
+            input::passthrough(
+              input_ctx,
+              make_gamepad_state_packet(static_cast<int>(slot), 0, 0, 0, 0, 0, 0, 0, 0),
+              crypto::PERM::input_controller
+            );
+          }
+        }
+      }
       std::lock_guard lg {gamepad_mutex};
       for (std::size_t slot = 0; slot < claimed_gamepad_slots.size(); ++slot) {
         if (claimed_gamepad_slots.test(slot)) {
@@ -6040,20 +6126,12 @@ namespace webrtc_stream {
                        << " for session " << id;
     }
 
-    // Stop this peer's encoder. Joined only after the session lock is released: the
-    // encoder thread delivers through submit_video_packet, which takes that same lock,
-    // so joining while holding it would deadlock.
-    if (encoder_mail) {
-      if (auto shutdown_event = encoder_mail->event<bool>(mail::shutdown)) {
-        shutdown_event->raise(true);
-      }
-    }
-    if (encoder_thread.joinable()) {
-      encoder_thread.join();
-    }
 #ifdef SUNSHINE_ENABLE_WEBRTC
-    // These callbacks retain raw context pointers in libwebrtc. Deactivate
-    // them even if peer construction failed partway through track setup.
+    // These callbacks retain raw context pointers in libwebrtc. Deactivate them
+    // before anything that can block — the encoder join below can take hundreds of
+    // milliseconds — so no input, ICE or rate callback runs for a session that has
+    // already left the registry. Even if peer construction failed partway through
+    // track setup, deactivating is harmless.
     if (ice_context) {
       ice_context->active.store(false, std::memory_order_release);
     }
@@ -6066,6 +6144,25 @@ namespace webrtc_stream {
     if (rate_context) {
       rate_context->active.store(false, std::memory_order_release);
     }
+#endif
+
+    // Stop this peer's encoder. Joined only after the session lock is released: the
+    // encoder thread delivers through submit_video_packet, which takes that same lock,
+    // so joining while holding it would deadlock.
+    if (encoder_mail) {
+      if (auto shutdown_event = encoder_mail->event<bool>(mail::shutdown)) {
+        shutdown_event->raise(true);
+      }
+    }
+    if (encoder_thread.joinable()) {
+      encoder_thread.join();
+    }
+    // Only now can no packet carry this token, so only now may it stop being ours.
+    if (channel_token) {
+      std::lock_guard lg {encoder_token_mutex};
+      encoder_tokens.erase(channel_token.get());
+    }
+#ifdef SUNSHINE_ENABLE_WEBRTC
     if (encoded_video_source) {
       // Quiesce callbacks before releasing their raw session contexts. The
       // rate bridge waits for SetRates() invocations already in progress.
@@ -6168,16 +6265,30 @@ namespace webrtc_stream {
     stop_webrtc_capture_if_idle();
   }
 
-  void submit_video_packet(video::packet_raw_t &packet) {
-    if (!has_active_sessions()) {
-      return;
+  bool submit_video_packet(video::packet_raw_t &packet) {
+    // Whose packet is this? A browser peer's encoder stamps its packets with a token
+    // registered in encoder_tokens; a Moonlight encoder stamps its session_t. The
+    // answer decides whether video.cpp raises the packet into the Moonlight broadcast
+    // queue, whose consumer casts channel_data to a session_t* and dereferences it —
+    // so a browser packet let through there is memory corruption the moment a native
+    // client streams alongside a browser one. Packets used to arrive with a null
+    // channel, which that consumer skips; per-session encoders ended that.
+    if (packet.channel_data == nullptr) {
+      return false;
+    }
+    {
+      std::lock_guard lg {encoder_token_mutex};
+      if (!encoder_tokens.contains(packet.channel_data)) {
+        return false;
+      }
     }
 
-    // Packets used to arrive with a null channel and be broadcast to every peer, because
-    // one encoder served them all. Each peer now owns an encoder and video.cpp stamps that
-    // peer's token on its packets, so this delivers to exactly one session.
-    if (!webrtc_capture.active.load(std::memory_order_acquire) || packet.channel_data == nullptr) {
-      return;
+    // Ours from here on. Whatever happens below, the caller must not raise it.
+    if (!has_active_sessions()) {
+      return true;
+    }
+    if (!webrtc_capture.active.load(std::memory_order_acquire)) {
+      return true;
     }
 
     auto payload = copy_video_payload(packet);
@@ -6247,6 +6358,7 @@ namespace webrtc_stream {
     webrtc_media_has_work.store(true, std::memory_order_release);
     webrtc_media_cv.notify_one();
 #endif
+    return true;
   }
 
   void submit_audio_packet(const audio::buffer_t &packet) {

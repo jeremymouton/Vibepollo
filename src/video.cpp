@@ -3122,11 +3122,14 @@ namespace video {
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
-      if (webrtc_stream::has_active_sessions()) {
-        webrtc_stream::submit_video_packet(*packet);
+      // A browser peer's encoder consumes its own packets here, and they must never
+      // reach the Moonlight broadcast queue: its consumer treats channel_data as a
+      // session_t*, and a browser packet there is memory corruption whenever a native
+      // client streams alongside. submit_video_packet says whose the packet is.
+      if (!webrtc_stream::submit_video_packet(*packet)) {
+        packet->packet_enqueue_timestamp = std::chrono::steady_clock::now();
+        packets->raise(std::move(packet));
       }
-      packet->packet_enqueue_timestamp = std::chrono::steady_clock::now();
-      packets->raise(std::move(packet));
     }
 
     return 0;
@@ -3157,11 +3160,14 @@ namespace video {
     packet->frame_timestamp = frame_timestamp;
     packet->capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
     packet->host_processing_timestamp = host_processing_timestamp;
-    if (webrtc_stream::has_active_sessions()) {
-      webrtc_stream::submit_video_packet(*packet);
+    // A browser peer's encoder consumes its own packets here, and they must never
+    // reach the Moonlight broadcast queue: its consumer treats channel_data as a
+    // session_t*, and a browser packet there is memory corruption whenever a native
+    // client streams alongside. submit_video_packet says whose the packet is.
+    if (!webrtc_stream::submit_video_packet(*packet)) {
+      packet->packet_enqueue_timestamp = std::chrono::steady_clock::now();
+      packets->raise(std::move(packet));
     }
-    packet->packet_enqueue_timestamp = std::chrono::steady_clock::now();
-    packets->raise(std::move(packet));
 
     return 0;
   }
@@ -3195,11 +3201,14 @@ namespace video {
       packet->frame_timestamp = ts.frame_timestamp;
       packet->capture_timestamp = ts.capture_timestamp ? ts.capture_timestamp : ts.frame_timestamp;
       packet->host_processing_timestamp = ts.host_processing_timestamp;
-      if (webrtc_stream::has_active_sessions()) {
-        webrtc_stream::submit_video_packet(*packet);
+      // A browser peer's encoder consumes its own packets here, and they must never
+      // reach the Moonlight broadcast queue: its consumer treats channel_data as a
+      // session_t*, and a browser packet there is memory corruption whenever a native
+      // client streams alongside. submit_video_packet says whose the packet is.
+      if (!webrtc_stream::submit_video_packet(*packet)) {
+        packet->packet_enqueue_timestamp = std::chrono::steady_clock::now();
+        packets->raise(std::move(packet));
       }
-      packet->packet_enqueue_timestamp = std::chrono::steady_clock::now();
-      packets->raise(std::move(packet));
     }
   }
 
