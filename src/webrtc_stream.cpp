@@ -2214,10 +2214,12 @@ namespace webrtc_stream {
     }
 #endif
 
-    std::optional<std::string> build_gamepad_feedback_payload(const platf::gamepad_feedback_msg_t &msg) {
+    /// The feedback event as the browser expects it, minus which pad it is for.
+    /// The host names the pad by its GLOBAL slot; a browser knows only its own
+    /// indices, so send_gamepad_feedback() fills in `id` per session.
+    std::optional<nlohmann::json> build_gamepad_feedback_payload(const platf::gamepad_feedback_msg_t &msg) {
       nlohmann::json payload;
       payload["type"] = "gamepad_feedback";
-      payload["id"] = msg.id;
       switch (msg.type) {
         case platf::gamepad_feedback_e::rumble:
           payload["event"] = "rumble";
@@ -2237,25 +2239,45 @@ namespace webrtc_stream {
         default:
           return std::nullopt;
       }
-      return payload.dump();
+      return payload;
     }
 
     #ifdef SUNSHINE_ENABLE_WEBRTC
-    void send_gamepad_feedback_payload(const std::string &payload) {
+    /// Deliver feedback for the pad on global slot `slot` to the one session whose
+    /// pad that is, named by the index that session's browser gave it.
+    ///
+    /// This used to broadcast the host's slot number to every session as `id`, and
+    /// every browser matched it against its own local pad list. That is right only
+    /// where slot and index coincide — the owner's first pad — and wrong for
+    /// everyone else: a guest whose single pad sits on slot 1 felt nothing, while
+    /// the owner's second pad, if they had one, shook in its place. A slot has at
+    /// most one holder (claim_free_gamepad_slot_locked hands out only free bits),
+    /// so the first match is the only one.
+    void send_gamepad_feedback(int slot, nlohmann::json payload) {
       std::lock_guard lg {session_mutex};
       for (auto &[_, session] : sessions) {
-        if (!session.input_channel) {
+        int local_index = -1;
+        for (const auto &[index, held] : session.gamepad_slots) {
+          if (held == slot) {
+            local_index = index;
+            break;
+          }
+        }
+        if (local_index < 0) {
           continue;
         }
-        if (lwrtc_data_channel_state(session.input_channel) != LWRTC_DATA_CHANNEL_OPEN) {
-          continue;
+        if (!session.input_channel || lwrtc_data_channel_state(session.input_channel) != LWRTC_DATA_CHANNEL_OPEN) {
+          return;
         }
+        payload["id"] = local_index;
+        const std::string text = payload.dump();
         lwrtc_data_channel_send(
           session.input_channel,
-          reinterpret_cast<const uint8_t *>(payload.data()),
-          payload.size(),
+          reinterpret_cast<const uint8_t *>(text.data()),
+          text.size(),
           0
         );
+        return;
       }
     }
 #endif
@@ -2272,7 +2294,7 @@ namespace webrtc_stream {
         if (!payload) {
           continue;
         }
-        send_gamepad_feedback_payload(*payload);
+        send_gamepad_feedback(static_cast<int>(next->id), std::move(*payload));
       }
     }
 #endif
