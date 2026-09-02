@@ -21,7 +21,7 @@ import {
   attachInputCapture,
   requestKeyboardLock,
 } from '@/utils/webrtc/input';
-import { WebRtcClient } from '@/utils/webrtc/client';
+import { WebRtcClient, offerSupportsEncoding } from '@/utils/webrtc/client';
 import { attachVideoUpscaler } from '@/utils/webrtc/upscaler';
 import { fetchIceServers, probeConnectivity } from '@/utils/webrtc/connectivity';
 import type { ConnectivityReport } from '@/utils/webrtc/connectivity';
@@ -36,9 +36,13 @@ import type { EncodingType, StreamConfig, WebRtcStatsSnapshot } from '@/types/we
 /// that, so unlike 'error' it offers no retry.
 type Phase = 'ready' | 'connecting' | 'playing' | 'ended' | 'error' | 'expired';
 
-/// What this browser can actually decode. Offering AV1 to a device that cannot
+const ALL_CODECS: EncodingType[] = ['h264', 'hevc', 'av1'];
+
+/// What this browser claims it can decode. Offering AV1 to a device that cannot
 /// decode it produces a black screen rather than an error, so the list is built
-/// from the browser's own answer instead of assumed.
+/// from the browser's own answer instead of assumed. This is the synchronous first
+/// guess; settleCodecs() narrows it once the browser's real offer and the host's
+/// encoder have both answered.
 function decodableCodecs(): EncodingType[] {
   const wanted: Array<[EncodingType, string[]]> = [
     ['h264', ['video/h264']],
@@ -59,7 +63,50 @@ function decodableCodecs(): EncodingType[] {
   return found.length ? found : ['h264'];
 }
 
-const codecs = decodableCodecs();
+/// What this browser will actually put in an offer. getCapabilities() is a claim —
+/// client.ts warns it can be a false positive, and WebKit has returned null from it
+/// until a peer connection exists — whereas a throwaway receive-only offer is the
+/// very list the real connection negotiates from. Empty when the probe cannot run.
+async function offeredCodecs(): Promise<EncodingType[]> {
+  if (typeof RTCPeerConnection === 'undefined') return [];
+  let probe: RTCPeerConnection;
+  try {
+    probe = new RTCPeerConnection();
+  } catch {
+    return [];
+  }
+  try {
+    probe.addTransceiver('video', { direction: 'recvonly' });
+    const sdp = (await probe.createOffer()).sdp ?? '';
+    return ALL_CODECS.filter((c) => offerSupportsEncoding(sdp, c));
+  } catch {
+    return [];
+  } finally {
+    probe.close();
+  }
+}
+
+/// What the host's encoder can produce. Empty when it will not say: an adapter
+/// that has not finished its encoder probe, or a host without the endpoint. The
+/// guest cannot intersect with what they cannot see, so an empty answer leaves
+/// the browser's list alone rather than emptying it. (A host that IS ready always
+/// lists H.264, so empty never means "nothing".)
+async function hostCodecs(): Promise<EncodingType[]> {
+  const response = await fetch('/api/webrtc/capabilities', {
+    credentials: 'include',
+    headers: { Accept: 'application/json' },
+  });
+  if (!response.ok) return [];
+  const payload = (await response.json()) as {
+    enabled?: boolean;
+    availability?: { state?: string };
+    codecs?: Partial<Record<EncodingType, { supported?: boolean }>>;
+  };
+  if (payload.enabled !== true || payload.availability?.state !== 'ready') return [];
+  return ALL_CODECS.filter((c) => payload.codecs?.[c]?.supported === true);
+}
+
+const codecs = ref<EncodingType[]>(decodableCodecs());
 
 interface Quality {
   codec: EncodingType;
@@ -70,37 +117,71 @@ interface Quality {
 
 const QUALITY_KEY = 'vibepollo.guest.quality';
 
-/// Best the browser can decode, preferring newer codecs — they hold up far better
-/// at the bitrates a guest on mobile data actually gets.
-function defaultQuality(): Quality {
-  const best: EncodingType = codecs.includes('av1')
-    ? 'av1'
-    : codecs.includes('hevc')
-      ? 'hevc'
-      : 'h264';
-  return { codec: best, maxHeight: 1080, fps: 60, bitrateKbps: 0 };
+/// Newest first — newer codecs hold up far better at the bitrates a guest on
+/// mobile data actually gets.
+function bestCodec(list: EncodingType[]): EncodingType {
+  return list.includes('av1') ? 'av1' : list.includes('hevc') ? 'hevc' : 'h264';
 }
 
-function loadQuality(): Quality {
-  const fallback = defaultQuality();
+function defaultQuality(): Quality {
+  return { codec: bestCodec(codecs.value), maxHeight: 1080, fps: 60, bitrateKbps: 0 };
+}
+
+function readSavedQuality(): Partial<Quality> {
   try {
     const raw = window.localStorage.getItem(QUALITY_KEY);
-    if (!raw) return fallback;
-    const saved = JSON.parse(raw) as Partial<Quality>;
-    return {
-      // A codec saved on another device, or one this browser has since lost, must
-      // not strand the guest on a black screen.
-      codec: saved.codec && codecs.includes(saved.codec) ? saved.codec : fallback.codec,
-      maxHeight: Number(saved.maxHeight) || fallback.maxHeight,
-      fps: Number(saved.fps) || fallback.fps,
-      bitrateKbps: Number(saved.bitrateKbps) || 0,
-    };
+    return raw ? (JSON.parse(raw) as Partial<Quality>) : {};
   } catch {
-    return fallback;
+    return {};
   }
 }
 
+const saved = readSavedQuality();
+
+/// The codec a returning guest chose last time, if any. Kept apart from the live
+/// choice so settleCodecs() can tell a preference from a placeholder default.
+const remembered: { codec?: EncodingType } =
+  saved.codec && ALL_CODECS.includes(saved.codec) ? { codec: saved.codec } : {};
+
+function loadQuality(): Quality {
+  const fallback = defaultQuality();
+  return {
+    // A codec saved on another device, or one this browser has since lost, must
+    // not strand the guest on a black screen.
+    codec:
+      remembered.codec && codecs.value.includes(remembered.codec)
+        ? remembered.codec
+        : fallback.codec,
+    maxHeight: Number(saved.maxHeight) || fallback.maxHeight,
+    fps: Number(saved.fps) || fallback.fps,
+    bitrateKbps: Number(saved.bitrateKbps) || 0,
+  };
+}
+
 const quality = ref<Quality>(loadQuality());
+
+/// Narrow the codec list to what BOTH sides can do, and re-pick the default from
+/// it. The default used to be the newest codec the browser claimed, with no word
+/// from the host: a guest whose phone decodes AV1 got AV1 whether or not the host
+/// could encode it, and learned otherwise from a black screen. A saved choice is
+/// kept when it is still possible; anything else falls to the best remaining.
+/// Settles either way, so a host that will not answer cannot hold the guest up.
+async function settleCodecs(): Promise<void> {
+  const [offered, host] = await Promise.all([
+    offeredCodecs().catch(() => null),
+    hostCodecs().catch(() => null),
+  ]);
+  let list = offered.length ? offered : codecs.value;
+  if (host.length) list = list.filter((c) => host.includes(c));
+  if (!list.length) list = ['h264'];
+  codecs.value = list;
+  quality.value.codec =
+    remembered.codec && list.includes(remembered.codec) ? remembered.codec : bestCodec(list);
+}
+
+/// Start waits on this, so the session is never asked for a codec the two sides
+/// have not agreed on — however fast the guest hits the button.
+const codecsSettled = settleCodecs();
 const showSettings = ref(false);
 
 const isTouch =
@@ -285,10 +366,13 @@ function streamConfig(): StreamConfig {
 }
 
 /// Remembers the choice before connecting, so a returning guest is not asked twice.
+/// Only once the codec is settled, or the placeholder default would be saved as if
+/// it had been chosen.
 async function startChosen(): Promise<void> {
-  saveQuality();
   phase.value = 'connecting';
   message.value = 'Connecting to the host…';
+  await codecsSettled;
+  saveQuality();
   await start();
 }
 
@@ -323,6 +407,7 @@ function wireInput(): void {
 
 async function start(): Promise<void> {
   try {
+    await codecsSettled;
     sessionId.value = await client.connect(streamConfig(), {
       onRemoteStream: (stream) => {
         if (!videoEl.value) return;
@@ -678,7 +763,9 @@ onBeforeUnmount(() => {
             {{ c === 'h264' ? 'H.264' : c === 'hevc' ? 'HEVC' : 'AV1' }}
           </option>
         </select>
-        <span class="text-white/50 text-xs">Only codecs this browser can decode are listed.</span>
+        <span class="text-white/50 text-xs"
+          >Only codecs this browser can decode and the host can encode are listed.</span
+        >
       </label>
       <label class="block">
         Resolution

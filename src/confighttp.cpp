@@ -4271,8 +4271,17 @@ namespace confighttp {
     send_response(response, output);
   }
 
+  /**
+   * @brief What the host can encode, and its limits. Guest-or-owner.
+   *
+   * A guest picks their codec before the session exists, and while this was
+   * owner-only the pick was whatever the browser claimed newest — AV1 first — with
+   * no way to learn the host could not encode it until the stream failed. Nothing
+   * here is secret: codec support, the HDR policy and the bitrate ceiling.
+   */
   void getWebRTCCapabilities(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
+    const auto guest = invite::guest::lookup(extract_guest_token_from_cookie(request->header));
+    if (!guest && !authenticate(response, request)) {
       return;
     }
 
@@ -6892,9 +6901,13 @@ namespace confighttp {
     register_api_route("^/api/host/stats$", "GET", getHostStats);
     register_api_route("^/api/host/info$", "GET", getHostInfo);
     register_api_route("^/api/rtsp/sessions$", "GET", listRTSPSessions);
-    register_blocking_api_route("^/api/webrtc/capabilities$", "GET", getWebRTCCapabilities);
-    // Self-authenticating: a redeemed guest reaches this before any owner login,
+    // Self-authenticating: a redeemed guest reaches these before any owner login,
     // the same way they reach createWebRTCSession.
+    register_blocking_api_route_self_authenticating(
+      "^/api/webrtc/capabilities$",
+      "GET",
+      getWebRTCCapabilities
+    );
     register_blocking_api_route_self_authenticating(
       "^/api/webrtc/ice-config$",
       "GET",

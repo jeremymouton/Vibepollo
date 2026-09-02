@@ -162,7 +162,7 @@ function getOfferedVideoCodecNames(sdp: string): Set<string> {
   return codecs;
 }
 
-function offerSupportsEncoding(sdp: string, encoding: string): boolean {
+export function offerSupportsEncoding(sdp: string, encoding: string): boolean {
   const offered = getOfferedVideoCodecNames(sdp);
   if (!offered.size) return false;
   const normalized = encoding.toLowerCase();
