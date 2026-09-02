@@ -31,7 +31,10 @@ import type { EncodingType, StreamConfig, WebRtcStatsSnapshot } from '@/types/we
 /// 'ready' exists so the guest picks before anything starts. A stream's encoder is
 /// fixed when the session is created, so a choice made afterwards costs a reconnect —
 /// and a guest on a phone or a poor line is exactly who most needs to choose first.
-type Phase = 'ready' | 'connecting' | 'playing' | 'ended' | 'error';
+/// 'expired' is the guest's cookie being gone — eight hours up, the invite revoked,
+/// or /play opened without coming through the link. Nothing on this page can fix
+/// that, so unlike 'error' it offers no retry.
+type Phase = 'ready' | 'connecting' | 'playing' | 'ended' | 'error' | 'expired';
 
 /// What this browser can actually decode. Offering AV1 to a device that cannot
 /// decode it produces a black screen rather than an error, so the list is built
@@ -102,7 +105,32 @@ const showSettings = ref(false);
 
 const isTouch =
   typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window);
-const showTouchPad = ref(isTouch);
+/// Shown by default only where touch is the ONLY way to point: a phone or a tablet
+/// held in the hands. A touch laptop or an iPad with a trackpad answers maxTouchPoints
+/// too, and there the pad covered the stage and swallowed every mouse event.
+const coarseOnly =
+  typeof window !== 'undefined' &&
+  typeof window.matchMedia === 'function' &&
+  window.matchMedia('(pointer: coarse) and (hover: none)').matches;
+const showTouchPad = ref(coarseOnly);
+
+/// A real controller makes the on-screen one redundant, and both being reported at
+/// once claims two host pads for one guest.
+function physicalPadPresent(): boolean {
+  try {
+    return Array.from(navigator.getGamepads?.() ?? []).some((pad) => pad?.connected);
+  } catch {
+    return false;
+  }
+}
+function onGamepadConnected(): void {
+  showTouchPad.value = false;
+}
+
+/// Element fullscreen does not exist on iPhone Safari, so the button would be a
+/// silent no-op there.
+const fullscreenAvailable =
+  typeof document !== 'undefined' && Boolean(document.fullscreenEnabled);
 
 /// Shown on request. Without it a guest can only report "it was bad", which says
 /// nothing about whether the link was slow, lossy, or the host was struggling —
@@ -311,14 +339,23 @@ async function start(): Promise<void> {
           wireInput();
           stopTelemetry();
           telemetryTimer = [setInterval(() => void reportTelemetry(), 10_000)];
+        } else if (state === 'disconnected') {
+          // Media has stopped but the peer may still come back; the client waits
+          // five seconds before giving up. Say so, rather than leaving a frozen
+          // frame that looks like the game hung.
+          phase.value = 'connecting';
+          message.value = 'Connection interrupted. Trying to recover…';
+          stopTelemetry();
         } else if (state === 'failed' || state === 'closed') {
           phase.value = 'ended';
           message.value = 'The connection to the host ended.';
+          stopTelemetry();
         }
       },
       onError: (error) => {
         phase.value = 'error';
         message.value = error.message || 'Could not start the stream.';
+        stopTelemetry();
       },
       onWarning: (warning) => console.warn(warning),
       onStats: (snapshot) => {
@@ -330,6 +367,15 @@ async function start(): Promise<void> {
       onInputMessage: (message) => applyGamepadFeedback(message),
     });
   } catch (err) {
+    stopTelemetry();
+    const status = (err as { status?: number } | null)?.status;
+    if (status === 401 || status === 403) {
+      // The cookie is gone or refused. The raw "HTTP 401" text told the guest
+      // nothing, and the retry it came with could only ever get the same answer.
+      phase.value = 'expired';
+      message.value = 'Your invite session has ended. Open your invite link again.';
+      return;
+    }
     phase.value = 'error';
     message.value =
       err instanceof Error ? err.message : 'Could not start the stream. Ask for a fresh link.';
@@ -365,6 +411,7 @@ async function goFullscreen(): Promise<void> {
 }
 
 async function leave(): Promise<void> {
+  stopTelemetry();
   detachInput();
   detachInput = noop;
   await client.disconnect().catch(() => undefined);
@@ -410,21 +457,44 @@ async function reportTelemetry(): Promise<void> {
         decode: s.videoDecodeMs ?? 0,
         dropped: s.videoFramesDropped ?? 0,
       },
-      { validateStatus: () => true },
+      // A guest is never "authenticated" in the auth store's sense, and without this
+      // flag the request interceptor cancelled the call before it left the browser.
+      // Nothing ever reached the host log.
+      { validateStatus: () => true, __allowUnauthenticated: true } as Record<string, unknown>,
     );
   } catch {
     /* telemetry must never be the reason a stream stops */
   }
 }
 
+/// The connectivity heartbeat reloads the page after a network blip unless a
+/// stream is marked active. A reload here is the end of the game.
+watch(phase, (value) => {
+  (window as Window & { __sunshine_webrtc_active?: boolean }).__sunshine_webrtc_active =
+    value === 'playing';
+});
+
+/// onBeforeUnmount runs on SPA navigation only, and a guest never navigates within
+/// the SPA — /join is a full page and so is Back. Reload, Back and closing the tab
+/// all arrive as pagehide, and each used to strand the session on the host until
+/// the silence reaper found it.
+function onPageHide(): void {
+  void client.disconnect({ keepalive: true }).catch(() => undefined);
+}
+
 onMounted(() => {
   message.value = '';
+  if (physicalPadPresent()) showTouchPad.value = false;
+  window.addEventListener('gamepadconnected', onGamepadConnected);
+  window.addEventListener('pagehide', onPageHide);
 });
 onBeforeUnmount(() => {
+  window.removeEventListener('gamepadconnected', onGamepadConnected);
+  window.removeEventListener('pagehide', onPageHide);
+  (window as Window & { __sunshine_webrtc_active?: boolean }).__sunshine_webrtc_active = false;
   stopTelemetry();
   detachInput();
   detachUpscaler();
-  // keepalive so a reload does not strand the session on the host
   void client.disconnect({ keepalive: true }).catch(() => undefined);
 });
 </script>
@@ -536,9 +606,14 @@ onBeforeUnmount(() => {
 
     <TouchGamepad v-if="phase === 'playing' && showTouchPad" />
 
+    <!-- data-chrome: these are the page's controls, not game input. The capture
+         layer leaves pointers on them alone, so a click lands on the button instead
+         of being captured by the stage and forwarded to the host as a mouse press.
+         Half-opaque at rest rather than a quarter: a phone has no hover to reveal it. -->
     <div
       v-if="phase === 'playing'"
-      class="absolute top-3 right-3 flex gap-2 opacity-25 hover:opacity-100 transition"
+      class="absolute top-3 right-3 flex gap-2 opacity-50 hover:opacity-100 focus-within:opacity-100 transition"
+      data-chrome
     >
       <button
         v-if="isTouch"
@@ -559,7 +634,11 @@ onBeforeUnmount(() => {
       >
         Quality
       </button>
-      <button class="rounded px-3 py-1.5 text-sm bg-black/60 text-white" @click="goFullscreen">
+      <button
+        v-if="fullscreenAvailable"
+        class="rounded px-3 py-1.5 text-sm bg-black/60 text-white"
+        @click="goFullscreen"
+      >
         Fullscreen
       </button>
       <button class="rounded px-3 py-1.5 text-sm bg-black/60 text-white" @click="leave">
@@ -570,6 +649,7 @@ onBeforeUnmount(() => {
     <div
       v-if="showStats && phase === 'playing'"
       class="absolute top-3 left-3 rounded-lg bg-black/80 px-3 py-2 text-xs text-white/90 font-mono leading-5"
+      data-chrome
     >
       <div>path {{ pathKind }} {{ stats.candidatePair?.protocol ?? '' }}</div>
       <div>rtt {{ Math.round(stats.roundTripTimeMs ?? 0) }} ms</div>
@@ -584,9 +664,12 @@ onBeforeUnmount(() => {
       <div>dropped {{ stats.videoFramesDropped ?? 0 }}</div>
     </div>
 
+    <!-- Gated on playing as well: it sits later in the DOM than the ended/error
+         overlay and would otherwise render on top of "You have left the session." -->
     <div
-      v-if="showSettings"
+      v-if="showSettings && phase === 'playing'"
       class="absolute top-16 right-3 w-64 rounded-lg bg-black/85 p-4 text-sm text-white space-y-3"
+      data-chrome
     >
       <label class="block">
         Codec

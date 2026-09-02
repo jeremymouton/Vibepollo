@@ -65,7 +65,9 @@ export const useConnectivityStore = defineStore('connectivity', () => {
   function shouldAvoidAutoReload(): boolean {
     try {
       const path = window.location?.pathname ?? '';
-      if (path.startsWith('/webrtc')) return true;
+      // Both streaming pages. A reload here is not a refresh, it is the end of the
+      // game — and the guest page cannot even be reopened without the invite link.
+      if (path.startsWith('/webrtc') || path.startsWith('/play')) return true;
       if ((window as any).__sunshine_webrtc_active) return true;
     } catch {
       /* ignore */

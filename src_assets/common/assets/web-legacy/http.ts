@@ -50,7 +50,9 @@ function clearCsrfToken(): void {
   csrfTokenPromise = null;
 }
 
-async function getCsrfToken(forceRefresh = false): Promise<string> {
+/// Exported for the one request that cannot go through this axios instance: the
+/// keepalive DELETE sent as a page unloads, which must be a bare fetch.
+export async function getCsrfToken(forceRefresh = false): Promise<string> {
   if (!forceRefresh && csrfToken) return csrfToken;
   if (!forceRefresh && csrfTokenPromise) return csrfTokenPromise;
 

@@ -400,6 +400,13 @@ export class WebRtcClient {
   private pendingLocalCandidatesTimer?: number;
   private autoDisconnectTimer?: number;
   private disconnecting = false;
+  /// The in-flight disconnect, so a second caller waits for it instead of returning
+  /// at once and racing its own connect against the first one's teardown.
+  private disconnectPromise: Promise<void> | undefined;
+  /// The callbacks of the current connection, kept so the client can tell the page
+  /// when it gives up on its own — the auto-disconnect after 'disconnected' closes
+  /// the peer, and a closed peer fires no state change of its own.
+  private callbacks: WebRtcClientCallbacks = {};
   private pendingInput: (string | ArrayBuffer)[] = [];
   private maxPendingInput = 256;
   private pingTimer?: number;
@@ -544,6 +551,7 @@ export class WebRtcClient {
     await this.disconnect();
     this.clearAutoDisconnectTimer();
     this.disconnecting = false;
+    this.callbacks = callbacks;
     const sessionConfig = config;
     const session = await this.api.createSession(sessionConfig);
     this.sessionId = session.sessionId;
@@ -736,6 +744,17 @@ export class WebRtcClient {
   }
 
   async disconnect(options: WebRtcDisconnectOptions = {}): Promise<void> {
+    // Returning at once while another disconnect was still awaiting endSession let a
+    // connect proceed and then have its new pc and sessionId wiped by the first
+    // disconnect's tail. Everyone waits for the one in flight instead.
+    if (this.disconnectPromise) return this.disconnectPromise;
+    this.disconnectPromise = this.disconnectNow(options).finally(() => {
+      this.disconnectPromise = undefined;
+    });
+    return this.disconnectPromise;
+  }
+
+  private async disconnectNow(options: WebRtcDisconnectOptions): Promise<void> {
     if (this.disconnecting) return;
     this.disconnecting = true;
     this.stopPing();
@@ -939,7 +958,11 @@ export class WebRtcClient {
     }
     this.autoDisconnectTimer = window.setTimeout(() => {
       this.autoDisconnectTimer = undefined;
-      void this.disconnect();
+      // This is the 'disconnected' path: the peer never recovered and is being
+      // given up on. pc.close() fires no connectionstatechange, so the page would
+      // otherwise be left on a frozen frame believing it is still connected.
+      const callbacks = this.callbacks;
+      void this.disconnect().then(() => callbacks.onConnectionState?.('closed'));
     }, delayMs);
   }
 

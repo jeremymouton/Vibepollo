@@ -1,4 +1,4 @@
-import { http } from '@/http';
+import { getCsrfToken, http } from '@/http';
 import {
   StreamConfig,
   WebRtcIceCandidate,
@@ -124,7 +124,11 @@ export class WebRtcHttpApi implements WebRtcApi {
     );
     if (r.status !== 200 || !r.data?.session?.id) {
       const detail = r.data ? JSON.stringify(r.data) : 'no response body';
-      throw new Error(`Failed to create WebRTC session (HTTP ${r.status}): ${detail}`);
+      // The status rides on the error so a page can tell "your session has ended"
+      // (401/403, the guest's cookie is gone) from a failure worth retrying.
+      const error = new Error(`Failed to create WebRTC session (HTTP ${r.status}): ${detail}`);
+      (error as Error & { status?: number }).status = r.status;
+      throw error;
     }
     return {
       sessionId: r.data.session.id,
@@ -287,12 +291,23 @@ export class WebRtcHttpApi implements WebRtcApi {
   async endSession(sessionId: string, options?: WebRtcSessionEndOptions): Promise<void> {
     if (options?.keepalive && typeof fetch === 'function') {
       try {
+        // A DELETE is a mutation, and the server's CSRF check does not know this
+        // one is special. Without the token it was refused with 400 on every
+        // deployment whose origin is not localhost, and the session it meant to end
+        // was left to the host's silence reaper instead.
+        let csrf = '';
+        try {
+          csrf = await getCsrfToken();
+        } catch {
+          /* send it anyway; the server will say no and the reaper still applies */
+        }
         await fetch(`/api/webrtc/sessions/${encodeURIComponent(sessionId)}`, {
           method: 'DELETE',
           keepalive: true,
           credentials: 'include',
           headers: {
             'X-Requested-With': 'XMLHttpRequest',
+            ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
           },
         });
         return;

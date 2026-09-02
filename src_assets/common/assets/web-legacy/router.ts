@@ -75,6 +75,9 @@ router.beforeEach(async (_to: RouteLocationNormalized) => {
   if (typeof window === 'undefined') return true;
   try {
     const auth = useAuthStore();
+    // A guest route needs no owner session, and init() would spend several round
+    // trips (status, a refresh that 401s, retries) establishing that there is none.
+    if (_to.meta?.['guest'] === true) return true;
     // Ensure auth store initialized before route components mount
     if (!auth.ready && typeof auth.init === 'function') {
       try {

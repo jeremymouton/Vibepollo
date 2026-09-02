@@ -169,7 +169,16 @@ const naiveOverrides = useNaiveThemeOverrides();
 
 const route = useRoute();
 /// Guest routes render bare — see the RouterView branch above.
-const isGuestRoute = computed(() => route.meta?.['guest'] === true);
+// Seeded from the URL as well as the route: meta is empty until the router has
+// resolved, and resolving waits on auth.init(), so for that window the admin
+// header (and the login modal behind it) would paint over a guest's page.
+const isGuestRoute = computed(
+  () =>
+    route.meta?.['guest'] === true ||
+    (route.matched.length === 0 &&
+      typeof window !== 'undefined' &&
+      window.location.pathname.startsWith('/play')),
+);
 const router = useRouter();
 
 // Use config metadata as a fallback for container sizing when route meta isn't set

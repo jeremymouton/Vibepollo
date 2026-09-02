@@ -820,6 +820,7 @@ export function attachInputCapture(
   };
 
   const onWheel = (event: WheelEvent) => {
+    if (onChrome(event)) return;
     event.preventDefault();
     const { x, y } = normalizePoint(event, element, video);
     const dx = normalizeWheelDelta(event.deltaX, event.deltaMode);
@@ -907,19 +908,34 @@ export function attachInputCapture(
     sendPayload(payload);
   };
 
-  const onMouseMove = (event: MouseEvent) => queueMove(event);
+  /// The page's own controls over the stage — a button bar, a stats overlay, a
+  /// settings panel — carry data-chrome, the same marker the on-screen pad uses for
+  /// its editor. A pointer on them is for the page, not the game. Capturing it here
+  /// retargeted the click at the stage, so the button under the cursor never received
+  /// it, and forwarded the press to the host as a mouse click on top of that.
+  const onChrome = (event: Event): boolean =>
+    event.target instanceof Element && event.target.closest('[data-chrome]') !== null;
+
+  const onMouseMove = (event: MouseEvent) => {
+    if (onChrome(event)) return;
+    queueMove(event);
+  };
   const onMouseDown = (event: MouseEvent) => {
+    if (onChrome(event)) return;
     element.focus();
     requestKeyboardLockForCapture();
     sendButton(event, 'mouse_down');
   };
-  const onMouseUp = (event: MouseEvent) => sendButton(event, 'mouse_up');
+  const onMouseUp = (event: MouseEvent) => {
+    if (onChrome(event)) return;
+    sendButton(event, 'mouse_up');
+  };
   const onPointerMove = (event: PointerEvent) => {
-    if (event.pointerType === 'touch') return;
+    if (event.pointerType === 'touch' || onChrome(event)) return;
     queueMove(event);
   };
   const onPointerDown = (event: PointerEvent) => {
-    if (event.pointerType === 'touch') return;
+    if (event.pointerType === 'touch' || onChrome(event)) return;
     element.focus();
     requestKeyboardLockForCapture();
     try {
@@ -930,7 +946,7 @@ export function attachInputCapture(
     sendButton(event, 'mouse_down');
   };
   const onPointerUp = (event: PointerEvent) => {
-    if (event.pointerType === 'touch') return;
+    if (event.pointerType === 'touch' || onChrome(event)) return;
     sendButton(event, 'mouse_up');
     try {
       element.releasePointerCapture(event.pointerId);
@@ -947,6 +963,7 @@ export function attachInputCapture(
     }
   };
   const onContextMenu = (event: MouseEvent) => {
+    if (onChrome(event)) return;
     event.preventDefault();
   };
   const onBlur = () => {
@@ -1174,12 +1191,16 @@ export function attachInputCapture(
     }
   };
 
+  // The mouse listeners are the fallback for a browser without pointer events, not
+  // for a caller that asked for gamepads only. Attaching them in that case forwarded
+  // every click twice — the page's own pointer path and this one — and, because the
+  // cleanup below chose by pointer support alone, they were never removed either.
   if (captureKeyboardAndPointer && supportsPointer) {
     element.addEventListener('pointermove', onPointerMove);
     element.addEventListener('pointerdown', onPointerDown);
     element.addEventListener('pointerup', onPointerUp);
     element.addEventListener('pointercancel', onPointerCancel);
-  } else {
+  } else if (captureKeyboardAndPointer) {
     element.addEventListener('mousemove', onMouseMove);
     element.addEventListener('mousedown', onMouseDown);
     element.addEventListener('mouseup', onMouseUp);
@@ -1203,12 +1224,12 @@ export function attachInputCapture(
   return () => {
     if (rafId) cancelAnimationFrame(rafId);
     if (gamepadRaf) cancelAnimationFrame(gamepadRaf);
-    if (supportsPointer) {
+    if (captureKeyboardAndPointer && supportsPointer) {
       element.removeEventListener('pointermove', onPointerMove);
       element.removeEventListener('pointerdown', onPointerDown);
       element.removeEventListener('pointerup', onPointerUp);
       element.removeEventListener('pointercancel', onPointerCancel);
-    } else {
+    } else if (captureKeyboardAndPointer) {
       element.removeEventListener('mousemove', onMouseMove);
       element.removeEventListener('mousedown', onMouseDown);
       element.removeEventListener('mouseup', onMouseUp);

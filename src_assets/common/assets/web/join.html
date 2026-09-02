@@ -345,21 +345,27 @@
       <p class="sub" id="subtitle">One moment.</p>
       <div class="grant hidden" id="grant"></div>
 
-      <form id="pin-form" class="hidden" autocomplete="off">
+      <!-- No pattern attribute: the browser's own validation bubble would refuse a
+           pasted "123 456" before the script gets to strip the space. one-time-code
+           lets a phone offer the PIN straight out of the message it arrived in. -->
+      <form id="pin-form" class="hidden">
         <label for="pin">Enter the PIN you were sent</label>
         <input
           id="pin"
           name="pin"
           type="text"
           inputmode="numeric"
-          maxlength="6"
-          pattern="[0-9]*"
+          maxlength="7"
+          autocomplete="one-time-code"
           aria-describedby="msg"
         />
         <button type="submit" id="submit">Join</button>
       </form>
+      <button type="button" class="link-back hidden" id="pin-back">Back to the other options</button>
 
-      <div class="choices" id="choices">
+      <!-- Hidden until the invite has been read: what is offered depends on what
+           the invite allows, and a link that allows only one way in skips this. -->
+      <div class="choices" id="choices" style="display: none">
         <button class="choice" id="choice-browser" type="button">
           <b>Play in this browser</b>
           <span>Nothing to install. A controller is recommended.</span>
@@ -369,12 +375,14 @@
           <b>Play in Moonlight</b>
           <span>Sharper picture and lower latency. Needs the free Moonlight app.</span>
         </button>
+      </div>
 
-        <!-- Checking the controller HERE rather than after joining: a pad that is
-             asleep, on the wrong mode, or claimed by another app looks exactly like
-             a broken stream once the video is up, and the guest has no way to tell
-             the difference. Better to find out before anyone is watching. -->
-        <div class="pad" id="pad-check">
+      <!-- Checking the controller HERE rather than after joining: a pad that is
+           asleep, on the wrong mode, or claimed by another app looks exactly like
+           a broken stream once the video is up, and the guest has no way to tell
+           the difference. Better to find out before anyone is watching. Sits
+           outside the choice list so it is there whether or not there is a choice. -->
+      <div class="pad hidden" id="pad-check">
           <div class="pad-name" id="pad-name">No controller detected</div>
           <div class="pad-hint" id="pad-hint">
             Connect a controller and press any button on it — browsers hide gamepads
@@ -437,7 +445,6 @@
 
           <div class="pad-buttons" id="pad-buttons"></div>
           <div class="pad-axes" id="pad-axes"></div>
-        </div>
       </div>
 
       <!-- Moonlight is a whole separate way in, with its own install and pairing
@@ -447,7 +454,7 @@
         <ol class="ml-steps">
           <li>Install Moonlight, if you have not already.</li>
           <li>Open it and choose <b>Add PC</b>, then enter <code id="pair-host">this host</code>.</li>
-          <li>Moonlight shows a four-digit PIN. Type it below to finish pairing.</li>
+          <li>Moonlight shows a four-digit PIN. Type it below, with the PIN you were sent, to finish pairing.</li>
         </ol>
 
         <a
@@ -465,15 +472,25 @@
           <a href="https://moonlight-stream.org/#downloads" target="_blank" rel="noopener noreferrer">Windows / Linux</a>
         </div>
 
+        <!-- Two PINs, proving two different things: the invite PIN that they were
+             invited at all, the Moonlight PIN that they are the client at the door. -->
         <form id="pair-form">
+          <label for="invite-pin">The PIN you were sent</label>
+          <input
+            id="invite-pin"
+            type="text"
+            inputmode="numeric"
+            maxlength="7"
+            autocomplete="one-time-code"
+            aria-describedby="msg"
+          />
+          <label for="moonlight-pin">The PIN Moonlight is showing</label>
           <input
             id="moonlight-pin"
             type="text"
             inputmode="numeric"
             maxlength="4"
-            pattern="[0-9]*"
             placeholder="PIN"
-            aria-label="PIN shown in Moonlight"
           />
           <button type="submit" id="pair-submit">Pair</button>
         </form>
@@ -488,20 +505,33 @@
       (function () {
         'use strict';
 
-        // The token is the last path segment. Read from the URL rather than
-        // templated into the page so this file stays a static asset.
-        const token = decodeURIComponent(
-          window.location.pathname.replace(/\/+$/, '').split('/').pop() || ''
-        );
+        // The token is the last path segment, read from the URL so this file stays a
+        // static asset. It is base64url, so it needs no decoding — and decoding a
+        // link damaged in transit would throw here and leave the page stuck on
+        // "Checking your invite" with no error path at all.
+        const token = window.location.pathname.replace(/\/+$/, '').split('/').pop() || '';
+
+        const OFFLINE = 'Could not reach the host. It may be offline.';
+        const INVALID = 'This invite link is no longer valid.';
 
         const el = (id) => document.getElementById(id);
         const show = (node, on) => node.classList.toggle('hidden', !on);
 
+        // What GET /api/join said about this link. Decides which ways in are offered.
+        let invite = null;
+
+        function heading(title, subtitle) {
+          el('title').textContent = title;
+          el('subtitle').textContent = subtitle;
+        }
+
         function fail(text) {
-          el('title').textContent = 'This link will not work';
-          el('subtitle').textContent = '';
+          heading('This link will not work', '');
           show(el('grant'), false);
           show(el('pin-form'), false);
+          show(el('pin-back'), false);
+          show(el('pad-check'), false);
+          show(el('view-moonlight'), false);
           el('choices').style.display = 'none';
           const m = el('msg');
           m.className = 'msg bad';
@@ -520,44 +550,156 @@
           try {
             body = await res.json();
           } catch (e) {
-            /* an empty or non-JSON body is handled by the caller via res.ok */
+            /* an empty or non-JSON body is handled by the caller via ok and status */
           }
-          return { ok: res.ok, body };
+          return { ok: res.ok, status: res.status, body };
         }
 
-        // The redeem POST is a state change, so it carries a CSRF token exactly
-        // as every other mutation in the app does. Issuing one grants no
-        // authority, so this endpoint is reachable without a session.
+        // A 5xx here is the proxy speaking for a host that is not answering — off,
+        // asleep, restarting — which deserves a different message from a link that
+        // is genuinely dead. Telling a guest to ask for a new link when the PC is
+        // merely off sends them to the owner for nothing.
+        function unreachable(status) {
+          return status === 0 || status >= 500;
+        }
+
+        // The POSTs are state changes, so they carry a CSRF token exactly as every
+        // other mutation in the app does. Issuing one grants no authority, so this
+        // endpoint is reachable without a session.
         async function csrfToken() {
           const { ok, body } = await json('/api/csrf-token');
           return ok && body.csrf_token ? body.csrf_token : '';
         }
 
+        // A PIN read off a chat message arrives as "123 456" or with a trailing space
+        // as often as not. Only the digits were ever meant.
+        function digits(value) {
+          return String(value || '').replace(/\D/g, '');
+        }
+
+        function greeting() {
+          return invite && invite.label ? 'Hi, ' + invite.label : 'You have been invited';
+        }
+
+        function bothWays() {
+          return invite.allow_browser !== false && invite.allow_pairing === true;
+        }
+
+        // Only worth showing if this invite can actually use a pad; a watch-only link
+        // would just be offering a test for something they cannot do.
+        function padUseful() {
+          return (
+            invite &&
+            invite.allow_browser !== false &&
+            typeof invite.permission_summary === 'string' &&
+            /gamepad|full control/i.test(invite.permission_summary)
+          );
+        }
+
+        function showPadCheck(on) {
+          show(el('pad-check'), on);
+          if (on) watchGamepads();
+        }
+
+        // ── The three screens ────────────────────────────────────────────────
+        // The choice comes BEFORE the PIN. The PIN is submitted to the way in the
+        // guest actually chose, because redeeming counts a use and each path has
+        // its own redemption: asking for the PIN first, against the browser path,
+        // meant a Moonlight-only invite refused every PIN as "not allowed that way",
+        // and a both-ways invite spent one use on the PIN and another on pairing.
+
+        function showChoices() {
+          heading(greeting(), 'Choose how you want to play.');
+          show(el('pin-form'), false);
+          show(el('pin-back'), false);
+          show(el('view-moonlight'), false);
+          show(el('choice-browser'), invite.allow_browser !== false);
+          show(el('choice-moonlight'), invite.allow_pairing === true);
+          el('choices').style.display = 'block';
+          showPadCheck(padUseful());
+          note('');
+        }
+
+        function showBrowserPin() {
+          heading(greeting(), 'Enter your PIN to join the game.');
+          el('choices').style.display = 'none';
+          show(el('view-moonlight'), false);
+          show(el('pin-form'), true);
+          show(el('pin-back'), bothWays());
+          showPadCheck(padUseful());
+          note('');
+          el('pin').focus();
+        }
+
+        function showMoonlight() {
+          el('choices').style.display = 'none';
+          show(el('pin-form'), false);
+          show(el('pin-back'), false);
+          showPadCheck(false);
+          show(el('view-moonlight'), true);
+          show(el('pair-form'), true);
+          show(el('ml-back'), bothWays());
+          // Constant markup, no server string in it.
+          el('title').innerHTML =
+            '<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true" ' +
+            'style="vertical-align:-3px;margin-right:8px">' +
+            '<path fill="#8ab4f8" d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>' +
+            'Play in Moonlight';
+          el('subtitle').textContent =
+            'The native app. Sharper picture and lower latency than a browser.';
+          // The address to type into Moonlight is simply wherever this page was
+          // reached. The guest got here somehow, and GameStream is relayed on the
+          // same hostname — so the page never has to be told its own address, and
+          // cannot be told a stale one.
+          el('pair-host').textContent = window.location.hostname;
+          note('');
+          el('invite-pin').focus();
+        }
+
         async function load() {
           if (!token) {
-            fail('This invite link is no longer valid.');
+            fail(INVALID);
             return;
           }
-          const { ok, body } = await json('/api/join/' + encodeURIComponent(token));
+          const { ok, status, body } = await json('/api/join/' + encodeURIComponent(token));
+          if (unreachable(status)) {
+            fail(OFFLINE);
+            return;
+          }
           if (!ok || !body.live) {
-            fail(body.error || 'This invite link is no longer valid.');
+            fail(body.error || INVALID);
             return;
           }
+          invite = body;
 
-          el('title').textContent = body.label ? 'Hi, ' + body.label : 'You have been invited';
-          el('subtitle').textContent = 'Enter your PIN to join the game.';
           el('grant').textContent = body.permission_summary || '';
           show(el('grant'), Boolean(body.permission_summary));
-          show(el('pin-form'), true);
-          el('pin').focus();
 
-          // Remembered so the choice screen can offer only what this invite allows.
-          window.__invite = body;
+          const browser = body.allow_browser !== false;
+          const pairing = body.allow_pairing === true;
+          if (browser && pairing) {
+            showChoices();
+          } else if (browser) {
+            showBrowserPin();
+          } else if (pairing) {
+            showMoonlight();
+          } else {
+            fail('This invite is not open for joining right now.');
+          }
+        }
+
+        // What a refusal says. A lockout REPLACES the generic sentence rather than
+        // being appended to it — the two together read as a contradiction.
+        function refusal(body, fallback) {
+          if (body.retry_after_seconds) {
+            return 'Too many incorrect PINs. Try again in ' + body.retry_after_seconds + 's.';
+          }
+          return body.error || fallback;
         }
 
         async function redeem(event) {
           event.preventDefault();
-          const pin = el('pin').value.trim();
+          const pin = digits(el('pin').value);
           if (!pin) {
             note('Enter the PIN you were sent.');
             return;
@@ -566,7 +708,7 @@
           el('submit').disabled = true;
           note('');
 
-          const { ok, body } = await json('/api/join/' + encodeURIComponent(token) + '/redeem', {
+          const { ok, status, body } = await json('/api/join/' + encodeURIComponent(token) + '/redeem', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -577,28 +719,71 @@
 
           el('submit').disabled = false;
 
-          if (ok) {
-            // Held in memory for the pairing call below, which needs it again.
-            // Never stored and never put in the URL — the page is thrown away on
-            // reload and the guest simply re-enters it.
-            window.__pin = pin;
+          if (unreachable(status)) {
+            note(OFFLINE);
+            return;
           }
-
           if (!ok) {
-            let text = body.error || 'That did not work.';
-            if (body.retry_after_seconds) {
-              text += ' Try again in ' + body.retry_after_seconds + 's.';
-            }
-            note(text);
+            note(refusal(body, 'That did not work.'));
             el('pin').select();
             return;
           }
 
-          offerWaysIn(body);
+          // The session cookie is set, so the stream page can start a session
+          // without any further credential. The PIN itself is never kept.
+          window.location.href = '/play';
         }
 
-        // The pad the owner assigned this invite. Slots are raw controller indexes,
-        // and index 0 is player one in every game, so the label is slot + 1.
+        // The native path needs BOTH secrets: the invite PIN, and the one Moonlight
+        // is showing right now. The second is what proves the caller is the client
+        // at the door, so it is asked for here rather than being something the link
+        // could carry.
+        async function pair(event) {
+          event.preventDefault();
+          const pin = digits(el('invite-pin').value);
+          const moonlightPin = digits(el('moonlight-pin').value);
+          if (!pin) {
+            note('Enter the PIN you were sent.');
+            el('invite-pin').focus();
+            return;
+          }
+          if (!moonlightPin) {
+            note('Enter the PIN Moonlight is showing.');
+            el('moonlight-pin').focus();
+            return;
+          }
+
+          el('pair-submit').disabled = true;
+          note('');
+
+          const { ok, status, body } = await json('/api/join/' + encodeURIComponent(token) + '/pair', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-CSRF-Token': await csrfToken(),
+            },
+            body: JSON.stringify({ pin, moonlight_pin: moonlightPin }),
+          });
+
+          el('pair-submit').disabled = false;
+
+          if (unreachable(status)) {
+            note(OFFLINE);
+            return;
+          }
+          if (!ok || !body.status) {
+            note(refusal(body, 'Pairing did not work.'));
+            // 400 is the Moonlight PIN being refused after the invite PIN was accepted;
+            // anything else is about the invite PIN.
+            (status === 400 ? el('moonlight-pin') : el('invite-pin')).select();
+            return;
+          }
+
+          // Done. The form goes with it: every successful pair spends a use, so a
+          // second press must not be possible from a screen that says "Paired".
+          show(el('view-moonlight'), false);
+          heading('Paired', 'Your Moonlight client can now connect to this host. You can close this page.');
+        }
 
         /**
          * Live view of the guest's controller.
@@ -606,9 +791,14 @@
          * Polls rather than listening: gamepadconnected fires once, and the thing a
          * guest actually needs to see is a button lighting up as they press it —
          * that is what tells them the browser is reading THIS pad, not some other
-         * device, and not a stale entry.
+         * device, and not a stale entry. Runs only while the check is on screen.
          */
+        let padWatching = false;
         function watchGamepads() {
+          if (padWatching) return;
+          padWatching = true;
+
+          const checkEl = el('pad-check');
           const nameEl = el('pad-name');
           const hintEl = el('pad-hint');
           const buttonsEl = el('pad-buttons');
@@ -647,11 +837,13 @@
                 if (node.getAttribute('data-on') !== on) node.setAttribute('data-on', on);
               }
             }
-            // Sticks: 20% of the well's radius is enough to read clearly without the
-            // cap escaping the well.
+            // Sticks. The centres are the wells' centres in the SVG above — the caps
+            // must be drawn from where the wells are, or a nudge of the stick sends
+            // them somewhere else on the body. Eight units of travel on an
+            // eighteen-unit well keeps the cap inside it at full deflection.
             const move = [
-              ['s0', 0, 1, 10, 160, 140],
-              ['s1', 2, 3, 11, 200, 150],
+              ['s0', 0, 1, 10, 92, 136],
+              ['s1', 2, 3, 11, 196, 136],
             ];
             for (let i = 0; i < move.length; i++) {
               const [id, ax, ay, press, cx, cy] = move[i];
@@ -697,6 +889,17 @@
             renderedButtons = pad.buttons.length;
           }
 
+          // Stops itself when the check leaves the screen, so a guest sitting on
+          // the Moonlight steps is not polling the Gamepad API sixty times a second
+          // for a picture nobody can see. Shown again, it starts afresh.
+          function next() {
+            if (checkEl.classList.contains('hidden')) {
+              padWatching = false;
+              return;
+            }
+            requestAnimationFrame(frame);
+          }
+
           function frame() {
             const pad = firstPad();
             if (!pad) {
@@ -709,7 +912,7 @@
                 axesEl.innerHTML = '';
                 show(svgEl, false);
               }
-              requestAnimationFrame(frame);
+              next();
               return;
             }
 
@@ -722,7 +925,7 @@
 
             if (standard(pad)) {
               paintSvg(pad);
-              requestAnimationFrame(frame);
+              next();
               return;
             }
 
@@ -737,114 +940,28 @@
               // -1..1 onto 0..100%
               tracks[i].style.left = ((pad.axes[i] + 1) / 2) * 100 + '%';
             }
-            requestAnimationFrame(frame);
+            next();
           }
 
           if (!navigator.getGamepads) {
             nameEl.textContent = 'This browser cannot read controllers';
             hintEl.textContent =
               'Keyboard and mouse will still work if the invite allows them. Chrome, Edge and Safari all support gamepads.';
+            padWatching = false;
             return;
           }
           requestAnimationFrame(frame);
         }
 
-        function offerWaysIn(invite) {
-          el('title').textContent = "You're in";
-          el('subtitle').textContent = 'Choose how you want to play.';
-          show(el('pin-form'), false);
-          note('');
-          el('choices').style.display = 'block';
-
-          show(el('choice-browser'), invite.allow_browser !== false);
-          show(el('choice-moonlight'), invite.allow_pairing === true);
-
-          // Only worth showing if this invite can actually use a pad; a watch-only
-          // link would just be offering a test for something they cannot do.
-          const padUseful =
-            invite.allow_browser !== false &&
-            typeof invite.permission_summary === 'string' &&
-            /gamepad|full control/i.test(invite.permission_summary);
-          show(el('pad-check'), padUseful);
-          if (padUseful) watchGamepads();
-
-          el('choice-browser').addEventListener('click', function () {
-            // The session cookie is already set, so the stream page can start a
-            // session without any further credential.
-            window.location.href = '/play';
-          });
-
-          el('pair-form').addEventListener('submit', pair);
-
-          el('choice-moonlight').addEventListener('click', function () {
-            el('choices').style.display = 'none';
-            show(el('view-moonlight'), true);
-            el('title').innerHTML =
-              '<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true" ' +
-              'style="vertical-align:-3px;margin-right:8px">' +
-              '<path fill="#8ab4f8" d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>' +
-              'Play in Moonlight';
-            el('subtitle').textContent =
-              'The native app. Sharper picture and lower latency than a browser.';
-            el('moonlight-pin').focus();
-          });
-
-          el('ml-back').addEventListener('click', function () {
-            show(el('view-moonlight'), false);
-            el('choices').style.display = 'block';
-            el('title').textContent = "You're in";
-            el('subtitle').textContent = 'Choose how you want to play.';
-            note('');
-          });
-
-          // The address to type into Moonlight is simply wherever this page was
-          // reached. The guest got here somehow, and GameStream is relayed on the
-          // same hostname — so the page never has to be told its own address, and
-          // cannot be told a stale one.
-          el('pair-host').textContent = window.location.hostname;
-        }
-
-        // The native path needs BOTH secrets: the invite PIN we already used, and
-        // the one Moonlight is showing right now. The second is what proves the
-        // caller is the client at the door, so it is asked for here rather than
-        // being something the link could carry.
-        async function pair(event) {
-          event.preventDefault();
-          const moonlightPin = el('moonlight-pin').value.trim();
-          if (!moonlightPin) {
-            note('Enter the PIN Moonlight is showing.');
-            return;
-          }
-
-          el('pair-submit').disabled = true;
-          note('');
-
-          const { ok, body } = await json('/api/join/' + encodeURIComponent(token) + '/pair', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'X-CSRF-Token': await csrfToken(),
-            },
-            body: JSON.stringify({ pin: window.__pin, moonlight_pin: moonlightPin }),
-          });
-
-          el('pair-submit').disabled = false;
-
-          if (!ok || !body.status) {
-            note(body.error || 'Pairing did not work.');
-            el('moonlight-pin').select();
-            return;
-          }
-
-          el('title').textContent = 'Paired';
-          el('subtitle').textContent =
-            'Your Moonlight client can now connect to this host. You can close this page.';
-          el('choices').style.display = 'none';
-        }
-
+        // Wired once, here, rather than every time a screen is shown.
         el('pin-form').addEventListener('submit', redeem);
+        el('pair-form').addEventListener('submit', pair);
+        el('choice-browser').addEventListener('click', showBrowserPin);
+        el('choice-moonlight').addEventListener('click', showMoonlight);
+        el('ml-back').addEventListener('click', showChoices);
+        el('pin-back').addEventListener('click', showChoices);
         load().catch(function () {
-          fail('Could not reach the host. It may be offline.');
+          fail(OFFLINE);
         });
       })();
     </script>
