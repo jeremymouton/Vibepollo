@@ -918,7 +918,8 @@ onMounted(() => void load());
                     v-else
                     :id="`setting-${field.key}`"
                     :class="['vs-input', { monospace: field.monospace }]"
-                    :type="field.kind === 'number' ? 'number' : 'text'"
+                    :type="field.kind === 'number' ? 'number' : field.secret ? 'password' : 'text'"
+                    :autocomplete="field.secret ? 'off' : undefined"
                     :min="field.min"
                     :max="field.max"
                     :step="field.step"

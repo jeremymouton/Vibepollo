@@ -33,6 +33,9 @@ export interface SettingsField {
   step?: number;
   placeholderKey?: string;
   monospace?: boolean;
+  /// A shared secret. Rendered masked, like a password: the coturn auth secret
+  /// was sitting in clear text on the Network page.
+  secret?: boolean;
   restartRequired?: boolean;
   stacked?: boolean;
   recommended?: boolean;
@@ -700,7 +703,7 @@ export const settingsCategories: SettingsCategory[] = [
           text('external_ip', { monospace: true, stacked: true }),
           text('public_base_url', { monospace: true, stacked: true }),
           text('webrtc_ice_servers', { monospace: true, stacked: true }),
-          text('webrtc_turn_secret', { monospace: true, stacked: true }),
+          text('webrtc_turn_secret', { monospace: true, stacked: true, secret: true }),
           number('ping_timeout', { min: 0, step: 1 }),
         ],
       },

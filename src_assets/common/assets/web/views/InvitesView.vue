@@ -54,6 +54,11 @@ const loading = ref(false);
 // existing list on screen instead of swapping it for a skeleton — that swap
 // is what makes the page look like it is reloading every few seconds.
 const initialLoad = ref(true);
+/// Two errors, because they have two lifetimes. The list failing to load is
+/// re-evaluated by every poll and clears itself when one succeeds. An action
+/// failing must stay on screen until the owner has read it — the poll used to
+/// wipe it within five seconds, often before it was seen.
+const loadError = ref('');
 const error = ref('');
 const notice = ref('');
 const busyId = ref('');
@@ -107,9 +112,10 @@ function loadDraft(): InviteDraft {
         typeof saved.allow_browser === 'boolean' ? saved.allow_browser : fallback.allow_browser,
       allow_pairing:
         typeof saved.allow_pairing === 'boolean' ? saved.allow_pairing : fallback.allow_pairing,
-      // 0 would mean an invite that expires instantly; a negative one is nonsense.
+      // 0 is "never expires" — the field label says so and the server agrees —
+      // so only a negative or non-numeric value is rejected.
       expires_in_hours:
-        Number.isFinite(Number(saved.expires_in_hours)) && Number(saved.expires_in_hours) > 0
+        Number.isFinite(Number(saved.expires_in_hours)) && Number(saved.expires_in_hours) >= 0
           ? Number(saved.expires_in_hours)
           : fallback.expires_in_hours,
       // 0 is meaningful here — it is "unlimited uses" — so only reject negatives.
@@ -187,15 +193,29 @@ function usesText(invite: Invite): string {
 const hasInvites = computed(() => invites.value.length > 0);
 
 function describe(err: unknown): string {
-  if (err instanceof ApiError && err.message) return err.message;
+  // ApiError's message is its code ('request-failed'); the server's sentence is in
+  // the payload. That is the one the owner can act on.
+  if (err instanceof ApiError) {
+    const payload = err.payload as { error?: unknown } | null;
+    if (typeof payload?.error === 'string' && payload.error) return payload.error;
+    return `HTTP ${err.status}`;
+  }
   return err instanceof Error ? err.message : String(err);
 }
 
+/// Bumped by every mutation. A poll that left before the mutation and lands after
+/// it carries the older truth; comparing epochs lets load() throw it away instead
+/// of undoing the optimistic update for one interval.
+let mutationEpoch = 0;
+
 async function load(): Promise<void> {
+  if (busyId.value || creating.value) return;
+  const epoch = mutationEpoch;
   loading.value = true;
-  error.value = '';
   try {
     const response = await apiGet<{ invites?: Invite[]; link_base?: string }>('/api/invites');
+    if (epoch !== mutationEpoch) return;
+    loadError.value = '';
     const next = Array.isArray(response.invites) ? response.invites : [];
     const nextBase = (response.link_base ?? '').replace(/\/+$/, '');
     // Skip the array replacement when nothing changed. A new ref on every poll
@@ -208,7 +228,7 @@ async function load(): Promise<void> {
       linkBase.value = nextBase;
     }
   } catch (err) {
-    error.value = describe(err);
+    if (epoch === mutationEpoch) loadError.value = describe(err);
   } finally {
     loading.value = false;
     initialLoad.value = false;
@@ -217,26 +237,28 @@ async function load(): Promise<void> {
 
 function sameInvites(a: Invite[], b: Invite[]): boolean {
   if (a.length !== b.length) return false;
+  // Every field a card renders can change underneath the page: `live` flips when an
+  // invite expires by time, token/pin/path change when it is rotated from another
+  // tab. So rows are compared whole. They are keyed by id, so a change re-renders
+  // one card, not the list — the flashing this guards against was the wholesale
+  // array swap, not a card update.
   for (let i = 0; i < a.length; i++) {
-    const x = a[i];
-    const y = b[i];
-    // Order is stable from the API; the only fields that change while the page
-    // is open are active_sessions, locked_for_seconds, uses, and revoked. A
-    // mismatch on any of those means the card needs to re-render.
-    if (
-      x.id !== y.id ||
-      x.active_sessions !== y.active_sessions ||
-      x.locked_for_seconds !== y.locked_for_seconds ||
-      x.uses !== y.uses ||
-      x.revoked !== y.revoked
-    ) {
-      return false;
-    }
+    if (a[i].id !== b[i].id || JSON.stringify(a[i]) !== JSON.stringify(b[i])) return false;
   }
   return true;
 }
 
 async function create(): Promise<void> {
+  // v-model.number hands back '' for an emptied field. '' * 3600 is 0, which would
+  // quietly create a link that never expires; and '' for max_uses is refused by the
+  // server. Say so here instead.
+  const hours = draft.value.expires_in_hours;
+  const maxUses = draft.value.max_uses;
+  if (!Number.isFinite(hours) || hours < 0 || !Number.isInteger(maxUses) || maxUses < 0) {
+    error.value = t('ui.invites.invalid_numbers');
+    return;
+  }
+  mutationEpoch += 1;
   creating.value = true;
   error.value = '';
   try {
@@ -262,6 +284,7 @@ async function create(): Promise<void> {
 }
 
 async function patch(invite: Invite, body: Record<string, unknown>): Promise<void> {
+  mutationEpoch += 1;
   busyId.value = invite.id;
   error.value = '';
   try {
@@ -275,6 +298,7 @@ async function patch(invite: Invite, body: Record<string, unknown>): Promise<voi
 }
 
 async function rotate(invite: Invite): Promise<void> {
+  mutationEpoch += 1;
   busyId.value = invite.id;
   error.value = '';
   try {
@@ -292,6 +316,7 @@ async function rotate(invite: Invite): Promise<void> {
 }
 
 async function remove(invite: Invite): Promise<void> {
+  mutationEpoch += 1;
   busyId.value = invite.id;
   error.value = '';
   try {
@@ -345,10 +370,27 @@ onBeforeUnmount(() => {
       </template>
     </PageHeader>
 
-    <InlineAlert v-if="error" tone="danger" :title="t('ui.invites.error')">{{ error }}</InlineAlert>
-    <InlineAlert v-if="notice" tone="success" announce="polite" @dismiss="notice = ''">{{
-      notice
+    <InlineAlert v-if="loadError" tone="danger" :title="t('ui.invites.error')">{{
+      loadError
     }}</InlineAlert>
+    <InlineAlert
+      v-if="error"
+      tone="danger"
+      :title="t('ui.invites.error')"
+      :dismiss-label="t('ui.invites.dismiss')"
+      @dismiss="error = ''"
+      >{{ error }}</InlineAlert
+    >
+    <!-- dismiss-label is what makes the dismiss button exist; without it the
+         handler below was never reachable and the notice stayed until replaced. -->
+    <InlineAlert
+      v-if="notice"
+      tone="success"
+      announce="polite"
+      :dismiss-label="t('ui.invites.dismiss')"
+      @dismiss="notice = ''"
+      >{{ notice }}</InlineAlert
+    >
 
     <form v-if="showCreate" class="create" @submit.prevent="create">
       <div class="create__grid">
@@ -493,12 +535,17 @@ onBeforeUnmount(() => {
       </li>
     </ul>
 
+    <!-- Held open and busy while the DELETE is in flight, so Confirm cannot be
+         pressed twice; remove() closes it when the request has settled. -->
     <ConfirmDialog
       :open="confirmDelete !== null"
       tone="danger"
       :title="t('ui.invites.delete_title')"
       :description="t('ui.invites.delete_description')"
       :confirm-label="t('ui.invites.delete')"
+      :busy="confirmDelete !== null && busyId === confirmDelete.id"
+      :busy-label="t('ui.invites.deleting')"
+      :close-on-confirm="false"
       @confirm="confirmDelete && remove(confirmDelete)"
       @cancel="confirmDelete = null"
     />

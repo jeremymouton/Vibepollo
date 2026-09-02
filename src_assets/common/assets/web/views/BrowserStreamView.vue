@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, reactive, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 
 import { apiGet, apiPost } from '@/api/client';
@@ -169,6 +169,8 @@ let videoFrameCallbackHandle: number | undefined;
 let videoRenderOverloadedSince: number | null = null;
 let videoLatencyResetAt: number | null = null;
 let videoPlaybackStream: MediaStream | null = null;
+/// Video and audio together, for the corner player (see activeStream.publish).
+let publishedStream: MediaStream | null = null;
 
 /// Stream settings persist per browser.
 ///
@@ -666,10 +668,11 @@ watch(
 );
 
 /// hostCapabilities is in the dependency list because the recommendation is
-/// clamped to the host's limits: until the capabilities response lands, the
-/// clamp collapses everything to 0 and nothing can be applied. The wholesale
-/// `hostCapabilities.value = ...` assignment on refresh triggers this watcher,
-/// which is what snaps the slider to the recommendation on page load.
+/// clamped to the host's limits: before the capabilities response lands the
+/// defaults apply, and once it does the recommendation has to be re-clamped to
+/// the real ones. The wholesale `hostCapabilities.value = ...` assignment on
+/// refresh triggers this watcher, which is what snaps the slider to the
+/// recommendation on page load.
 watch(
   () => [form.width, form.height, form.fps, form.encoding, hostCapabilities.value] as const,
   () => {
@@ -1333,7 +1336,6 @@ function attachRemoteStream(stream: MediaStream): void {
     player.muted = true;
     player.srcObject = videoPlaybackStream;
     startVideoFrameLatencyMonitoring(player);
-    activeStream.publish(videoPlaybackStream ?? undefined, selectedAppName.value);
   }
 
   const audioTracks = stream.getAudioTracks();
@@ -1343,6 +1345,15 @@ function attachRemoteStream(stream: MediaStream): void {
     // Apply the current slider value to the element. A fresh srcObject reset
     // clears the volume to 1, so reapply here whenever a new track lands.
     audioEl.value.volume = clampVolume(form.volume);
+  }
+
+  // The corner player gets both kinds in one stream. This page's own elements
+  // pause whenever KeepAlive lifts it out of the document, so while the owner is
+  // elsewhere the mini player is the only thing that can carry the game's sound.
+  if (videoTracks.length || audioTracks.length) {
+    publishedStream = replaceTracks(publishedStream, [...videoTracks, ...audioTracks]);
+    activeStream.setVolume(clampVolume(form.volume));
+    activeStream.publish(publishedStream ?? undefined, selectedAppName.value);
   }
 
   void playAttachedMedia();
@@ -1389,11 +1400,18 @@ async function connect(resume: boolean): Promise<void> {
         if (state === 'failed' || state === 'disconnected' || state === 'closed') {
           startSessionStatusPolling();
         }
+        if (state === 'failed' || state === 'closed') {
+          // The corner player keys off the published stream. A connection that has
+          // died for good must take it down, or it keeps showing the last frame with
+          // "Back to stream" under it. 'disconnected' is left alone: it can recover,
+          // and nothing would republish the stream if it did.
+          activeStream.publish();
+        }
       },
-      // Rumble on its way back from the host.
       onStreamStats: (snapshot) => {
         streamStats.value = snapshot;
       },
+      // Rumble on its way back from the host.
       onInputMessage: (message: unknown) => applyGamepadFeedback(message),
       onInputState: (state) => {
         if (state !== 'open') releaseForwardedInput();
@@ -1467,6 +1485,7 @@ async function disconnect(restartStatusPolling = true): Promise<void> {
   if (audioEl.value) audioEl.value.srcObject = null;
   videoPlaybackStream = null;
   audioPlaybackStream = null;
+  publishedStream = null;
   activeStream.publish();
   playbackBlocked.value = false;
   connectionState.value = 'idle';
@@ -1936,6 +1955,7 @@ watch(
   () => form.volume,
   (value) => {
     if (audioEl.value) audioEl.value.volume = clampVolume(value);
+    activeStream.setVolume(clampVolume(value));
   },
 );
 
@@ -1979,6 +1999,29 @@ onBeforeUnmount(() => {
   releaseForwardedInput();
   stopVideoFrameLatencyMonitoring();
   void disconnect(false);
+});
+
+// KeepAlive keeps this page mounted across navigation so the stream survives, but
+// lifting its DOM out of the document pauses both media elements (that is what a
+// media element does on removal), and nothing resumes a paused element on its own.
+// Coming back showed the last frame, silent, under a badge that still said
+// Connected. The pollers also ran on every other page for the life of the app.
+onActivated(() => {
+  if (isConnected.value) {
+    void playAttachedMedia();
+    if (videoEl.value) startVideoFrameLatencyMonitoring(videoEl.value);
+  }
+  startSessionStatusPolling();
+  startGamepadPolling();
+});
+onDeactivated(() => {
+  // Still mounted for the mini player's sake, but nothing here can be seen or
+  // pressed: stop the pollers and let go of any input still held on the host.
+  releaseForwardedInput();
+  cancelFullscreenExitHold();
+  stopSessionStatusPolling();
+  stopGamepadPolling();
+  stopVideoFrameLatencyMonitoring();
 });
 </script>
 
@@ -2553,7 +2596,7 @@ onBeforeUnmount(() => {
               <label class="stream-form__check stream-form__check--plain">
                 <input v-model="useHostBitrate" type="checkbox" />
                 <span>{{
-                  t('ui.browser_stream.settings.bitrate_host_default', 'Let the host choose bitrate')
+                  t('ui.browser_stream.settings.bitrate_host_default_option', 'Let the host choose bitrate')
                 }}</span>
               </label>
             </div>
@@ -2684,7 +2727,7 @@ onBeforeUnmount(() => {
           <AppButton
             variant="secondary"
             :disabled="connTesting"
-            :loading="connTesting"
+            :busy="connTesting"
             @click="runConnectionTest"
           >
             {{
@@ -2694,7 +2737,7 @@ onBeforeUnmount(() => {
             }}
           </AppButton>
 
-          <InlineAlert v-if="connError" tone="danger" :message="connError" />
+          <InlineAlert v-if="connError" tone="danger">{{ connError }}</InlineAlert>
 
           <div v-if="connReport" class="conn-test__result">
             <StatusBadge :label="connReport.verdict" :tone="connTone" compact />

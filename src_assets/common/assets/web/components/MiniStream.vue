@@ -6,8 +6,10 @@
  * connection — a MediaStream can feed any number of video elements, so this costs
  * nothing beyond another decode surface, and the session is untouched.
  *
- * Muted on purpose: the audio is already playing on the stream page, which is
- * still mounted behind this. Two elements playing the same audio would echo.
+ * Plays the audio too. The stream page is kept alive behind this, but kept alive
+ * is not playing: when KeepAlive lifts the page out of the document its media
+ * elements pause, so for as long as this player is on screen it is the only sound
+ * source. It is shown only off the stream route, so the two never overlap.
  */
 import { onBeforeUnmount, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
@@ -22,13 +24,14 @@ function bind(): void {
   const el = videoEl.value;
   if (!el) return;
   const media = stream.media.value;
+  el.volume = stream.volume.value;
   if (el.srcObject !== (media ?? null)) {
     el.srcObject = media ?? null;
     if (media) void el.play().catch(() => undefined);
   }
 }
 
-watch([() => stream.media.value, videoEl], bind, { immediate: true });
+watch([() => stream.media.value, () => stream.volume.value, videoEl], bind, { immediate: true });
 onBeforeUnmount(() => {
   if (videoEl.value) videoEl.value.srcObject = null;
 });
@@ -40,7 +43,7 @@ function backToStream(): void {
 
 <template>
   <div v-if="stream.connected.value" class="mini-stream">
-    <video ref="videoEl" autoplay muted playsinline disablepictureinpicture />
+    <video ref="videoEl" autoplay playsinline disablepictureinpicture />
     <button class="mini-stream__open" type="button" @click="backToStream">
       Back to stream<template v-if="stream.appName.value"> · {{ stream.appName.value }}</template>
     </button>
