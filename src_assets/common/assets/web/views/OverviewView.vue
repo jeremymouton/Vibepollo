@@ -194,7 +194,10 @@ onBeforeUnmount(() => {
         }}</span>
       </template>
       <template #actions>
-        <a class="button button--secondary" href="/">
+        <!-- Not "/": the host redirects the root to this app, so that link only
+             reloaded the page. The legacy shell is served for any other extension-
+             free path, and /legacy is an alias of its dashboard. -->
+        <a class="button button--secondary" href="/legacy">
           {{ t('ui.overview.actions.useLegacyWebUi') }}
         </a>
         <AppButton

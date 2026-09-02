@@ -12,7 +12,10 @@ const StatsView = () => import('@/views/StatsView.vue');
 const WebRtcClientView = () => import('@/views/WebRtcClientView.vue');
 
 const routes = [
-  { path: '/', component: DashboardView, meta: { container: 'xl' } },
+  // /legacy is the same page: the host redirects "/" to the v2 app, so this is the
+  // only way a full-page load can land in the legacy UI. v2's "Use legacy web UI"
+  // link points here.
+  { path: '/', alias: '/legacy', component: DashboardView, meta: { container: 'xl' } },
   { path: '/applications', component: ApplicationsView },
   { path: '/settings', component: SettingsView, meta: { container: 'lg' } },
   { path: '/logs', component: DashboardView, meta: { container: 'xl' } },
