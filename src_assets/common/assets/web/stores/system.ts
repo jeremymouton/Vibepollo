@@ -1,7 +1,14 @@
 import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
 
-import { apiGet, apiPost, clearCsrfToken } from '@/api/client';
+import {
+  ApiError,
+  apiGet,
+  apiPost,
+  clearCsrfToken,
+  refreshSessionToken,
+  setSessionLostHandler,
+} from '@/api/client';
 import type { SessionStatus } from '@/types/sessions';
 
 export interface AuthStatus {
@@ -93,6 +100,22 @@ export const useSystemStore = defineStore('system', () => {
     return result;
   }
 
+  /// The session is gone and the refresh token could not save it. Drop the host
+  /// data with it: leaving the last snapshot on screen behind a login prompt shows
+  /// stale numbers as if they were current.
+  function onSessionLost(): void {
+    auth.value = { ...auth.value, authenticated: false, login_required: true };
+    metadata.value = null;
+    session.value = null;
+    error.value = '';
+  }
+
+  setSessionLostHandler(onSessionLost);
+
+  function isAuthFailure(reason: unknown): boolean {
+    return reason instanceof ApiError && (reason.status === 401 || reason.status === 403);
+  }
+
   async function refreshHost(): Promise<void> {
     if (loadingHost.value || needsLogin.value || needsSetup.value) return;
     loadingHost.value = true;
@@ -107,6 +130,13 @@ export const useSystemStore = defineStore('system', () => {
       const failure = [metadataResult, sessionResult].find(
         (result): result is PromiseRejectedResult => result.status === 'rejected',
       );
+      // A refused request is not an unavailable host. Both were reported as
+      // "host status unavailable", so an expired session left that banner on the
+      // dashboard indefinitely with nothing to say the sign-in had lapsed.
+      if (failure && isAuthFailure(failure.reason)) {
+        onSessionLost();
+        return;
+      }
       error.value = failure ? 'ui.system.host_status_unavailable' : '';
       lastUpdatedAt.value = Date.now();
     } finally {
@@ -120,6 +150,13 @@ export const useSystemStore = defineStore('system', () => {
     applyTheme();
     try {
       await fetchAuthStatus();
+      // The host decides "login required" from the session cookie alone — it does
+      // not look at the refresh token. So a tab reopened after the session's two
+      // hours is told to sign in while a "stay signed in" token good for a week
+      // sits unused. Spend it before asking for a password.
+      if (needsLogin.value && (await refreshSessionToken())) {
+        await fetchAuthStatus();
+      }
       await refreshHost();
     } catch {
       error.value = 'ui.system.unreachable';
