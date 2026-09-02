@@ -232,6 +232,22 @@ const AXIS_DEADZONE = 0.08;
 const MOTION_SEND_INTERVAL_MS = 16;
 const MOTION_DIFF_THRESHOLD = 0.1;
 const GAMEPAD_STATE_HEARTBEAT_MS = 500;
+/// How long each rumble effect is asked to run for.
+///
+/// Rumble arrives as a STATE, not an event: the host sends one message when the
+/// motors change and says nothing more until they change again, so a two-second
+/// vibration is one message. Playing a fixed short pulse per message — which is
+/// what this did — turns a held rumble into a tick at its onset and drops the
+/// rest, and makes a slow swell a scatter of ticks wherever the level crossed a
+/// threshold. So an effect runs long and is renewed underneath, which browsers
+/// cap anyway (Chrome refuses beyond ~5s).
+const RUMBLE_EFFECT_MS = 2000;
+/// Renewed before the effect runs out, so the motors never gap between two.
+const RUMBLE_RENEW_MS = 1500;
+/// A rumble nobody has updated for this long stops itself. The stop message is
+/// normally explicit, but a dropped data channel or a game that exits mid-shake
+/// would otherwise leave the pad buzzing until it is unplugged.
+const RUMBLE_MAX_AGE_MS = 30000;
 
 const activeGamepads = new Map<number, Gamepad>();
 const motionRequestState = new Map<number, { gyro: boolean; accel: boolean }>();
@@ -517,6 +533,148 @@ function isGamepadConnected(gamepad: Gamepad): boolean {
   return true;
 }
 
+interface RumbleChannel {
+  strong: number;
+  weak: number;
+  updatedAt: number;
+  playingUntil: number;
+}
+
+/// One entry per pad per motor pair. Main motors and trigger motors are separate
+/// effects on the hardware and are held separately here — writing triggers to the
+/// main motors, as this used to, meant a game driving both made them fight, each
+/// message cancelling the other's effect.
+const rumbleState = new Map<string, RumbleChannel>();
+/// Held as a 0-or-1 list rather than a nullable: this project's lint rules ban
+/// `| undefined` in an annotation. clearInterval over an empty list is a no-op.
+let rumbleTimer: ReturnType<typeof setInterval>[] = [];
+
+function rumbleKey(id: number, kind: 'dual-rumble' | 'trigger-rumble'): string {
+  return `${id}:${kind}`;
+}
+
+/// Does this browser have a real trigger-rumble effect for this pad? Chrome
+/// exposes one on Xbox pads that have the motors. Where it is absent the trigger
+/// message is dropped rather than played on the handles, which would be a lie
+/// about which part of the pad the game asked to move.
+function supportsEffect(actuator: GamepadHapticActuator, effect: string): boolean {
+  const effects = (actuator as { effects?: readonly string[] }).effects;
+  if (Array.isArray(effects)) return effects.includes(effect);
+  // No introspection: assume the standard effect exists (it is the one every
+  // implementation ships) and that the trigger one does not.
+  return effect === 'dual-rumble';
+}
+
+/// The pad at this index, as a 0-or-1 list — see rumbleTimer on why not a union.
+function padForId(id: number): Gamepad[] {
+  const pad = activeGamepads.get(id) ?? getGamepads()[id];
+  return pad ? [pad] : [];
+}
+
+/// Push the held levels at the hardware, renewing an effect before it expires.
+/// Called on every message and on a timer, so a rumble the game holds steady
+/// keeps running and one it never cancels still stops on its own.
+function pumpRumble(): void {
+  const now = performance.now();
+  for (const [key, channel] of rumbleState) {
+    const [rawId, kind] = key.split(':') as [string, 'dual-rumble' | 'trigger-rumble'];
+    const id = Number(rawId);
+    const silent = channel.strong <= 0 && channel.weak <= 0;
+    const stale = now - channel.updatedAt > RUMBLE_MAX_AGE_MS;
+    const [pad] = padForId(id);
+    const actuator = pad ? getHapticActuator(pad) : null;
+
+    if (!pad || !actuator) {
+      // The pad went away mid-rumble; there is nothing left to stop.
+      rumbleState.delete(key);
+      continue;
+    }
+    if (silent || stale) {
+      rumbleState.delete(key);
+      try {
+        const reset = (actuator as { reset?: () => Promise<unknown> }).reset;
+        if (reset) void reset.call(actuator).catch(() => undefined);
+        else
+          void actuator
+            .playEffect(kind, { duration: 1, strongMagnitude: 0, weakMagnitude: 0 })
+            .catch(() => undefined);
+      } catch {
+        /* a browser that will not stop it will let it lapse instead */
+      }
+      continue;
+    }
+    if (now < channel.playingUntil - (RUMBLE_EFFECT_MS - RUMBLE_RENEW_MS)) continue;
+
+    try {
+      void actuator
+        .playEffect(kind, {
+          duration: RUMBLE_EFFECT_MS,
+          strongMagnitude: channel.strong,
+          weakMagnitude: channel.weak,
+        })
+        // Refusals are routine — a pad unplugged between the check and the call,
+        // an effect the browser declines — and an uncaught rejection here would
+        // put an error in the console on every one.
+        .catch(() => undefined);
+      channel.playingUntil = now + RUMBLE_EFFECT_MS;
+    } catch {
+      rumbleState.delete(key);
+    }
+  }
+  if (!rumbleState.size) {
+    rumbleTimer.forEach(clearInterval);
+    rumbleTimer = [];
+  }
+}
+
+function setRumble(
+  id: number,
+  kind: 'dual-rumble' | 'trigger-rumble',
+  strong: number,
+  weak: number,
+): void {
+  const key = rumbleKey(id, kind);
+  const existing = rumbleState.get(key);
+  const now = performance.now();
+  if (strong <= 0 && weak <= 0 && !existing) return;
+  rumbleState.set(key, {
+    strong,
+    weak,
+    updatedAt: now,
+    // A changed level must reach the motors now, not when the running effect
+    // ends, so the renewal deadline is cleared whenever the value moves.
+    playingUntil:
+      existing && existing.strong === strong && existing.weak === weak ? existing.playingUntil : 0,
+  });
+  if (!rumbleTimer.length) {
+    rumbleTimer = [setInterval(pumpRumble, 250)];
+  }
+  pumpRumble();
+}
+
+/// Stop every motor this page is driving. Used when input capture detaches — the
+/// guest leaving, the owner navigating away — because the pad is the browser's to
+/// silence and the host will send nothing more.
+/// Stop the motors on one pad, for when it disconnects mid-rumble.
+function stopRumbleFor(id: number): void {
+  for (const kind of ['dual-rumble', 'trigger-rumble'] as const) {
+    const channel = rumbleState.get(rumbleKey(id, kind));
+    if (channel) {
+      channel.strong = 0;
+      channel.weak = 0;
+    }
+  }
+  pumpRumble();
+}
+
+export function stopAllRumble(): void {
+  for (const channel of rumbleState.values()) {
+    channel.strong = 0;
+    channel.weak = 0;
+  }
+  pumpRumble();
+}
+
 export function applyGamepadFeedback(message: GamepadFeedbackMessage | unknown): void {
   if (!message || typeof message !== 'object') return;
   const payload = message as GamepadFeedbackMessage;
@@ -537,27 +695,28 @@ export function applyGamepadFeedback(message: GamepadFeedbackMessage | unknown):
     return;
   }
 
-  const gamepad = activeGamepads.get(id) ?? getGamepads()[id];
+  const [gamepad] = padForId(id);
   if (!gamepad) return;
   const actuator = getHapticActuator(gamepad);
   if (!actuator) return;
 
-  let strong = clampMagnitude((payload.lowfreq ?? 0) / 65535);
-  let weak = clampMagnitude((payload.highfreq ?? 0) / 65535);
   if (payload.event === 'rumble_triggers') {
-    strong = clampMagnitude((payload.left ?? 0) / 65535);
-    weak = clampMagnitude((payload.right ?? 0) / 65535);
+    if (!supportsEffect(actuator, 'trigger-rumble')) return;
+    setRumble(
+      id,
+      'trigger-rumble',
+      clampMagnitude((payload.left ?? 0) / 65535),
+      clampMagnitude((payload.right ?? 0) / 65535),
+    );
+    return;
   }
 
-  try {
-    void actuator.playEffect('dual-rumble', {
-      duration: 100,
-      strongMagnitude: strong,
-      weakMagnitude: weak,
-    });
-  } catch {
-    /* ignore */
-  }
+  setRumble(
+    id,
+    'dual-rumble',
+    clampMagnitude((payload.lowfreq ?? 0) / 65535),
+    clampMagnitude((payload.highfreq ?? 0) / 65535),
+  );
 }
 
 export function attachInputCapture(
@@ -1163,6 +1322,7 @@ export function attachInputCapture(
           gamepadStates.delete(index);
           activeGamepads.delete(index);
           motionRequestState.delete(index);
+          stopRumbleFor(index);
           sendGamepadDisconnect(index, activeMask);
         });
       }
@@ -1264,6 +1424,10 @@ export function attachInputCapture(
       gamepadMeta.clear();
       gamepadStates.clear();
     }
+    // The motors are this page's to silence: the host sends nothing once the
+    // session ends, so a rumble in flight would otherwise run until the effect
+    // lapsed or the pad was unplugged.
+    stopAllRumble();
     activeGamepads.clear();
     motionRequestState.clear();
   };

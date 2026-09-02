@@ -45,7 +45,7 @@ const LAYOUT_KEY = 'vibepollo.guest.padLayout';
  * iOS refuses the API outright. There it is simply a no-op, which is the correct
  * outcome and not worth apologising for on screen.
  */
-let vibrationBusyUntil = 0;
+let vibrationStrength = -1;
 
 const vibrationActuator = {
   type: 'dual-rumble',
@@ -57,32 +57,35 @@ const vibrationActuator = {
     if (!vibrate) return Promise.resolve('complete');
 
     const strength = Math.max(params.strongMagnitude ?? 0, params.weakMagnitude ?? 0);
-    const now = performance.now();
 
     if (strength <= 0.05) {
       vibrate(0);
-      vibrationBusyUntil = 0;
+      vibrationStrength = -1;
       return Promise.resolve('complete');
     }
 
-    // A game may ask many times a second. Restarting the motor on each one makes it
-    // stutter and drains the battery, so an effect already running is left alone.
-    if (now < vibrationBusyUntil) return Promise.resolve('complete');
+    // The caller now holds rumble as a state and renews this effect before it
+    // runs out, so the duty cycle is built for the full duration it asks for and
+    // an unchanged level is left alone — restarting the motor mid-buzz makes it
+    // stutter and drains the battery. A CHANGED level must land immediately.
+    const duration = Math.max(20, Math.round(params.duration ?? 100));
+    if (Math.abs(strength - vibrationStrength) < 0.05) return Promise.resolve('complete');
+    vibrationStrength = strength;
 
-    const duration = Math.min(400, Math.max(20, Math.round(params.duration ?? 100)));
     if (strength > 0.6) {
       vibrate(duration);
     } else {
-      // Roughly `strength` of each 40ms slice spent buzzing.
+      // Roughly `strength` of each 40ms slice spent buzzing. Android caps a
+      // pattern's length, so this is capped well under it and renewed by the
+      // caller like any other effect.
       const slice = 40;
-      const on = Math.max(8, Math.round(slice * strength));
+      const on = Math.max(8, Math.round(strength * slice));
       const pattern: number[] = [];
-      for (let elapsed = 0; elapsed < duration; elapsed += slice) {
+      for (let elapsed = 0; elapsed < Math.min(duration, 3000); elapsed += slice) {
         pattern.push(on, Math.max(0, slice - on));
       }
       vibrate(pattern);
     }
-    vibrationBusyUntil = now + duration;
     return Promise.resolve('complete');
   },
 };
@@ -304,7 +307,9 @@ function recomputePressed(): void {
 /// A short tick on first contact. It is the only feedback available on glass, and
 /// its absence is most of why on-screen controls feel vague.
 function tick(): void {
-  if (vibrationBusyUntil > performance.now()) return;
+  // Not while the game is rumbling: the phone has one motor, so a tap tick would
+  // cut the rumble short and restart it. vibrationStrength is -1 when idle.
+  if (vibrationStrength >= 0) return;
   navigator.vibrate?.(8);
 }
 
