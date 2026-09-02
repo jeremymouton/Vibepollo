@@ -168,8 +168,8 @@ const quality = ref<Quality>(loadQuality());
 /// Settles either way, so a host that will not answer cannot hold the guest up.
 async function settleCodecs(): Promise<void> {
   const [offered, host] = await Promise.all([
-    offeredCodecs().catch(() => null),
-    hostCodecs().catch(() => null),
+    offeredCodecs().catch((): EncodingType[] => []),
+    hostCodecs().catch((): EncodingType[] => []),
   ]);
   let list = offered.length ? offered : codecs.value;
   if (host.length) list = list.filter((c) => host.includes(c));
@@ -694,10 +694,17 @@ onBeforeUnmount(() => {
     <!-- data-chrome: these are the page's controls, not game input. The capture
          layer leaves pointers on them alone, so a click lands on the button instead
          of being captured by the stage and forwarded to the host as a mouse press.
-         Half-opaque at rest rather than a quarter: a phone has no hover to reveal it. -->
+         Half-opaque at rest rather than a quarter: a phone has no hover to reveal it.
+
+         While the on-screen pad is up, this bar, the stats box and the settings
+         panel all drop a row: the pad draws LB/LT and RT/RB in the top corners and
+         its own editor chrome top-centre, at exactly these offsets. Sitting on top
+         of RT/RB meant a thumb aiming for a trigger hit Quality instead — and, later
+         in the DOM, the bar won every one of those taps. -->
     <div
       v-if="phase === 'playing'"
-      class="absolute top-3 right-3 flex gap-2 opacity-50 hover:opacity-100 focus-within:opacity-100 transition"
+      class="absolute right-3 flex gap-2 opacity-50 hover:opacity-100 focus-within:opacity-100 transition"
+      :class="showTouchPad ? 'top-14' : 'top-3'"
       data-chrome
     >
       <button
@@ -733,7 +740,8 @@ onBeforeUnmount(() => {
 
     <div
       v-if="showStats && phase === 'playing'"
-      class="absolute top-3 left-3 rounded-lg bg-black/80 px-3 py-2 text-xs text-white/90 font-mono leading-5"
+      class="absolute left-3 rounded-lg bg-black/80 px-3 py-2 text-xs text-white/90 font-mono leading-5"
+      :class="showTouchPad ? 'top-14' : 'top-3'"
       data-chrome
     >
       <div>path {{ pathKind }} {{ stats.candidatePair?.protocol ?? '' }}</div>
@@ -753,7 +761,8 @@ onBeforeUnmount(() => {
          overlay and would otherwise render on top of "You have left the session." -->
     <div
       v-if="showSettings && phase === 'playing'"
-      class="absolute top-16 right-3 w-64 rounded-lg bg-black/85 p-4 text-sm text-white space-y-3"
+      class="absolute right-3 w-64 rounded-lg bg-black/85 p-4 text-sm text-white space-y-3"
+      :class="showTouchPad ? 'top-24' : 'top-16'"
       data-chrome
     >
       <label class="block">
