@@ -125,6 +125,16 @@ namespace invite {
    */
   redemption_t redeem(const std::string &token, mode_e mode, const std::string &pin);
 
+  /**
+   * @brief Give back one use that a redemption counted but the guest never received.
+   *
+   * The pairing path has to redeem before it can try the Moonlight PIN — the invite
+   * PIN is what earns the attempt — so a mistyped Moonlight PIN, or pressing the
+   * button before Moonlight is waiting, would otherwise spend a single-use invite on
+   * nothing. Only ever undoes the increment just made; it cannot take `uses` below 0.
+   */
+  void refund_use(const std::string &id);
+
 
   /**
    * @brief Sessions belonging to redeemed guests.

@@ -2491,7 +2491,19 @@ namespace nvhttp {
     }
 
     inline PERM client_perm(const verified_client_t &verified_client) {
-      return verified_client ? verified_client->perm : PERM::_no;
+      if (!verified_client) {
+        return PERM::_no;
+      }
+      // A device an invite paired is held to the invite's CURRENT grant on every
+      // permission check, not only at launch. Without this, revoking or expiring
+      // the invite muted the device's input on a stream it could still start and
+      // watch, because the launch gate reads the certificate's own permission.
+      // Intersected, never widened; a device no invite paired is untouched, since
+      // its permission is the owner's business.
+      if (const auto granted = invite::perm_for_paired_device(verified_client->uuid)) {
+        return static_cast<PERM>(static_cast<std::uint32_t>(verified_client->perm) & *granted);
+      }
+      return verified_client->perm;
     }
 
     inline bool has_client_perm(const verified_client_t &verified_client, PERM perm) {

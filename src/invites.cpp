@@ -155,9 +155,9 @@ namespace invite {
     invite.created_at = policy::clock_t::now();
 
     invite.label = spec.label.value_or("Guest"s);
-    // Default to gamepad-only plus the two action bits a guest needs to see and start
-    // anything. Deliberately not PERM::_all: the safe grant should be what you get by
-    // forgetting to choose, not what you get by asking.
+    // Nothing, unless told otherwise. The HTTP layer substitutes the gamepad preset
+    // when a caller names no permissions; this module does not know the bit values,
+    // and a store that silently widened a grant would be the wrong place to guess.
     invite.perm = spec.perm.value_or(0u);
     invite.gamepad_base_slot = spec.gamepad_base_slot.value_or(1);
     invite.app_id = spec.app_id.value_or(-1);
@@ -277,9 +277,13 @@ namespace invite {
     for (const auto &invite : g_invites) {
       if (std::find(invite.paired_device_uuids.begin(), invite.paired_device_uuids.end(), device_uuid) !=
           invite.paired_device_uuids.end()) {
-        // A revoked invite grants nothing. The device is unpaired on revocation
-        // anyway, but if that ever fails to land this still refuses it everything.
-        return invite.revoked ? 0u : invite.perm;
+        // A revoked or expired invite grants nothing. The device is unpaired in both
+        // cases anyway, but revocation is a request that can fail and expiry is
+        // swept on a timer, so this is what refuses the device in the gap. Time only:
+        // an invite that merely ran out of uses spent one of them on this pairing.
+        const auto now = policy::clock_t::now();
+        const bool expired = invite.expires_at != policy::time_point_t {} && now >= invite.expires_at;
+        return (invite.revoked || expired) ? 0u : invite.perm;
       }
     }
     return std::nullopt;
@@ -353,6 +357,16 @@ namespace invite {
     return out;
   }
 
+
+  void refund_use(const std::string &id) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto *invite = find_locked(id);
+    if (!invite || invite->uses <= 0) {
+      return;
+    }
+    --invite->uses;
+    save_locked();
+  }
 
   namespace guest {
 

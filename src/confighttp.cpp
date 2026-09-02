@@ -2496,19 +2496,19 @@ namespace confighttp {
   }
 
   /**
-   * @brief List every guest invite, newest first.
-   * @api_examples{/api/invites| GET| null}
+   * @brief Take back everything an expired invite handed out.
+   *
+   * Expiry is the one revocation nobody triggers. Time only: an invite that merely
+   * ran out of uses must NOT unpair anyone, or a single-use invite would eject the
+   * guest it just admitted.
+   *
+   * Called from the owner's list, so the page always shows the swept state, and
+   * from a timer in start(), because whether an owner happens to open that page
+   * must not decide how long an expired guest keeps streaming. nvhttp separately
+   * refuses an expired invite's device on every permission check; this is about
+   * ending what is already running.
    */
-  void listInvites(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-    print_req(request);
-
-    // Expiry is the one revocation nobody triggers, so it is swept here, where the
-    // owner's page already polls. Time only: an invite that merely ran out of uses
-    // must NOT unpair anyone, or a single-use invite would eject the guest it just
-    // admitted.
+  void sweep_expired_invites() {
     const auto now = invite::policy::clock_t::now();
     for (const auto &invite : invite::list()) {
       const bool expired_by_time =
@@ -2519,12 +2519,28 @@ namespace confighttp {
       const auto live_streams = invite::guest::stream_sessions_for_invite(invite.id);
       if (!live_streams.empty()) {
         close_invite_streams(live_streams, invite.id);
-        invite::guest::revoke_for_invite(invite.id);
       }
+      // Every browser session on it, not only those that reached a stream: a guest
+      // who redeemed and is still on the pre-flight screen must not be able to
+      // start one after the link died. Cheap when there is nothing to drop.
+      invite::guest::revoke_for_invite(invite.id);
       if (!invite.paired_device_uuids.empty()) {
         unpair_invite_devices(invite.id);
       }
     }
+  }
+
+  /**
+   * @brief List every guest invite, newest first.
+   * @api_examples{/api/invites| GET| null}
+   */
+  void listInvites(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    sweep_expired_invites();
 
     nlohmann::json items = nlohmann::json::array();
     for (const auto &invite : invite::list()) {
@@ -2886,6 +2902,10 @@ namespace confighttp {
     nlohmann::json body = nlohmann::json::object();
     body["status"] = paired;
     if (!paired) {
+      // The redemption counted a use the guest never received. Hand it back, or a
+      // single-use invite is spent by a mistyped Moonlight PIN — or by pressing the
+      // button before Moonlight has started pairing at all.
+      invite::refund_use(outcome.invite.id);
       // The invite was good; the Moonlight PIN or the pairing attempt was not.
       // Said plainly, because at this point the caller has already proved they
       // hold the invite and there is nothing left to protect by being vague.
@@ -4616,8 +4636,15 @@ namespace confighttp {
       // grant changes is the owner editing the invite and the guest redeeming again.
       options.input_permission = guest->perm & static_cast<std::uint32_t>(crypto::PERM::_all_inputs);
       options.gamepad_base_slot = guest->gamepad_base_slot;
+      // The app is the invite's choice as well. Pinned to an app, the guest gets that
+      // app; pinned to none, they join whatever is already running. Either way the
+      // app_id the guest put in the body is discarded: create_session launches a
+      // requested app that is not the current one, so honouring it would have let a
+      // watch-only guest start, or replace, anything in the owner's list.
       if (guest->app_id >= 0) {
         options.app_id = guest->app_id;
+      } else {
+        options.app_id.reset();
       }
       BOOST_LOG(info) << "WebRTC: guest session for '"sv << guest->label << "' (perm "sv
                       << *options.input_permission << ", pad slot "sv << guest->gamepad_base_slot << ")"sv;
@@ -6957,6 +6984,15 @@ namespace confighttp {
         if (session_token_manager.cleanup_expired_session_tokens()) {
           session_token_manager.save_session_tokens();
         }
+      }
+    });
+
+    // Expired invites are swept every minute. The owner's invites page sweeps too,
+    // but a guest still streaming an hour after their link died because nobody
+    // happened to open that page is the failure the expiry exists to prevent.
+    std::jthread invite_sweep_thread([shutdown_event]() {
+      while (!shutdown_event->view(std::chrono::minutes(1))) {
+        sweep_expired_invites();
       }
     });
 
