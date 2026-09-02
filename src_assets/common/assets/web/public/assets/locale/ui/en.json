@@ -1192,13 +1192,20 @@
       },
       "history": {
         "actions": "Actions",
+        "app": "Game",
+        "client": "Client",
         "client_and_game": "Client and game",
         "description": "The latest 50 completed sessions stored by this host.",
+        "duration": "Duration",
         "empty_description": "Completed streams will appear here when session history is available.",
         "empty_title": "No session history",
         "outcome": "Outcome",
+        "protocol": "Protocol",
+        "show_all": "Show all {count}",
+        "show_fewer": "Show fewer",
         "stream": "Stream",
-        "table_caption": "Recent completed streaming sessions"
+        "table_caption": "Recent completed streaming sessions",
+        "when": "When"
       },
       "metric": {
         "picture": "Picture"

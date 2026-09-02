@@ -74,6 +74,13 @@ const webRtcSessions = ref<WebRTCSession[]>([]);
 const histories = ref<Record<string, PerformancePoint[]>>({});
 const counterSnapshots = new Map<string, CounterSnapshot>();
 const sessionHistory = ref<SessionSummary[]>([]);
+/// Ten rows by default. The host keeps the latest fifty, and fifty rows of
+/// anything is a page the reader scrolls past on the way to something else.
+const HISTORY_PREVIEW = 10;
+const historyExpanded = ref(false);
+const visibleHistory = computed(() =>
+  historyExpanded.value ? sessionHistory.value : sessionHistory.value.slice(0, HISTORY_PREVIEW),
+);
 const selectedHistory = ref<SessionSummary | null>(null);
 const detailOpen = ref(false);
 const stopConfirmOpen = ref(false);
@@ -416,6 +423,10 @@ async function confirmStop(): Promise<void> {
   }
 }
 
+function streamLabel(history: SessionSummary): string {
+  return `${history.width} × ${history.height} @ ${history.target_fps} · ${history.codec}`;
+}
+
 function historyDate(history: SessionSummary): string {
   const timestamp = history.end_time_unix || history.start_time_unix;
   return formatRelativeTime(timestamp * 1000, locale.value, t('ui.sessions.value.unknown_time'));
@@ -681,32 +692,90 @@ onBeforeUnmount(() => {
           icon="logs"
           compact
         />
-        <div v-else class="history-card-grid">
-          <button
-            v-for="history in sessionHistory"
-            :key="history.uuid"
-            class="history-card"
-            type="button"
-            @click="openHistory(history)"
-          >
-            <span class="history-card__topline">
-              <StatusBadge
-                :label="(history.protocol || t('_common.unknown')).toUpperCase()"
-                tone="info"
-                compact
-              />
-              <time>{{ historyDate(history) }}</time>
-            </span>
-            <strong>{{ history.app_name || t('ui.sessions.value.desktop_stream') }}</strong>
-            <span>{{
-              history.client_name || history.device_name || t('ui.sessions.value.unknown_client')
-            }}</span>
-            <span class="history-card__stream"
-              >{{ history.width }} × {{ history.height }} @ {{ history.target_fps }} ·
-              {{ history.codec }}</span
-            >
-            <span class="history-card__action">{{ t('sessions.history_view_detail') }} →</span>
-          </button>
+        <!-- A table, not cards: fifty cards three abreast ran to several screens,
+             and a two-line row would have run longer still, so game and client get
+             a column each. Rows open the detail dialog and take the keyboard, which
+             is what lets the button column go below 1200px, where it did not fit;
+             protocol and duration go with it, and on a phone client and stream go
+             too — the stream moves under the game name. All of it is in the dialog. -->
+        <div v-else class="vs-table-wrap">
+          <table class="vs-table vs-table--compact history-table">
+            <caption class="visually-hidden">
+              {{
+                t('ui.sessions.history.table_caption')
+              }}
+            </caption>
+            <thead>
+              <tr>
+                <th>{{ t('ui.sessions.history.when') }}</th>
+                <th>{{ t('ui.sessions.history.app') }}</th>
+                <th class="history-table__md">{{ t('ui.sessions.history.client') }}</th>
+                <th class="history-table__lg">{{ t('ui.sessions.history.protocol') }}</th>
+                <th class="history-table__md">{{ t('ui.sessions.history.stream') }}</th>
+                <th class="history-table__lg">{{ t('ui.sessions.history.duration') }}</th>
+                <th class="history-table__lg">
+                  <span class="visually-hidden">{{ t('ui.sessions.history.actions') }}</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="history in visibleHistory"
+                :key="history.uuid"
+                class="history-row"
+                tabindex="0"
+                @click="openHistory(history)"
+                @keydown.enter.prevent="openHistory(history)"
+                @keydown.space.prevent="openHistory(history)"
+              >
+                <td class="history-row__nowrap">
+                  <time>{{ historyDate(history) }}</time>
+                </td>
+                <td class="history-row__truncate">
+                  <strong>{{ history.app_name || t('ui.sessions.value.desktop_stream') }}</strong>
+                  <span class="history-row__sub">{{ streamLabel(history) }}</span>
+                </td>
+                <td class="history-row__truncate history-table__md">
+                  {{
+                    history.client_name ||
+                    history.device_name ||
+                    t('ui.sessions.value.unknown_client')
+                  }}
+                </td>
+                <td class="history-table__lg">
+                  <StatusBadge
+                    :label="(history.protocol || t('_common.unknown')).toUpperCase()"
+                    tone="info"
+                    compact
+                  />
+                </td>
+                <td class="history-row__nowrap history-table__md">{{ streamLabel(history) }}</td>
+                <td class="history-row__nowrap history-table__lg">
+                  {{ formatDuration(history.duration_seconds, locale) }}
+                </td>
+                <td class="vs-table__actions history-table__lg">
+                  <AppButton
+                    :label="t('sessions.history_view_detail')"
+                    variant="tertiary"
+                    size="compact"
+                    @click.stop="openHistory(history)"
+                  />
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-if="sessionHistory.length > HISTORY_PREVIEW" class="history-table__footer">
+            <AppButton
+              :label="
+                historyExpanded
+                  ? t('ui.sessions.history.show_fewer')
+                  : t('ui.sessions.history.show_all', { count: sessionHistory.length })
+              "
+              variant="tertiary"
+              size="compact"
+              @click="historyExpanded = !historyExpanded"
+            />
+          </div>
         </div>
       </section>
     </div>
@@ -844,70 +913,52 @@ onBeforeUnmount(() => {
   font-variant-numeric: tabular-nums;
 }
 
-.history-card-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: var(--vs-space-12);
+/* Seven columns at 16px a side overran a 1280px window's content area by
+   sixteen pixels; 12px keeps every column with room to spare. */
+.history-table th,
+.history-table td {
+  padding-inline: var(--vs-space-12);
 }
 
-.history-card {
-  display: grid;
-  min-width: 0;
-  gap: var(--vs-space-4);
-  padding: var(--vs-space-16);
-  border: 1px solid var(--vs-color-border-subtle);
-  border-radius: var(--vs-radius-card);
-  background: var(--vs-color-bg-surface);
-  color: var(--vs-color-text-secondary);
-  text-align: left;
+.history-row {
   cursor: pointer;
-  transition:
-    border-color var(--vs-motion-duration-control) var(--vs-motion-easing-standard),
-    transform var(--vs-motion-duration-control) var(--vs-motion-easing-standard);
 }
 
-.history-card:hover {
-  border-color: var(--vs-color-accent-default);
-  transform: translateY(-1px);
+.history-row:focus-visible {
+  outline: 2px solid var(--vs-color-accent-default);
+  outline-offset: -2px;
 }
 
-.history-card:focus-visible {
-  outline: var(--vs-focus-width) solid var(--vs-focus-ring);
-  outline-offset: 2px;
+/* Phone-only: the stream line under the game name. */
+.history-row__sub {
+  display: none;
+  color: var(--vs-color-text-secondary);
+  font-size: var(--vs-type-size-metadata);
+  font-weight: var(--vs-type-weight-regular);
 }
 
-.history-card__topline {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--vs-space-8);
-  margin-bottom: var(--vs-space-8);
+.history-row__nowrap {
+  white-space: nowrap;
 }
 
-.history-card time,
-.history-card__stream,
-.history-card__action {
-  color: var(--vs-color-text-muted);
-  font-size: var(--vs-type-size-helper);
-}
-
-.history-card strong {
+.history-row__truncate {
+  max-width: 14rem;
   overflow: hidden;
-  color: var(--vs-color-text-primary);
-  font-size: var(--vs-type-size-control);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.history-card__stream {
-  margin-top: var(--vs-space-8);
-  font-variant-numeric: tabular-nums;
+.history-row__truncate strong {
+  display: block;
+  overflow: hidden;
+  color: var(--vs-color-text-primary);
+  text-overflow: ellipsis;
 }
 
-.history-card__action {
-  margin-top: var(--vs-space-8);
-  color: var(--vs-color-accent-default);
-  font-weight: var(--vs-type-weight-semibold);
+.history-table__footer {
+  display: flex;
+  justify-content: center;
+  padding: var(--vs-space-8);
 }
 
 @media (max-width: 1199px) {
@@ -916,8 +967,8 @@ onBeforeUnmount(() => {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .history-card-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .history-table__lg {
+    display: none;
   }
 
   .visual-session__header {
@@ -931,10 +982,21 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 639px) {
-  .gauge-grid,
-  .host-chart-grid,
-  .history-card-grid {
+  /* The gauges stay two-up: four rings stacked one per row pushed everything
+     else a screen and a half down on a phone. MetricGauge shrinks its ring at
+     this width so two fit inside 360px with the page padding. */
+  .host-chart-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .history-table__md {
+    display: none;
+  }
+
+  .history-row__sub {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .visual-session {

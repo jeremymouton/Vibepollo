@@ -95,4 +95,31 @@ const display = computed(() => `${Math.round(bounded.value)}%`);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Two gauges side by side on a phone: 2 × (7rem ring + 2 × 12px padding + border)
+   plus the grid gap is 280px, inside the 328px a 360px viewport leaves after the
+   page padding. The full-size ring would have overflowed its card there. */
+@media (max-width: 639px) {
+  .metric-gauge {
+    padding: var(--vs-space-12);
+  }
+
+  .metric-gauge__ring {
+    width: 7rem;
+    height: 7rem;
+  }
+
+  .metric-gauge__ring::before {
+    width: 5.5rem;
+    height: 5.5rem;
+  }
+
+  .metric-gauge__ring > div {
+    max-width: 4.75rem;
+  }
+
+  .metric-gauge strong {
+    font-size: 1.35rem;
+  }
+}
 </style>
