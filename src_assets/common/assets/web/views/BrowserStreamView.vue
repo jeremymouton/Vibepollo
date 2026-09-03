@@ -1579,6 +1579,21 @@ function sendPointerMove(event: PointerEvent): void {
   });
 }
 
+/// Right-click belongs to the streamed desktop, not to this browser.
+///
+/// Button 2 already goes to the host with every pointerdown, so the remote menu
+/// does open — the browser's own menu just draws on top of it and swallows the
+/// next click. Suppressing it here rather than in attachInputCapture because
+/// that helper is attached with pointerAndKeyboard:false (gamepads only), so its
+/// contextmenu handler never runs for this view.
+///
+/// Only while input is actually being forwarded. With no stream running this is
+/// an ordinary page and should keep an ordinary right-click.
+function suppressContextMenu(event: MouseEvent): void {
+  if (!inputReady.value) return;
+  event.preventDefault();
+}
+
 function sendPointerButton(event: PointerEvent, type: 'mouse_down' | 'mouse_up'): void {
   if (!inputReady.value) return;
   const surface = streamSurface.value;
@@ -2200,6 +2215,7 @@ onDeactivated(() => {
         :aria-label="t('ui.browser_stream.stream_surface')"
         @keydown="sendKey($event, 'key_down')"
         @keyup="sendKey($event, 'key_up')"
+        @contextmenu="suppressContextMenu"
         @pointerdown="sendPointerButton($event, 'mouse_down')"
         @pointermove="sendPointerMove"
         @pointerup="sendPointerButton($event, 'mouse_up')"
