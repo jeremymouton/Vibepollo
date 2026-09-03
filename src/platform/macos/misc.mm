@@ -9,6 +9,7 @@
 #endif
 
 // standard includes
+#include <cstdlib>
 #include <fcntl.h>
 #include <ifaddrs.h>
 
@@ -337,6 +338,19 @@ namespace platf {
     // Gracefully clean up and restart ourselves instead of exiting
     atexit(restart_on_exit);
     lifetime::exit_sunshine(0, true);
+  }
+
+  bool suspend() {
+    // pmset is the supported way to sleep macOS from a process; the IOKit route
+    // needs entitlements this build does not carry.
+    const int rc = std::system("pmset sleepnow");
+    if (rc != 0) {
+      BOOST_LOG(error) << "Cannot suspend: 'pmset sleepnow' returned " << rc;
+      return false;
+    }
+
+    BOOST_LOG(info) << "Host suspended on request";
+    return true;
   }
 
   int set_env(const std::string &name, const std::string &value) {

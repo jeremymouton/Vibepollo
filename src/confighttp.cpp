@@ -6282,6 +6282,48 @@ namespace confighttp {
   }
 
   /**
+   * @brief Put the host to sleep.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * Unlike restart and quit, this answers before acting. The process survives a
+   * suspend, so the caller gets a real reply — and it has to be sent before the
+   * machine goes down or the socket dies mid-flight and the UI cannot tell a
+   * successful sleep from a failure.
+   *
+   * Any running stream is terminated first. Sleeping under a live session would
+   * strand the client on a frozen picture; the UI warns about this before asking.
+   *
+   * @api_examples{/api/suspend| POST| null}
+   */
+  void suspend(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    const int active = rtsp_stream::session_count() + static_cast<int>(webrtc_stream::active_session_count());
+    BOOST_LOG(info) << "Suspend requested with "sv << active << " active session(s)"sv;
+
+    nlohmann::json output_tree;
+    output_tree["status"] = true;
+    output_tree["terminatedSessions"] = active;
+    send_response(response, output_tree);
+
+    // Off the HTTP thread: SetSuspendState blocks until the machine comes back,
+    // and holding the request thread for the length of a nap would wedge the
+    // config server. Detached because there is nothing left to join — when this
+    // returns, the host has already woken up again.
+    std::thread([]() {
+      proc::proc.terminate();
+      if (!platf::suspend()) {
+        BOOST_LOG(error) << "Suspend request failed"sv;
+      }
+    }).detach();
+  }
+
+  /**
    * @brief Quit Apollo.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -6869,6 +6911,7 @@ namespace confighttp {
     register_api_route("^/api/metadata$", "GET", getMetadata);
     register_api_route("^/api/configLocale$", "GET", getLocale);
     register_api_route("^/api/restart$", "POST", restart);
+    register_api_route("^/api/suspend$", "POST", suspend);
     register_api_route("^/api/quit$", "POST", quit);
     register_blocking_api_route("^/api/reset-display-device-persistence$", "POST", resetDisplayDevicePersistence);
 #if defined(_WIN32)

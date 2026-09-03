@@ -9,6 +9,7 @@
 #endif
 
 // standard includes
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -590,6 +591,20 @@ namespace platf {
     // Gracefully clean up and restart ourselves instead of exiting
     atexit(restart_on_exit);
     lifetime::exit_sunshine(0, true);
+  }
+
+  bool suspend() {
+    // logind owns sleep on every distro Vibepollo targets, and systemctl is its
+    // front door. Going through the CLI rather than the DBus API keeps this free
+    // of a new link-time dependency for a button pressed once in a while.
+    const int rc = std::system("systemctl suspend");
+    if (rc != 0) {
+      BOOST_LOG(error) << "Cannot suspend: 'systemctl suspend' returned "sv << rc;
+      return false;
+    }
+
+    BOOST_LOG(info) << "Host suspended on request"sv;
+    return true;
   }
 
   int set_env(const std::string &name, const std::string &value) {

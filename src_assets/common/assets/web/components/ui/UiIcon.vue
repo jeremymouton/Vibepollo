@@ -35,6 +35,9 @@ const iconPaths: Record<UiIconName, IconDefinition> = {
   overview: ['M3 3h7v7H3z', 'M14 3h7v7h-7z', 'M3 14h7v7H3z', 'M14 14h7v7h-7z'],
   play: ['m8 5 11 7-11 7Z'],
   plus: ['M12 5v14', 'M5 12h14'],
+  // Sleep. A crescent is the one shape that reads as "suspend" rather than
+  // "power off" — the machine is meant to come back.
+  moon: ['M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z'],
   refresh: ['M20 6v5h-5', 'M4 18v-5h5', 'M18.5 9A7 7 0 0 0 6.2 6.2L4 11', 'M5.5 15A7 7 0 0 0 17.8 17.8L20 13'],
   // Sharpening / enhancement. A sparkle is the common metaphor for it, and there
   // was no icon in the set that read as "make the picture better".

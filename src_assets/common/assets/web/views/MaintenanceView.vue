@@ -76,7 +76,8 @@ type PendingAction =
   | { kind: 'golden-export' }
   | { kind: 'golden-delete' }
   | { kind: 'revoke-session'; session: BrowserSession }
-  | { kind: 'restart' };
+  | { kind: 'restart' }
+  | { kind: 'sleep' };
 
 const { locale, t } = useI18n();
 const system = useSystemStore();
@@ -309,6 +310,16 @@ const dialogCopy = computed(() => {
       tone: 'danger' as const,
     };
   }
+  if (action?.kind === 'sleep') {
+    return {
+      title: t('ui.maintenance.confirm.sleepTitle'),
+      description: system.isStreaming
+        ? t('ui.maintenance.confirm.sleepDescriptionStreaming')
+        : t('ui.maintenance.confirm.sleepDescription'),
+      confirm: t('ui.maintenance.actions.sleepHost'),
+      tone: 'danger' as const,
+    };
+  }
   if (action?.kind === 'restart') {
     return {
       title: t('ui.maintenance.confirm.restartTitle'),
@@ -358,6 +369,11 @@ async function runConfirmedAction(): Promise<void> {
         browser: sessionName(action.session),
       });
       await load();
+    } else if (action.kind === 'sleep') {
+      // The host answers before it sleeps, so unlike restart a reply is expected
+      // here and a dropped connection is a real failure, not the success path.
+      await apiPost('/api/suspend', {});
+      notice.value = t('ui.maintenance.notices.sleepRequested');
     } else {
       notice.value = t('ui.maintenance.notices.restartRequested');
       try {
@@ -703,12 +719,20 @@ onMounted(() => void load());
           <h2 id="restart-title">{{ t('troubleshooting.restart_sunshine') }}</h2>
           <p>{{ t('ui.maintenance.restart.description') }}</p>
         </div>
-        <AppButton
-          icon="refresh"
-          :label="t('ui.maintenance.actions.restartService')"
-          variant="danger"
-          @click="requestAction({ kind: 'restart' })"
-        />
+        <div class="danger-zone__actions">
+          <AppButton
+            icon="moon"
+            :label="t('ui.maintenance.actions.sleepHost')"
+            variant="secondary"
+            @click="requestAction({ kind: 'sleep' })"
+          />
+          <AppButton
+            icon="refresh"
+            :label="t('ui.maintenance.actions.restartService')"
+            variant="danger"
+            @click="requestAction({ kind: 'restart' })"
+          />
+        </div>
       </section>
     </template>
 
@@ -730,6 +754,12 @@ onMounted(() => void load());
 .maintenance-page {
   display: grid;
   gap: var(--vs-space-24);
+}
+
+.danger-zone__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--vs-space-12);
 }
 
 .maintenance-section {

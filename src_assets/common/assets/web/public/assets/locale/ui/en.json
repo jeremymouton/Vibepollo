@@ -739,7 +739,8 @@
         "deleteSnapshot": "Delete snapshot",
         "replaceSnapshot": "Replace snapshot",
         "restartService": "Restart service",
-        "revokeSession": "Revoke session"
+        "revokeSession": "Revoke session",
+        "sleepHost": "Sleep"
       },
       "applying": "Applying",
       "confirm": {
@@ -752,7 +753,10 @@
         "restartDescription": "Active streams will disconnect and this interface will be unavailable while the service restarts.",
         "restartTitle": "Restart Vibepollo?",
         "revokeSessionDescription": "That browser will need to sign in again before it can manage this host.",
-        "revokeSessionTitle": "Revoke {browser}?"
+        "revokeSessionTitle": "Revoke {browser}?",
+        "sleepTitle": "Put the PC to sleep?",
+        "sleepDescription": "The host will suspend to sleep. Streaming and the web UI stay unavailable until it wakes — send a wake signal or use the machine directly to bring it back.",
+        "sleepDescriptionStreaming": "A session is running right now. Sleeping the host ends it immediately and disconnects whoever is streaming. They will not be warned."
       },
       "crash": {
         "acknowledged": "Crash acknowledged",
@@ -786,7 +790,8 @@
         "restartRequested": "Restart requested. Reconnect after the Vibepollo service comes back online.",
         "sessionRevoked": "{browser} was revoked.",
         "snapshotCaptured": "The current display layout is now the recovery baseline.",
-        "snapshotDeleted": "The display recovery snapshot was deleted."
+        "snapshotDeleted": "The display recovery snapshot was deleted.",
+        "sleepRequested": "The host is going to sleep."
       },
       "recovery": {
         "available": "Available",
@@ -946,7 +951,7 @@
         "bitrate": "Bitrate (Kbps; 0 = host default)",
         "bitrate_recommended_hint": "Recommended for this resolution and frame rate: {value}.",
         "bitrate_simple": "Bitrate",
-        "bitrate_tracks_recommendation": "Set automatically for this resolution and frame rate \u2014 drag the slider to override.",
+        "bitrate_tracks_recommendation": "Set automatically for this resolution and frame rate — drag the slider to override.",
         "bitrate_use_recommended": "Use recommended",
         "codec": "Video codec",
         "description": "Unavailable options stay disabled instead of silently falling back to another codec or SDR.",

@@ -736,6 +736,15 @@ namespace platf {
   void restart();
 
   /**
+   * @brief Put the host to sleep (suspend to RAM).
+   * @return true if the OS accepted the request.
+   * @note Returns rather than exiting: unlike restart(), the process survives a
+   *       suspend and keeps running when the machine wakes, so the caller can
+   *       still answer the HTTP request that asked for it.
+   */
+  bool suspend();
+
+  /**
    * @brief Set an environment variable.
    * @param name The name of the environment variable.
    * @param value The value to set the environment variable to.

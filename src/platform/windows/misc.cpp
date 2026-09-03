@@ -1698,6 +1698,66 @@ namespace platf {
     lifetime::exit_sunshine(0, true);
   }
 
+  bool suspend() {
+    // SetSuspendState lives in powrprof.dll, which this build does not link
+    // against. Resolved at runtime for the same reason wlanapi and qwave are
+    // above: it leaves the link line alone and degrades to a logged error
+    // instead of a missing symbol.
+    auto powrprof = LoadLibraryExA("powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!powrprof) {
+      BOOST_LOG(error) << "Cannot suspend: powrprof.dll failed to load"sv;
+      return false;
+    }
+    auto free_powrprof = util::fail_guard([powrprof] {
+      FreeLibrary(powrprof);
+    });
+
+    auto fn_SetSuspendState = (BOOLEAN(WINAPI *)(BOOLEAN, BOOLEAN, BOOLEAN)) GetProcAddress(powrprof, "SetSuspendState");
+    if (!fn_SetSuspendState) {
+      BOOST_LOG(error) << "Cannot suspend: powrprof.dll is missing SetSuspendState"sv;
+      return false;
+    }
+
+    // Suspending needs SE_SHUTDOWN_NAME. It is present but disabled by default,
+    // so it has to be switched on for this process first.
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+      BOOST_LOG(error) << "Cannot suspend: OpenProcessToken failed, "sv << GetLastError();
+      return false;
+    }
+    auto close_token = util::fail_guard([token] {
+      CloseHandle(token);
+    });
+
+    TOKEN_PRIVILEGES tp {};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!LookupPrivilegeValue(nullptr, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid)) {
+      BOOST_LOG(error) << "Cannot suspend: LookupPrivilegeValue failed, "sv << GetLastError();
+      return false;
+    }
+
+    // AdjustTokenPrivileges reports success even when it changed nothing, so the
+    // real answer is in GetLastError() — which must be cleared first, or a stale
+    // error from an earlier call is read as this one failing.
+    SetLastError(ERROR_SUCCESS);
+    AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    if (GetLastError() != ERROR_SUCCESS) {
+      BOOST_LOG(error) << "Cannot suspend: SeShutdownPrivilege was not granted"sv;
+      return false;
+    }
+
+    // Sleep rather than hibernate, and do not disable wake events — the whole
+    // point is that a magic packet can bring it back.
+    if (!fn_SetSuspendState(FALSE, FALSE, FALSE)) {
+      BOOST_LOG(error) << "SetSuspendState failed, "sv << GetLastError();
+      return false;
+    }
+
+    BOOST_LOG(info) << "Host suspended on request"sv;
+    return true;
+  }
+
   int set_env(const std::string &name, const std::string &value) {
     return services::process_environment().set(name, value);
   }
