@@ -1287,6 +1287,11 @@ jobs:
           name: build-Windows
           path: artifacts/
           if-no-files-found: error
+          # Every other upload in this file caps retention; this one did not, so
+          # it inherited the 90-day default and a week of pushes accumulated
+          # 38 copies at 37MB — several times a free account's whole quota.
+          # A week is long enough to pull an installer off a branch build.
+          retention-days: 7
           overwrite: true
 
       - name: Publish private symbols release
