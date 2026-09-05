@@ -21,6 +21,8 @@ interface InputCaptureOptions {
   shouldDrop?: (payload: InputMessage) => boolean;
 }
 
+/** Encode absolute motion as the host's seven-byte, sequence-stamped move packet. */
+export declare function encodeMouseMove(x: number, y: number): ArrayBuffer;
 export declare function requestKeyboardLock(keys?: string[]): Promise<boolean>;
 export declare function releaseKeyboardLock(): void;
 export declare function applyGamepadFeedback(message: GamepadFeedbackMessage | unknown): void;

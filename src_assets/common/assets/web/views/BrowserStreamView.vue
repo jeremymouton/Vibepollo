@@ -25,7 +25,7 @@ import {
 } from '@/services/webrtc';
 import TouchGamepad from '@/components/TouchGamepad.vue';
 import { useActiveStream } from '@/stores/activeStream';
-import { applyGamepadFeedback, attachInputCapture } from '@/utils/webrtc/input';
+import { applyGamepadFeedback, attachInputCapture, encodeMouseMove } from '@/utils/webrtc/input';
 import type { SessionStatus } from '@/types/sessions';
 import { attachVideoUpscaler } from '@/utils/webrtc/upscaler';
 import { fetchIceServers, probeConnectivity } from '@/utils/webrtc/connectivity';
@@ -1571,12 +1571,11 @@ function sendPointerMove(event: PointerEvent): void {
     pressed.x = position.x;
     pressed.y = position.y;
   }
-  browserSession.sendInput({
-    ...position,
-    buttons: event.buttons,
-    modifiers: modifiers(event),
-    type: 'mouse_move',
-  });
+  // Motion goes as the binary packet the desktop capture path already uses. The
+  // host reads only x and y off a JSON move anyway, so `buttons` and `modifiers`
+  // were bytes it threw away — and the binary form carries the sequence number
+  // the host needs to discard a move that arrives out of order.
+  browserSession.sendRawInput(encodeMouseMove(position.x, position.y));
 }
 
 /// Right-click belongs to the streamed desktop, not to this browser.

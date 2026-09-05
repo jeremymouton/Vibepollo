@@ -59,7 +59,11 @@ let keyboardLockPendingRequests = 0;
 export function requestKeyboardLock(keys?: string[]): Promise<boolean> {
   const keyboardLockApi = getKeyboardLockApi();
   if (!keyboardLockApi?.lock) return Promise.resolve(false);
-  if (typeof window !== 'undefined' && 'isSecureContext' in window && !(window as any).isSecureContext) {
+  if (
+    typeof window !== 'undefined' &&
+    'isSecureContext' in window &&
+    !(window as any).isSecureContext
+  ) {
     return Promise.resolve(false);
   }
   if (keyboardLockActive) {
@@ -218,6 +222,36 @@ function normalizePoint(
     x: Math.min(1, Math.max(0, x)),
     y: Math.min(1, Math.max(0, y)),
   };
+}
+
+/// The host reads mouse motion as seven bytes, not JSON: a type tag, a 16-bit
+/// sequence, and absolute x/y as 16-bit units (webrtc_stream.cpp,
+/// handle_input_message_binary). The JSON form carries `buttons` and
+/// `modifiers` that the host's handler reads right past, so this is the same
+/// motion in a tenth of the bytes.
+///
+/// The sequence is what earns the saving: the host drops a move whose sequence
+/// has already been passed (seq_newer_u16), so a move that overtakes another in
+/// flight cannot pull the cursor back to an older coordinate. That guard is
+/// what makes it safe to carry motion on an unordered channel, where a lost
+/// packet does not hold up every input behind it.
+///
+/// One counter for the page, not one per capture: the host keeps a single
+/// sequence per session, so two encoders counting separately would each look
+/// stale to the other and drop each other's moves.
+let mouseMoveSeq = 0;
+
+const toU16Unit = (value: number) => Math.round(Math.min(1, Math.max(0, value)) * 65535);
+
+export function encodeMouseMove(x: number, y: number): ArrayBuffer {
+  const out = new ArrayBuffer(7);
+  const view = new DataView(out);
+  view.setUint8(0, 1);
+  view.setUint16(1, mouseMoveSeq, true);
+  view.setUint16(3, toU16Unit(x), true);
+  view.setUint16(5, toU16Unit(y), true);
+  mouseMoveSeq = (mouseMoveSeq + 1) & 0xffff;
+  return out;
 }
 
 function normalizeWheelDelta(delta: number, deltaMode: number): number {
@@ -732,7 +766,6 @@ export function attachInputCapture(
   let queuedMove: InputMessage | null = null;
   let queuedMoveAt = 0;
   let rafId = 0;
-  let mouseMoveSeq = 0;
   const pressedKeys = new Map<
     string,
     { key: string; code: string; chorded: boolean; lastRepeatSentAt?: number }
@@ -754,23 +787,12 @@ export function attachInputCapture(
   let moveRateCount = 0;
   let moveSendRateCount = 0;
   let lastMetricsEmitAt = 0;
-  const toU16Unit = (value: number) => Math.round(Math.min(1, Math.max(0, value)) * 65535);
-  const encodeMouseMove = (payload: InputMessage & { type: 'mouse_move' }) => {
-    const out = new ArrayBuffer(7);
-    const view = new DataView(out);
-    view.setUint8(0, 1);
-    view.setUint16(1, mouseMoveSeq, true);
-    view.setUint16(3, toU16Unit(payload.x), true);
-    view.setUint16(5, toU16Unit(payload.y), true);
-    mouseMoveSeq = (mouseMoveSeq + 1) & 0xffff;
-    return out;
-  };
   const sendPayload = (payload: InputMessage) => {
     if (shouldDrop?.(payload)) {
       return false;
     }
     if (payload.type === 'mouse_move') {
-      return send(encodeMouseMove(payload)) !== false;
+      return send(encodeMouseMove(payload.x, payload.y)) !== false;
     }
     return send(JSON.stringify(payload)) !== false;
   };
@@ -1028,7 +1050,8 @@ export function attachInputCapture(
       sendPayload(payload);
       return;
     }
-    const chorded = shouldPreventDefaultKey(event) && (event.metaKey || event.ctrlKey || event.altKey);
+    const chorded =
+      shouldPreventDefaultKey(event) && (event.metaKey || event.ctrlKey || event.altKey);
     pressedKeys.set(event.code, { key: event.key, code: event.code, chorded });
     const payload: InputMessage = {
       type: 'key_down',
