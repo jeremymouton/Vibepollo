@@ -784,8 +784,24 @@ namespace platf::dxgi {
       return false;
     }
 
-    // Check if we can use the Desktop Duplication API on this output
-    for (int x = 0; x < 2; ++x) {
+    // Check if we can use the Desktop Duplication API on this output.
+    //
+    // DXGI_ERROR_MODE_CHANGE_IN_PROGRESS is documented as "the call may succeed if
+    // attempted later": a mode change is in flight, which is the ordinary state of the
+    // world for a moment after a virtual display is created or torn down. That says
+    // nothing about whether this output can be captured, so it gets a longer budget than
+    // the two quick tries that settle a genuine failure. Treating it as a verdict is what
+    // makes it permanent: the caller drops the output from enumeration, finds the list
+    // empty, and re-enumerates -- and on Windows that re-enumeration is itself a display
+    // change, so it starts another mode change and the condition sustains itself.
+    constexpr int settled_attempts = 2;
+    constexpr auto retry_delay = 200ms;
+    constexpr auto mode_change_budget = 1500ms;
+
+    const auto mode_change_deadline = std::chrono::steady_clock::now() + mode_change_budget;
+    bool waited_for_mode_change = false;
+
+    for (int x = 0;; ++x) {
       dup_t dup;
 
       // Only resynchronize the thread desktop when not enumerating displays.
@@ -804,12 +820,32 @@ namespace platf::dxgi {
       // capture the current desktop, just bail immediately. Retrying won't help.
       if (enumeration_only && status == E_ACCESSDENIED) {
         break;
-      } else {
-        std::this_thread::sleep_for(200ms);
       }
+
+      if (status == DXGI_ERROR_MODE_CHANGE_IN_PROGRESS) {
+        if (std::chrono::steady_clock::now() >= mode_change_deadline) {
+          break;
+        }
+        if (!waited_for_mode_change) {
+          BOOST_LOG(debug) << "DuplicateOutput() deferred by an in-progress mode change; waiting for it to settle."sv;
+          waited_for_mode_change = true;
+        }
+      } else if (x + 1 >= settled_attempts) {
+        break;
+      }
+
+      std::this_thread::sleep_for(retry_delay);
     }
 
-    BOOST_LOG(error) << "DuplicateOutput() test failed [0x"sv << util::hex(status).to_string_view() << ']';
+    if (status == DXGI_ERROR_MODE_CHANGE_IN_PROGRESS) {
+      // Distinct from the line below on purpose: this output may well be capturable, and
+      // the display configuration simply never stopped moving long enough to prove it.
+      BOOST_LOG(warning) << "DuplicateOutput() test gave up after "sv
+                         << std::chrono::duration_cast<std::chrono::milliseconds>(mode_change_budget).count()
+                         << "ms of in-progress mode changes [0x"sv << util::hex(status).to_string_view() << ']';
+    } else {
+      BOOST_LOG(error) << "DuplicateOutput() test failed [0x"sv << util::hex(status).to_string_view() << ']';
+    }
     return false;
   }
 
