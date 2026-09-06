@@ -2990,7 +2990,27 @@ namespace video {
             }
 #endif
 
+            // A capture target that never comes back is a failure, not something to wait
+            // out forever. Every pass here re-enumerates displays, and on Windows that
+            // re-enumeration is itself a display change -- so a target that cannot be
+            // duplicated keeps provoking the very mode changes that stop it from being
+            // duplicated, and the loop sustains its own failure. Left unbounded it spins
+            // for as long as the viewer leaves the session up, emitting no frames while
+            // audio and input keep flowing, which reaches the client as an unexplained
+            // black screen rather than an error it can show. Bound it so the session ends
+            // and says why. The budget is far longer than any real mode change so an
+            // ordinary slow display switch still completes.
+            constexpr auto reinit_budget = 30s;
+            const auto reinit_deadline = std::chrono::steady_clock::now() + reinit_budget;
+
             while (capture_ctx_queue->running()) {
+              if (std::chrono::steady_clock::now() >= reinit_deadline) {
+                BOOST_LOG(error) << "Giving up on capture reinitialization after "sv
+                                 << std::chrono::duration_cast<std::chrono::seconds>(reinit_budget).count()
+                                 << "s without a usable capture display; ending the session."sv;
+                break;
+              }
+
               // Release the display before reenumerating displays, since some capture backends
               // only support a single display session per device/application.
               disp.reset();
