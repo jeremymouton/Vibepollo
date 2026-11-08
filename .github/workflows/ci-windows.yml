@@ -483,6 +483,22 @@ jobs:
           cmake --build build --target all -j "$(nproc)"
           echo "::remove-matcher owner=gcc::"
 
+      - name: Test Windows application startup
+        id: test-windows-startup
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ inputs.release_version }}
+        run: |
+          ./scripts/test_windows_startup.ps1 -Executable ./build/sunshine.exe -ExpectedVersion $env:EXPECTED_VERSION
+
+      - name: Preserve failed startup binary
+        if: failure() && steps.test-windows-startup.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: windows-startup-diagnostics
+          path: build/sunshine.exe
+          retention-days: 7
+
       - name: Test native AMF lifecycle behavior
         shell: msys2 {0}
         run: |
@@ -665,6 +681,26 @@ jobs:
           msi_name="$(basename "${msi_path}")"
           cp "${msi_path}" "../unsigned-signpath-msi/${msi_name}"
           echo "msi_name=${msi_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Test packaged Windows application startup
+        shell: pwsh
+        timeout-minutes: 3
+        env:
+          MSI_NAME: ${{ steps.package-windows-msi.outputs.msi_name }}
+          EXPECTED_VERSION: ${{ inputs.release_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Resolve-Path "unsigned-signpath-msi/$env:MSI_NAME").Path
+          $payload = Join-Path $env:RUNNER_TEMP 'windows-startup-payload'
+          $log = Join-Path $env:RUNNER_TEMP 'windows-startup-extract.log'
+          $process = Start-Process msiexec.exe -ArgumentList @('/a', "`"$msi`"", '/qn', "TARGETDIR=`"$payload`"", '/l*v', "`"$log`"") -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            Get-Content $log
+            throw "MSI extraction failed with $($process.ExitCode)"
+          }
+          $executables = @(Get-ChildItem $payload -Recurse -Filter sunshine.exe -File)
+          if ($executables.Count -ne 1) { throw 'Expected exactly one packaged sunshine.exe' }
+          ./scripts/test_windows_startup.ps1 -Executable $executables[0].FullName -ExpectedVersion $env:EXPECTED_VERSION
 
       - name: Upload unsigned MSI for SignPath
         id: upload-unsigned-msi
