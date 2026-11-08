@@ -6,6 +6,8 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 // lib includes
 #include <nlohmann/json.hpp>
@@ -56,6 +58,76 @@ namespace confighttp {
     std::unique_ptr<policy::RequestAuthPolicy> auth;
     bool credentials_configured = true;
   };
+
+  TEST_F(ConfigHttpAuthHelpersTest, BootstrapAcceptsOnlyNumericLoopbackBeforeCredentialsExist) {
+    credentials_configured = false;
+    for (const auto &address : {"127.0.0.1", "127.42.0.1", "::1", "::ffff:127.0.0.1"}) {
+      EXPECT_TRUE(auth->check_setup(address).ok) << address;
+    }
+    for (const auto &address : {"192.168.1.7", "8.8.8.8", "::ffff:192.168.1.7", "::", "localhost", "127.0.0.1.attacker.test", ""}) {
+      EXPECT_FALSE(auth->check_setup(address).ok) << address;
+    }
+    credentials_configured = true;
+    EXPECT_FALSE(auth->check_setup("127.0.0.1").ok);
+  }
+
+  TEST(PasswordAttemptLimiterTest, JsonAndBasicShareAttemptBudgetWithoutBlockingOtherPeers) {
+    using Clock = policy::PasswordAttemptLimiter::clock;
+    auto now = Clock::now();
+    policy::PasswordAttemptLimiter limiter([&] { return now; });
+    policy::RequestAuthDependencies deps;
+    deps.remote_allowed = [](const auto &) { return true; };
+    deps.credentials_configured = [] { return true; };
+    deps.https_port = [] { return std::uint16_t {47990}; };
+    deps.decode_base64 = [](const auto &text) { return text; };
+    int verified = 0;
+    deps.password_auth = [&](const auto &remote, const auto &username, const auto &password) {
+      return limiter.verify(remote, [&] { ++verified; return username == "admin" && password == "correct"; });
+    };
+    policy::RequestAuthPolicy auth(std::move(deps));
+    for (int attempt = 0; attempt < 5; ++attempt) {
+      auto result = attempt % 2 ? auth.check("10.0.0.1", "Basic admin:wrong", "/api/config", "GET") : auth.check_password("10.0.0.1", "random-user", "wrong");
+      EXPECT_EQ(result.code, SimpleWeb::StatusCode::client_error_unauthorized);
+    }
+    auto blocked = auth.check_password("10.0.0.1", "admin", "correct");
+    EXPECT_EQ(blocked.code, SimpleWeb::StatusCode::client_error_too_many_requests);
+    ASSERT_NE(blocked.headers.find("Retry-After"), blocked.headers.end());
+    EXPECT_EQ(verified, 5);
+    EXPECT_TRUE(auth.check_password("10.0.0.2", "admin", "correct").ok);
+    now += std::chrono::minutes(1);
+    EXPECT_TRUE(auth.check("10.0.0.1", "Basic admin:correct", "/api/config", "GET").ok);
+  }
+
+  TEST(PasswordAttemptLimiterTest, ConcurrentAttemptsCannotAllPassReservation) {
+    policy::PasswordAttemptLimiter limiter;
+    std::atomic<int> verified = 0;
+    std::vector<std::thread> requests;
+    for (int i = 0; i < 32; ++i) {
+      requests.emplace_back([&] { limiter.verify("10.0.0.1", [&] { ++verified; return false; }); });
+    }
+    for (auto &request : requests) request.join();
+    EXPECT_EQ(verified.load(), 5);
+  }
+
+  TEST(PasswordAttemptLimiterTest, DistributedAttackAddsShortBackoffAndKeepsLocalRecovery) {
+    using Clock = policy::PasswordAttemptLimiter::clock;
+    auto now = Clock::now();
+    policy::PasswordAttemptLimiter limiter([&] { return now; });
+    for (int i = 0; i < 100; ++i) {
+      EXPECT_EQ(limiter.verify("10.0.0." + std::to_string(i), [] { return false; }).retry_after, 0);
+    }
+    EXPECT_TRUE(limiter.verify("10.1.0.1", [] { return true; }).accepted);
+    EXPECT_EQ(limiter.verify("10.1.0.2", [] { return true; }).retry_after, 1);
+    EXPECT_TRUE(limiter.verify("::ffff:127.0.0.1", [] { return true; }).accepted);
+    now += std::chrono::seconds(1);
+    EXPECT_TRUE(limiter.verify("10.1.0.2", [] { return true; }).accepted);
+  }
+
+  TEST_F(ConfigHttpAuthHelpersTest, DirectPasswordLoginAlsoEnforcesNetworkAndSetupPolicy) {
+    EXPECT_EQ(auth->check_password("10.0.0.1", "testuser", "testpass").code, SimpleWeb::StatusCode::client_error_forbidden);
+    credentials_configured = false;
+    EXPECT_FALSE(auth->check_password("127.0.0.1", "testuser", "testpass").ok);
+  }
 
   TEST_F(ConfigHttpAuthHelpersTest, given_unauthorized_error_when_making_auth_error_then_should_return_proper_response) {
     auto result = auth->make_error(SimpleWeb::StatusCode::client_error_unauthorized, "Unauthorized");

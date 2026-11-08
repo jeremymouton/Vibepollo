@@ -230,6 +230,11 @@ find_package(OpenSSL REQUIRED)
 # paths.  A component explicitly opts in to the one external surface it uses;
 # this keeps edits in a vendored SDK from rebuilding unrelated test targets.
 add_library(sunshine_test_simple_web_headers INTERFACE)
+include("${SUNSHINE_TEST_REPOSITORY_ROOT}/cmake/dependencies/SimpleWebServerHardening.cmake")
+sunshine_prepare_simple_web_server("${SUNSHINE_TEST_REPOSITORY_ROOT}"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/simple-web-server" SUNSHINE_TEST_SIMPLE_WEB_INCLUDE_DIR)
+target_include_directories(sunshine_test_simple_web_headers BEFORE INTERFACE
+    "${SUNSHINE_TEST_SIMPLE_WEB_INCLUDE_DIR}")
 target_include_directories(sunshine_test_simple_web_headers SYSTEM INTERFACE
     "${SUNSHINE_TEST_REPOSITORY_ROOT}/third-party")
 target_link_libraries(sunshine_test_simple_web_headers INTERFACE
@@ -390,15 +395,23 @@ sunshine_register_component(NAME test_component_state_storage TEST_SOURCE unit/t
 sunshine_register_component(NAME test_component_invite_policy TEST_SOURCE unit/test_invite_policy.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/invite_policy.cpp"
     LINK_LIBRARIES sunshine_test_json_headers)
+sunshine_register_component(NAME test_component_invite_lifecycle TEST_SOURCE unit/test_invite_lifecycle.cpp
+    SUPPORT_SOURCES "${CMAKE_CURRENT_LIST_DIR}/support/invite_test_dependencies.cpp"
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/invites.cpp" "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/invite_policy.cpp"
+    LINK_LIBRARIES sunshine_test_json_headers Boost::headers Boost::log OpenSSL::Crypto)
 sunshine_register_component(NAME test_component_http_auth TEST_SOURCE unit/test_http_auth.cpp
     EXTRA_TEST_SOURCES "${CMAKE_CURRENT_LIST_DIR}/unit/test_confighttp.cpp"
     PRODUCT_SOURCES
         "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/http_auth_policy.cpp"
         "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/http_auth_request_policy.cpp"
         "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/config_http_policy.cpp"
-    LINK_LIBRARIES GTest::gmock sunshine_test_simple_web_headers ws2_32)
+    LINK_LIBRARIES GTest::gmock sunshine_test_simple_web_headers sunshine_test_json_headers Boost::headers "$<$<PLATFORM_ID:Windows>:ws2_32>")
 sunshine_register_component(NAME test_component_http_policy TEST_SOURCE unit/test_httpcommon.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/http_policy.cpp")
+sunshine_register_component(NAME test_component_http_security TEST_SOURCE unit/test_http_security.cpp
+    LINK_LIBRARIES sunshine_test_simple_web_headers Boost::headers "$<$<PLATFORM_ID:Windows>:ws2_32>")
+sunshine_register_component(NAME test_component_csrf_token_store TEST_SOURCE unit/test_csrf_token_store.cpp
+    LINK_LIBRARIES OpenSSL::Crypto)
 sunshine_register_component(NAME test_component_network_policy TEST_SOURCE unit/test_network.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/network_policy.cpp"
     LINK_LIBRARIES ws2_32)

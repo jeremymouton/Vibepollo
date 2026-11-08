@@ -187,6 +187,7 @@ namespace confighttp {
     std::string device_label;
     std::string refresh_token_hash;
     std::string rotation_id;
+    std::string credentials_tag;
   };
 
   struct SessionTokenView {
@@ -217,6 +218,7 @@ namespace confighttp {
     boost::function<bool(const std::string &)> file_exists;
     boost::function<void(const std::string &, boost::property_tree::ptree &)> read_json;
     boost::function<void(const std::string &, const boost::property_tree::ptree &)> write_json;
+    boost::function<std::string()> credentials_tag;
     SessionTokenManagerDependencies() = default;
     SessionTokenManagerDependencies(const SessionTokenManagerDependencies &) = default;
     SessionTokenManagerDependencies &operator=(const SessionTokenManagerDependencies &) = default;
@@ -268,6 +270,7 @@ namespace confighttp {
      * @param token Token to remove.
      */
     void revoke_session_token(const std::string &token);
+    bool revoke_all_session_tokens();
     /**
      * @brief Remove all expired tokens.
      */
@@ -292,7 +295,7 @@ namespace confighttp {
     /**
      * @brief Persist session tokens to disk.
      */
-    void save_session_tokens() const;
+    bool save_session_tokens() const;
     /**
      * @brief Load session tokens from disk, discarding expired entries.
      */
@@ -319,6 +322,7 @@ namespace confighttp {
   private:
     SessionTokenManagerDependencies _dependencies;  ///< Injected dependencies
     mutable std::mutex _mutex;  ///< Guards session token map
+    mutable std::recursive_mutex _persistence_mutex;
 
     struct TransparentStringHash {
       using is_transparent = void;
@@ -412,13 +416,6 @@ namespace confighttp {
   private:
     SessionTokenManager &_session_manager;  ///< Managed session token store reference
     /**
-     * @brief Validate supplied credentials (implementation-defined policy).
-     * @param username Name.
-     * @param password Password candidate.
-     * @return `true` if credentials accepted.
-     */
-    bool validate_credentials(const std::string &username, const std::string &password) const;
-    /**
      * @brief Build a success JSON response.
      * @param data Additional JSON payload.
      * @return Response with status `200` and JSON body.
@@ -469,6 +466,9 @@ namespace confighttp {
    * @return AuthResult representing authentication decision.
    */
   AuthResult check_auth(const std::string &remote_address, const std::string &auth_header, const std::string &path, const std::string &method);
+  AuthResult check_setup(const std::string &remote_address);
+  AuthResult check_password(const std::string &remote_address, const std::string &username, const std::string &password);
+  std::recursive_mutex &credentials_mutex();
   /**
    * @brief Extract session token from Cookie headers.
    * @param headers Case-insensitive header multimap.

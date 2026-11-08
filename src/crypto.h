@@ -102,6 +102,8 @@ namespace crypto {
   struct named_cert_t {
     std::string name;
     std::string uuid;
+    std::string invite_id;
+    std::uint64_t invite_generation = 0;
     std::string cert;
     std::string display_mode;
     std::string hdr_profile;

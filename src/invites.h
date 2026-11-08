@@ -16,7 +16,10 @@
 #include "invite_policy.h"
 
 #include <optional>
+#include <functional>
+#include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace invite {
@@ -50,6 +53,15 @@ namespace invite {
     int retry_after_seconds = 0;
   };
 
+  struct revoked_access_t {
+    std::vector<std::string> stream_ids;
+    std::vector<std::string> device_uuids;
+  };
+
+  // Acquire before stream/client lifecycle locks; mutation releases it before teardown.
+  std::shared_lock<std::shared_mutex> acquire_access();
+  revoked_access_t expire(policy::time_point_t now = policy::clock_t::now());
+
   /// Read invites.json. Safe to call when the file does not exist. Called once at start.
   void load();
 
@@ -64,23 +76,16 @@ namespace invite {
   invite_t create(const spec_t &spec);
 
   /// Apply the set fields of @p spec to an existing invite. Persists on success.
-  std::optional<invite_t> update(const std::string &id, const spec_t &spec);
+  std::optional<invite_t> update(const std::string &id, const spec_t &spec, revoked_access_t &revoked);
 
   /// New token and PIN for an existing invite, invalidating the link already sent.
-  std::optional<invite_t> rotate(const std::string &id);
+  std::optional<invite_t> rotate(const std::string &id, revoked_access_t &revoked);
 
   /// Forget an invite entirely. Prefer setting revoked, which keeps the refusal explicable.
-  bool remove(const std::string &id);
+  bool remove(const std::string &id, revoked_access_t &revoked);
 
-  /**
-   * @brief Remember that this invite paired a Moonlight client.
-   *
-   * Called from the far end of the pairing handshake, where the device finally gets
-   * a uuid — several round trips after the invite was redeemed. Without the record
-   * the pairing cannot be taken back, and an expiring link would hand out permanent
-   * access to anyone who chose the native path.
-   */
-  void record_paired_device(const std::string &invite_id, const std::string &device_uuid);
+  // Validate and publish under the access gate so revocation cannot miss a new client.
+  bool commit_pairing(const std::string &invite_id, std::uint64_t generation, const std::string &device_uuid, const std::function<void()> &publish);
 
   /**
    * @brief Hand back the devices this invite paired, and forget them.
@@ -105,6 +110,8 @@ namespace invite {
    * paired before invites existed carried whatever it happened to be given.
    */
   std::optional<std::uint32_t> perm_for_paired_device(const std::string &device_uuid);
+  std::optional<std::string> invite_for_paired_device(const std::string &device_uuid);
+  std::optional<invite_t> paired_grant(const std::string &invite_id, std::uint64_t generation);
 
   /**
    * @brief Look up an invite by its link token, without redeeming it.
@@ -168,11 +175,10 @@ namespace invite {
       std::uint32_t perm = 0;
       int gamepad_base_slot = 0;
       int app_id = -1;
+      std::uint64_t generation = 0;
       policy::time_point_t expires_at {};
-      /// The WebRTC session this guest created, once they have created one.
-      /// Signalling is authorised against this and nothing else, so a guest can
-      /// drive their own stream and cannot touch anyone else's.
-      std::string stream_session_id;
+      // Retained through credential expiry until the streams have been closed.
+      std::unordered_set<std::string> stream_session_ids;
     };
 
     /// Mint a session for a successfully redeemed invite. Returns the cookie value.
@@ -182,11 +188,13 @@ namespace invite {
     std::optional<session_t> lookup(const std::string &token);
 
     /// Drop a session early — the guest leaving, or the owner revoking.
-    void revoke(const std::string &token);
+    std::vector<std::string> revoke(const std::string &token);
 
-    /// Record the WebRTC session a guest just created, so the signalling routes can
-    /// tell "their own stream" from "somebody else's".
+    /// Record ownership; production creation uses create_stream to serialize revocation.
     void bind_stream_session(const std::string &token, const std::string &stream_session_id);
+    bool create_stream(const std::string &token, const std::function<std::optional<std::string>(const session_t &)> &start);
+    void forget_stream_session(const std::string &stream_session_id);
+    std::vector<std::string> expire(policy::time_point_t now);
 
     /// Whether this cookie owns this WebRTC session. False for an unknown or expired
     /// cookie, for a guest who has not created a session, and for any mismatch — the
@@ -201,10 +209,8 @@ namespace invite {
     /// Drop every session issued from one invite. Called when the owner revokes it, so
     /// revoking a link also ejects whoever is already using it.
     ///
-    /// Ejects them from the CREDENTIAL, not from a stream already running: a
-    /// negotiated WebRTC session keeps flowing because nothing re-checks the guest
-    /// afterwards. Call stream_sessions_for_invite first and close those too.
-    void revoke_for_invite(const std::string &invite_id);
+    /// Returns every stream to close after releasing the access gate.
+    std::vector<std::string> revoke_for_invite(const std::string &invite_id);
 
     /// The WebRTC sessions this invite's guests are currently running.
     ///

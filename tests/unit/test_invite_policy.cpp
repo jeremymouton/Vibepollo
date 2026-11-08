@@ -16,6 +16,36 @@ namespace {
   using policy::mode_e;
   using policy::result_e;
 
+  TEST(InvitePolicy, WatchOnlyGuestCannotStartAnIdleApp) {
+    EXPECT_FALSE(policy::app_allowed(42, 42, -1, false));
+    EXPECT_FALSE(policy::app_allowed(42, 99, -1, true));
+    EXPECT_TRUE(policy::app_allowed(42, 42, 42, false));
+    EXPECT_TRUE(policy::app_allowed(42, 42, -1, true));
+  }
+
+  TEST(InvitePolicy, UnpinnedGuestCanOnlyJoinCurrentCapture) {
+    EXPECT_FALSE(policy::app_allowed(-1, 99, -1, true));
+    EXPECT_FALSE(policy::app_allowed(-1, 0, -1, true));
+    EXPECT_FALSE(policy::app_allowed(-1, 99, 42, true));
+    EXPECT_TRUE(policy::app_allowed(-1, 42, 42, false));
+    EXPECT_TRUE(policy::app_allowed(-1, 0, -1, false, true));
+  }
+
+  TEST(InvitePolicy, DesktopScopeCannotInheritAnotherRunningApp) {
+    EXPECT_FALSE(policy::app_allowed(0, 0, 42, true, true));
+    EXPECT_FALSE(policy::app_allowed(0, 42, 42, true, true));
+    EXPECT_FALSE(policy::app_allowed(0, 0, -1, false));
+    EXPECT_TRUE(policy::app_allowed(0, 0, -1, false, true));
+    EXPECT_TRUE(policy::app_allowed(0, 0, -1, true));
+  }
+
+  TEST(InvitePolicy, LaunchPermissionCannotAdoptCaptureOutsidePinnedScope) {
+    EXPECT_FALSE(policy::app_allowed(42, 42, 99, true, true));
+    EXPECT_FALSE(policy::app_allowed(42, 42, -1, true, true));
+    EXPECT_TRUE(policy::app_allowed(42, 42, 42, true, true));
+    EXPECT_TRUE(policy::app_allowed(42, 42, -1, true, false));
+  }
+
   /// A fixed instant, so every expiry and lockout in these tests is exact.
   policy::time_point_t at(int seconds) {
     return policy::time_point_t {} + std::chrono::seconds {1000000 + seconds};

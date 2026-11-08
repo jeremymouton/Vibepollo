@@ -50,9 +50,11 @@
 #include <openssl/hmac.h>
 #include "confighttp.h"
 #include "crypto.h"
+#include "csrf_token_store.h"
 #include "file_handler.h"
 #include "globals.h"
 #include "http_auth.h"
+#include "http_security.h"
 #include "httpcommon.h"
 #include "invites.h"
 #include "system_tray.h"
@@ -572,22 +574,17 @@ namespace confighttp {
     REMOVE  ///< Remove client
   };
 
-  // SESSION COOKIE
-  std::string sessionCookie;
-  static std::chrono::time_point<std::chrono::steady_clock> cookie_creation_time;
-
   /**
    * @brief Log the request details.
    * @param request The HTTP request object.
    */
   void print_req(const req_https_t &request) {
-    BOOST_LOG(debug) << "HTTP "sv << request->method << ' ' << request->path;
+    BOOST_LOG(debug) << "HTTP "sv << http::security::log_text(request->method) << ' ' << http::security::log_path(request->path);
 
     if (!request->header.empty()) {
       BOOST_LOG(verbose) << "Headers:"sv;
       for (auto &[name, val] : request->header) {
-        BOOST_LOG(verbose) << name << " -- "
-                           << (name == "Authorization" ? "CREDENTIALS REDACTED" : val);
+        BOOST_LOG(verbose) << http::security::log_text(name) << " -- " << http::security::log_header(name, val);
       }
     }
 
@@ -595,7 +592,7 @@ namespace confighttp {
     if (!query.empty()) {
       BOOST_LOG(verbose) << "Query Params:"sv;
       for (auto &[name, val] : query) {
-        BOOST_LOG(verbose) << name << " -- " << val;
+        BOOST_LOG(verbose) << http::security::log_text(name) << " -- [REDACTED]";
       }
     }
   }
@@ -1347,59 +1344,33 @@ namespace confighttp {
     response->write(client_error_bad_request, error.dump(), headers);
   }
 
-  struct csrf_token_t {
-    std::string token;
-    std::chrono::steady_clock::time_point expiration;
-  };
+  csrf::TokenStore csrf_tokens([] { return crypto::rand_alphabet(csrf::TokenStore::token_size); });
 
-  std::map<std::string, csrf_token_t, std::less<>> csrf_tokens;
-  std::mutex csrf_tokens_mutex;
-  constexpr auto CSRF_TOKEN_SIZE = 32;
-  constexpr auto CSRF_TOKEN_LIFETIME = std::chrono::hours(1);
-
-  std::string get_client_id(const req_https_t &request) {
+  csrf::client_id_t get_client_id(const req_https_t &request) {
     if (const auto auth = request->header.find("authorization"); auth != request->header.end()) {
-      return auth->second;
+      return csrf::client_id(csrf::identity_source::authorization, auth->second);
     }
-    return net::addr_to_normalized_string(request->remote_endpoint().address());
+    return csrf::client_id(csrf::identity_source::peer, net::addr_to_normalized_string(request->remote_endpoint().address()));
   }
 
-  std::string generate_csrf_token(const std::string &client_id) {
-    const auto now = std::chrono::steady_clock::now();
-    std::scoped_lock lock(csrf_tokens_mutex);
-    std::erase_if(csrf_tokens, [&now](const auto &entry) {
-      return entry.second.expiration < now;
-    });
-    if (const auto existing = csrf_tokens.find(client_id); existing != csrf_tokens.end()) {
-      return existing->second.token;
-    }
-
-    std::string token = crypto::rand_alphabet(CSRF_TOKEN_SIZE);
-    csrf_tokens[client_id] = csrf_token_t {token, now + CSRF_TOKEN_LIFETIME};
-    return token;
+  std::string generate_csrf_token(const csrf::client_id_t &client_id) {
+    return csrf_tokens.issue(client_id);
   }
 
-  bool validate_stored_csrf_token(const resp_https_t &response, const req_https_t &request, std::string_view client_id, std::string_view provided_token) {
-    std::scoped_lock lock(csrf_tokens_mutex);
-    auto token_it = csrf_tokens.find(client_id);
-    if (token_it == csrf_tokens.end()) {
-      bad_request(response, request, "Invalid CSRF token");
-      return false;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    if (token_it->second.expiration < now) {
-      csrf_tokens.erase(token_it);
+  bool validate_stored_csrf_token(const resp_https_t &response, const req_https_t &request, const csrf::client_id_t &client_id, std::string_view provided_token) {
+    const auto result = csrf_tokens.validate(client_id, provided_token);
+    if (result == csrf::validation::expired) {
       bad_request(response, request, "CSRF token expired");
       return false;
     }
-    if (token_it->second.token != provided_token) {
+    if (result != csrf::validation::valid) {
       bad_request(response, request, "Invalid CSRF token");
       return false;
     }
     return true;
   }
 
-  bool validate_csrf_token(const resp_https_t &response, const req_https_t &request, const std::string &client_id) {
+  bool validate_csrf_token(const resp_https_t &response, const req_https_t &request, const csrf::client_id_t &client_id) {
     auto is_allowed_origin = [](std::string_view url) {
       return std::ranges::any_of(config::sunshine.csrf_allowed_origins, [&url](const std::string &allowed_origin) {
         if (url.rfind(allowed_origin, 0) != 0) {
@@ -1435,7 +1406,7 @@ namespace confighttp {
   }
 
   void getCSRFToken(resp_https_t response, req_https_t request) {
-    // The browser needs a token before login. Issuing one does not grant any
+    // Owners and remote guests need a token before login/redemption. Issuing one does not grant any
     // authority: it is bound to the request's client identity and every API
     // handler still performs its own authentication and authorization checks.
     nlohmann::json output_tree;
@@ -2462,11 +2433,10 @@ namespace confighttp {
    * guest permanently able to stream, which is precisely what an expiring invite
    * promises not to do.
    *
-   * Runs outside the invite lock — take_paired_devices returns and clears in one
-   * step, and unpair_client takes nvhttp's own locks.
+   * Runs after the atomic invite mutation releases its access and storage locks.
    */
-  void unpair_invite_devices(const std::string &invite_id) {
-    for (const auto &uuid : invite::take_paired_devices(invite_id)) {
+  void unpair_invite_devices(const std::vector<std::string> &devices, const std::string &invite_id) {
+    for (const auto &uuid : devices) {
       // unpair_client removes the certificate AND calls stop_session on anything
       // that device is streaming, so a native guest is dropped mid-game rather than
       // merely blocked from reconnecting.
@@ -2484,8 +2454,7 @@ namespace confighttp {
    * re-checks the guest session behind it. So an owner who revoked mid-stream
    * watched the guest keep playing, which is the opposite of what the button says.
    *
-   * The ids must be read BEFORE the invite is changed: the revoke drops the guest
-   * sessions and the stream ids live on them.
+   * The invite mutation returns the ids together with invalidating credentials.
    */
   void close_invite_streams(const std::vector<std::string> &stream_session_ids, const std::string &invite_id) {
     for (const auto &id : stream_session_ids) {
@@ -2509,25 +2478,9 @@ namespace confighttp {
    * ending what is already running.
    */
   void sweep_expired_invites() {
-    const auto now = invite::policy::clock_t::now();
-    for (const auto &invite : invite::list()) {
-      const bool expired_by_time =
-        invite.expires_at != invite::policy::time_point_t {} && invite.expires_at <= now;
-      if (!expired_by_time) {
-        continue;
-      }
-      const auto live_streams = invite::guest::stream_sessions_for_invite(invite.id);
-      if (!live_streams.empty()) {
-        close_invite_streams(live_streams, invite.id);
-      }
-      // Every browser session on it, not only those that reached a stream: a guest
-      // who redeemed and is still on the pre-flight screen must not be able to
-      // start one after the link died. Cheap when there is nothing to drop.
-      invite::guest::revoke_for_invite(invite.id);
-      if (!invite.paired_device_uuids.empty()) {
-        unpair_invite_devices(invite.id);
-      }
-    }
+    const auto revoked = invite::expire();
+    close_invite_streams(revoked.stream_ids, "expired");
+    unpair_invite_devices(revoked.device_uuids, "expired");
   }
 
   /**
@@ -2616,22 +2569,14 @@ namespace confighttp {
       return;
     }
 
-    // Captured before update(): it drops the guest sessions that carry these ids.
-    const auto live_streams = invite::guest::stream_sessions_for_invite(id);
-
-    const auto updated = invite::update(id, spec);
+    invite::revoked_access_t revoked;
+    const auto updated = invite::update(id, spec, revoked);
     if (!updated) {
       not_found(response, request, "No such invite");
       return;
     }
-    // Same rule invite::update applies to browser sessions: narrowing a grant must
-    // not leave a wider one still running. A paired client's permissions were fixed
-    // at pairing time and cannot be narrowed in place, so it is unpaired instead.
-    const bool narrowed = (spec.revoked && *spec.revoked) || spec.perm || spec.gamepad_base_slot || spec.app_id;
-    if (narrowed) {
-      close_invite_streams(live_streams, id);
-      unpair_invite_devices(id);
-    }
+    close_invite_streams(revoked.stream_ids, id);
+    unpair_invite_devices(revoked.device_uuids, id);
     send_response(response, invites_api::to_owner_json(*updated));
   }
 
@@ -2651,9 +2596,8 @@ namespace confighttp {
     }
 
     const std::string rotate_id {request->path_match[1]};
-    const auto live_streams = invite::guest::stream_sessions_for_invite(rotate_id);
-
-    const auto rotated = invite::rotate(rotate_id);
+    invite::revoked_access_t revoked;
+    const auto rotated = invite::rotate(rotate_id, revoked);
     if (!rotated) {
       not_found(response, request, "No such invite");
       return;
@@ -2662,8 +2606,8 @@ namespace confighttp {
     // grounds that the old link is dead. A device it paired is admitted by the same
     // link and goes the same way, or "new link and PIN" would quietly leave the old
     // holder streaming.
-    close_invite_streams(live_streams, rotate_id);
-    unpair_invite_devices(rotate_id);
+    close_invite_streams(revoked.stream_ids, rotate_id);
+    unpair_invite_devices(revoked.device_uuids, rotate_id);
     BOOST_LOG(info) << "Invites: rotated '"sv << rotated->label << "'"sv;
     send_response(response, invites_api::to_owner_json(*rotated));
   }
@@ -2687,15 +2631,13 @@ namespace confighttp {
     }
 
     const std::string id {request->path_match[1]};
-    // Before remove(), not after: the uuids live on the invite and the stream ids on
-    // its guest sessions, so deleting it first throws away the record of what needs
-    // tearing down.
-    close_invite_streams(invite::guest::stream_sessions_for_invite(id), id);
-    unpair_invite_devices(id);
-    if (!invite::remove(id)) {
+    invite::revoked_access_t revoked;
+    if (!invite::remove(id, revoked)) {
       not_found(response, request, "No such invite");
       return;
     }
+    close_invite_streams(revoked.stream_ids, id);
+    unpair_invite_devices(revoked.device_uuids, id);
     nlohmann::json output = nlohmann::json::object();
     output["status"] = true;
     send_response(response, output);
@@ -2832,6 +2774,10 @@ namespace confighttp {
     }
 
     const auto session_token = invite::guest::issue(outcome.invite);
+    if (session_token.empty()) {
+      join_api::refuse(response, invite::policy::result_e::unknown, 0);
+      return;
+    }
     BOOST_LOG(info) << "Invites: '"sv << outcome.invite.label << "' joined from "sv
                     << request->remote_endpoint().address().to_string();
 
@@ -2897,7 +2843,7 @@ namespace confighttp {
     }
 
     const auto granted = static_cast<crypto::PERM>(outcome.invite.perm);
-    const bool paired = nvhttp::pin((*input)["moonlight_pin"].get<std::string>(), name, granted, outcome.invite.id);
+    const bool paired = nvhttp::pin((*input)["moonlight_pin"].get<std::string>(), name, granted, outcome.invite.id, outcome.invite.generation);
 
     nlohmann::json body = nlohmann::json::object();
     body["status"] = paired;
@@ -4615,68 +4561,72 @@ namespace confighttp {
 
     BOOST_LOG(debug) << "WebRTC: creating session";
     std::optional<std::string> capture_start_error;
+    std::optional<webrtc_stream::SessionState> session;
+    const auto start_session = [&]() -> std::optional<std::string> {
 #ifdef _WIN32
-    {
-      // Publish the cleanup tail before capture startup mutates any display or
-      // runtime configuration. The lifecycle gate below then closes the gap
-      // between the failed start releasing its gate and direct VDD cleanup.
-      stream::session::cleanup_reservation_t cleanup_reservation;
-      capture_start_error = webrtc_stream::ensure_capture_started(options);
-      if (capture_start_error) {
-        std::unique_lock<std::mutex> lifecycle_lock(nvhttp::stream_lifecycle_mutex());
-        if (!stream::session::has_shared_runtime_owner()) {
-          (void) platf::virtual_display_cleanup::run(
-            "webrtc_session_start_failed",
-            config::video.dd.config_revert_on_disconnect
-          );
+      {
+        // Keep cleanup reserved until a failed capture startup has unwound.
+        stream::session::cleanup_reservation_t cleanup_reservation;
+        capture_start_error = webrtc_stream::ensure_capture_started(options);
+        if (capture_start_error) {
+          std::unique_lock<std::mutex> lifecycle_lock(nvhttp::stream_lifecycle_mutex());
+          if (!stream::session::has_shared_runtime_owner()) {
+            (void) platf::virtual_display_cleanup::run(
+              "webrtc_session_start_failed",
+              config::video.dd.config_revert_on_disconnect
+            );
+          }
         }
       }
-    }
 #else
-    capture_start_error = webrtc_stream::ensure_capture_started(options);
+      capture_start_error = webrtc_stream::ensure_capture_started(options);
 #endif
-    if (capture_start_error) {
-      bad_request(response, request, capture_start_error->c_str());
-      return;
-    }
-    if (guest) {
-      // Overwritten, not validated. Whatever the guest sent in these three fields
-      // is discarded, so asking for more cannot get more — the only way a guest's
-      // grant changes is the owner editing the invite and the guest redeeming again.
-      options.input_permission = guest->perm & static_cast<std::uint32_t>(crypto::PERM::_all_inputs);
-      options.gamepad_base_slot = guest->gamepad_base_slot;
-      // The app is the invite's choice as well. Pinned to an app, the guest gets that
-      // app; pinned to none, they join whatever is already running. Either way the
-      // app_id the guest put in the body is discarded: create_session launches a
-      // requested app that is not the current one, so honouring it would have let a
-      // watch-only guest start, or replace, anything in the owner's list.
-      if (guest->app_id >= 0) {
-        options.app_id = guest->app_id;
-      } else {
-        options.app_id.reset();
+      if (capture_start_error) {
+        return std::nullopt;
       }
-      BOOST_LOG(info) << "WebRTC: guest session for '"sv << guest->label << "' (perm "sv
-                      << *options.input_permission << ", pad slot "sv << guest->gamepad_base_slot << ")"sv;
+      session = webrtc_stream::create_session(options);
+      return session ? std::optional<std::string> {session->id} : std::nullopt;
+    };
+    if (guest) {
+      const bool authorized = invite::guest::create_stream(extract_guest_token_from_cookie(request->header), [&](const invite::guest::session_t &grant) -> std::optional<std::string> {
+        if (!(grant.perm & static_cast<std::uint32_t>(crypto::PERM::_allow_view))) {
+          capture_start_error = "This invite does not allow viewing";
+          return std::nullopt;
+        }
+        options.input_permission = grant.perm & static_cast<std::uint32_t>(crypto::PERM::_all_inputs);
+        options.gamepad_base_slot = grant.gamepad_base_slot;
+        options.app_id = grant.app_id >= 0 ? std::optional<int> {grant.app_id} : std::nullopt;
+        options.guest_app_scope = grant.app_id;
+        options.guest_may_launch = (grant.perm & static_cast<std::uint32_t>(crypto::PERM::launch)) != 0;
+        options.client_uuid.reset();
+        options.client_name = grant.label;
+        return start_session();
+      });
+      if (!authorized) {
+        bad_request(response, request, "Guest session expired or revoked");
+        return;
+      }
 #ifdef _WIN32
       // Someone with no account just got input on this machine. That should be
       // visible without going looking for it, and it should say what they were
       // granted — gamepad-only and full-control are very different guests.
-      system_tray::update_tray_guest_joined(guest->label, invites_api::describe_perm(guest->perm));
+      if (session) {
+        system_tray::update_tray_guest_joined(guest->label, invites_api::describe_perm(guest->perm));
+      }
 #endif
+    } else {
+      start_session();
     }
-
-    auto session = webrtc_stream::create_session(options);
+    if (capture_start_error) {
+      bad_request(response, request, capture_start_error->c_str());
+      return;
+    }
     if (!session) {
       webrtc_stream::shutdown_all_sessions();
       service_unavailable(response, "Shutdown in progress");
       return;
     }
     BOOST_LOG(debug) << "WebRTC: session created id=" << session->id;
-    if (guest) {
-      // Bind before the id is handed back, so the guest's very next request — the
-      // offer — already authorises.
-      invite::guest::bind_stream_session(extract_guest_token_from_cookie(request->header), session->id);
-    }
     nlohmann::json output;
     output["status"] = true;
     output["session"] = webrtc_session_to_json(*session);
@@ -5463,8 +5413,16 @@ namespace confighttp {
    * @api_examples{/api/password| POST| {"currentUsername":"admin","currentPassword":"admin","newUsername":"admin","newPassword":"admin","confirmNewPassword":"admin"}}
    */
   void savePassword(resp_https_t response, req_https_t request) {
+    std::scoped_lock credentials_lock(credentials_mutex());
     if ((!config::sunshine.username.empty() && !authenticate(response, request)) || !validateContentType(response, request, "application/json")) {
       return;
+    }
+    const auto remote_address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    if (config::sunshine.username.empty()) {
+      if (const auto auth = check_setup(remote_address); !auth.ok) {
+        response->write(auth.code, auth.body, auth.headers);
+        return;
+      }
     }
     print_req(request);
     std::vector<std::string> errors;
@@ -5484,25 +5442,35 @@ namespace confighttp {
       if (newUsername.empty()) {
         errors.push_back("Invalid Username");
       } else {
-        auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
-        if (config::sunshine.username.empty() ||
-            (boost::iequals(username, config::sunshine.username) && hash == config::sunshine.password)) {
+        if (!config::sunshine.username.empty()) {
+          if (const auto auth = check_password(remote_address, username, password); !auth.ok) {
+            response->write(auth.code, auth.body, auth.headers);
+            return;
+          }
+        }
+        {
           if (newPassword.empty() || newPassword != confirmPassword) {
             errors.push_back("Password Mismatch");
           } else {
+            if (!session_token_manager.revoke_all_session_tokens()) {
+              service_unavailable(response, "Unable to revoke existing sessions");
+              return;
+            }
             if (http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword)) {
               service_unavailable(response, "Unable to write credentials file");
               return;
             }
             if (http::reload_user_creds(config::sunshine.credentials_file)) {
-              service_unavailable(response, "Unable to reload credentials file");
+              // The write succeeded: never continue accepting the old password
+              // or reopen first-run setup if the read-back fails.
+              config::sunshine.password.clear();
+              config::sunshine.salt.clear();
+              config::sunshine.username.swap(newUsername);
+              service_unavailable(response, "Credentials saved; restart the host to load them");
               return;
             }
-            sessionCookie.clear();  // force re-login
             output_tree["status"] = true;
           }
-        } else {
-          errors.push_back("Invalid Current Credentials");
         }
       }
       if (!errors.empty()) {
@@ -5512,10 +5480,11 @@ namespace confighttp {
         bad_request(response, request, error);
         return;
       }
-      send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SavePassword: "sv << e.what();
-      bad_request(response, request, e.what());
+      auto logged_out = session_token_api.logout({}, {});
+      response->write(logged_out.status_code, output_tree.dump(), logged_out.headers);
+    } catch (const std::exception &) {
+      BOOST_LOG(warning) << "SavePassword: invalid credential request"sv;
+      bad_request(response, request, "Invalid credential request");
     }
   }
 
@@ -5541,10 +5510,12 @@ namespace confighttp {
 
       std::string passphrase = input_tree.value("passphrase", "");
       if (passphrase.empty()) {
-        throw std::runtime_error("Passphrase not provided!");
+        bad_request(response, request, "Passphrase not provided!");
+        return;
       }
       if (passphrase.size() < 4) {
-        throw std::runtime_error("Passphrase too short!");
+        bad_request(response, request, "Passphrase too short!");
+        return;
       }
 
       std::string deviceName = input_tree.value("deviceName", "");
@@ -5554,9 +5525,9 @@ namespace confighttp {
       output_tree["status"] = true;
       output_tree["message"] = "OTP created, effective within 3 minutes.";
       send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "OTP creation failed: "sv << e.what();
-      bad_request(response, request, e.what());
+    } catch (const std::exception &) {
+      BOOST_LOG(warning) << "OTP creation failed: invalid request"sv;
+      bad_request(response, request, "Invalid OTP request");
     }
   }
 
@@ -5594,9 +5565,9 @@ namespace confighttp {
         BOOST_LOG(warning) << "SavePin: no pending Moonlight pairing request accepted the submitted PIN";
       }
       send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SavePin: "sv << e.what();
-      bad_request(response, request, e.what());
+    } catch (const std::exception &) {
+      BOOST_LOG(warning) << "SavePin: invalid request"sv;
+      bad_request(response, request, "Invalid PIN request");
     }
   }
 
@@ -7011,6 +6982,7 @@ namespace confighttp {
     register_api_route("^/api/auth/sessions$", "GET", listSessions);
     register_api_route("^/api/auth/sessions/([A-Fa-f0-9]+)$", "DELETE", revokeSession);
     server.config.reuse_address = true;
+    http::security::configure_request_limits(server.config);
     server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
 
@@ -7043,11 +7015,11 @@ namespace confighttp {
       }
     });
 
-    // Expired invites are swept every minute. The owner's invites page sweeps too,
+    // Expired invites are swept every second. The owner's invites page sweeps too,
     // but a guest still streaming an hour after their link died because nobody
     // happened to open that page is the failure the expiry exists to prevent.
     std::jthread invite_sweep_thread([shutdown_event]() {
-      while (!shutdown_event->view(std::chrono::minutes(1))) {
+      while (!shutdown_event->view(std::chrono::seconds(1))) {
         sweep_expired_invites();
       }
     });
@@ -7163,7 +7135,7 @@ namespace confighttp {
       write_api_response(response, api_response);
 
     } catch (const nlohmann::json::exception &e) {
-      BOOST_LOG(warning) << "Login JSON error:"sv << e.what();
+      BOOST_LOG(warning) << "Login: invalid JSON request"sv;
       bad_request(response, request, "Invalid JSON format");
     }
   }

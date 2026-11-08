@@ -57,6 +57,7 @@
 #include "globals.h"
 #include "httpcommon.h"
 #include "input.h"
+#include "invites.h"
 #include "logging.h"
 #include "nvhttp.h"
 #include "process.h"
@@ -3405,6 +3406,25 @@ namespace webrtc_stream {
       const int effective_app_id = requested_app_id > 0 ? requested_app_id : std::max(current_app_id, 0);
       const bool capture_already_active = webrtc_capture.active.load(std::memory_order_acquire);
 
+      if (options.guest_app_scope) {
+        const int scope = *options.guest_app_scope > 0 ? requested_app_id : *options.guest_app_scope;
+        const int guest_requested = scope < 0 ? effective_app_id : requested_app_id;
+        if (!invite::policy::app_allowed(scope, guest_requested, current_app_id, options.guest_may_launch, capture_already_active || rtsp_active)) {
+          return std::string {"This invite may only join its permitted running app"};
+        }
+        if (scope >= 0 && capture_already_active) {
+          // Check the capture's own identity too: process state can change while
+          // a capture remains alive, and adopting it must not widen the grant.
+          const auto expected_uuid = requested_app_ctx ? requested_app_ctx->uuid : std::string {};
+          const int expected_legacy_id = expected_uuid.empty() ? std::max(scope, 0) : 0;
+          if (!webrtc_capture.config_key ||
+              webrtc_capture.config_key->app_uuid != expected_uuid ||
+              webrtc_capture.config_key->legacy_app_id != expected_legacy_id) {
+            return std::string {"Active capture is outside this invite's app scope"};
+          }
+        }
+      }
+
       std::unordered_map<std::string, std::string> requested_runtime_overrides;
       if (effective_app_id > 0) {
         if (auto app_ctx = proc::proc.resolve_app(effective_app_id)) {
@@ -6109,6 +6129,7 @@ namespace webrtc_stream {
       }
     }
     if (removed) {
+      invite::guest::forget_stream_session(std::string {id});
       local_answer_cv.notify_all();
     }
 

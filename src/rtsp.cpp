@@ -814,32 +814,40 @@ namespace rtsp_stream {
 #endif
     }
 
-    void cancel_pending_launches(std::string_view reason) {
+    void cancel_pending_launches(std::string_view reason, std::string_view client_uuid = {}) {
       stream::session::cleanup_reservation_t cleanup_reservation;
       std::unique_lock<std::mutex> lifecycle_lock(nvhttp::stream_lifecycle_mutex());
       std::optional<std::array<std::uint8_t, 16>> virtual_display_guid_bytes;
       bool cleared = false;
+      bool pending_launches_remain = false;
       {
         std::lock_guard<std::mutex> lock(_launch_sessions_mutex);
-        for (const auto &entry : _launch_sessions) {
-          if (entry.session) {
-            const auto &guid_bytes = entry.session->virtual_display_guid_bytes;
+        for (auto it = _launch_sessions.begin(); it != _launch_sessions.end();) {
+          if (!client_uuid.empty() && (!it->session || it->session->client_uuid != client_uuid)) {
+            ++it;
+            continue;
+          }
+          if (it->session) {
+            const auto &guid_bytes = it->session->virtual_display_guid_bytes;
             if (std::any_of(guid_bytes.begin(), guid_bytes.end(), [](const std::uint8_t byte) {
                   return byte != 0;
                 })) {
               virtual_display_guid_bytes = guid_bytes;
             }
           }
+          it = _launch_sessions.erase(it);
+          cleared = true;
         }
-        cleared = !_launch_sessions.empty();
-        _launch_sessions.clear();
+        pending_launches_remain = !_launch_sessions.empty();
       }
-      raised_timer.cancel();
+      asio::post(io_context, [this]() { arm_launch_timer(); });
       if (!cleared) {
         return;
       }
 
-      set_pending_vulkan_hdr_layer_stream(false);
+      if (!pending_launches_remain) {
+        set_pending_vulkan_hdr_layer_stream(false);
+      }
       const stream::session::shared_runtime_finalize_context_t finalize_context {
         .virtual_display_guid_bytes = virtual_display_guid_bytes,
       };
@@ -1281,6 +1289,12 @@ namespace rtsp_stream {
   }
 
   bool disconnect_client_sessions(const std::string &client_uuid) {
+    if (client_uuid.empty()) {
+      return false;
+    }
+    // Startup publishes its active session under the same lifecycle gate used
+    // by cancellation, so the following snapshot cannot miss a pending start.
+    server.cancel_pending_launches("rtsp_client_disconnected", client_uuid);
     server.clear(false);
     return server.disconnect_client(client_uuid);
   }

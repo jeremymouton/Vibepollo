@@ -26,6 +26,7 @@ elseif(UNIX)
     endif()
 endif()
 
+target_include_directories(sunshine BEFORE PRIVATE "${SUNSHINE_SIMPLE_WEB_INCLUDE_DIR}")
 target_link_libraries(sunshine ${SUNSHINE_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
 target_compile_definitions(sunshine PUBLIC ${SUNSHINE_DEFINITIONS})
 

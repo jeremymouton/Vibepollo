@@ -55,6 +55,25 @@ namespace invite::policy {
     return true;
   }
 
+  bool grant_valid(const invite_t &invite, mode_e mode, std::uint64_t generation, time_point_t now) {
+    return invite.generation == generation && !invite.revoked &&
+           (is_unset(invite.expires_at) || now < invite.expires_at) &&
+           (mode == mode_e::browser ? invite.allow_browser : invite.allow_pairing);
+  }
+
+  bool app_allowed(int scope, int requested, int running, bool may_launch, bool capture_active) {
+    const bool joining = requested == std::max(running, 0) && (running > 0 || capture_active);
+    if (scope < 0) {
+      return joining;
+    }
+    // Shared capture is adopted as-is; launch permission cannot change its app.
+    if (capture_active && !joining) {
+      return false;
+    }
+    // A desktop request cannot silently inherit an unrelated running application.
+    return requested == scope && !(requested == 0 && running > 0) && (may_launch || joining);
+  }
+
   int lockout_remaining_seconds(const invite_t &invite, time_point_t now) {
     if (is_unset(invite.locked_until) || now >= invite.locked_until) {
       return 0;
@@ -171,6 +190,7 @@ namespace invite::policy {
     node["label"] = invite.label;
     node["token"] = invite.token;
     node["pin"] = invite.pin;
+    node["generation"] = invite.generation;
     node["perm"] = invite.perm;
     node["gamepad_base_slot"] = invite.gamepad_base_slot;
     node["app_id"] = invite.app_id;
@@ -197,6 +217,7 @@ namespace invite::policy {
     invite_t invite;
     invite.id = node.value("id", ""s);
     invite.token = node.value("token", ""s);
+    invite.generation = node.value("generation", std::uint64_t {0});
     // An invite without an id or a token can never be addressed or redeemed; keeping it
     // would leave an unusable row in the owner's list forever.
     if (invite.id.empty() || invite.token.empty()) {

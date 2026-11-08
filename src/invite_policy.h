@@ -63,6 +63,7 @@ namespace invite::policy {
     std::string label;  ///< what the owner calls it
     std::string token;  ///< the secret in the link
     std::string pin;    ///< second factor, sent by another channel
+    std::uint64_t generation = 0;
 
     /// crypto::PERM bitmask. The ceiling for anything this invite grants; kept as a
     /// plain integer so this module does not depend on crypto.h.
@@ -91,6 +92,9 @@ namespace invite::policy {
     /// here so revoking or deleting the invite can take the pairing back too.
     std::vector<std::string> paired_device_uuids;
   };
+
+  bool grant_valid(const invite_t &invite, mode_e mode, std::uint64_t generation, time_point_t now);
+  bool app_allowed(int scope, int requested, int running, bool may_launch, bool capture_active = false);
 
   /**
    * @brief Decide whether this invite admits a guest right now. Does not mutate.

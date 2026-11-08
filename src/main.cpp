@@ -818,6 +818,7 @@ int main(int argc, char *argv[]) {
   // request, or a link redeemed in the first moments after a restart would be
   // refused as unknown.
   invite::load();
+  nvhttp::initialize_client_state();
 
   std::thread httpThread {nvhttp::start};
   std::thread configThread {confighttp::start};

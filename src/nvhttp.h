@@ -148,6 +148,7 @@ namespace nvhttp {
     /// The invite this pairing came from, so the device can be attached to it once
     /// the handshake produces a uuid. Empty for an ordinary owner-driven pairing.
     std::string granted_invite_id;
+    std::uint64_t granted_invite_generation = 0;
   };
 
   /**
@@ -229,7 +230,9 @@ namespace nvhttp {
    *   behaviour (PERM::_default, or PERM::_all for the very first client). Set by the
    *   invite flow, where it is authoritative — see docs/guest-invites.md.
    */
-  bool pin(std::string pin, std::string name, std::optional<crypto::PERM> granted_perm = std::nullopt, std::string granted_invite_id = {});
+  bool pin(std::string pin, std::string name, std::optional<crypto::PERM> granted_perm = std::nullopt, std::string granted_invite_id = {}, std::uint64_t granted_invite_generation = 0);
+
+  void initialize_client_state();
 
   /**
    * @brief Pick the client label used for display-facing behavior.

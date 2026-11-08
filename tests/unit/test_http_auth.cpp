@@ -2,6 +2,8 @@
 
 #include <boost/property_tree/ptree.hpp>
 #include <chrono>
+#include <condition_variable>
+#include <future>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -259,6 +261,126 @@ TEST(SessionTokenManagerStatefulTest, RememberMeTokenPersistsAcrossRestart) {
     EXPECT_EQ(entry.device_label, "UnitTestAgent");
   }
 
+}
+
+TEST(SessionTokenManagerStatefulTest, RevokingAllSessionsRejectsAccessAndRefreshAcrossRestart) {
+  InMemorySessionState state;
+  auto deps = MakeSessionDependencies(state);
+  deps.credentials_tag = [] { return "credential-generation-1"; };
+  SessionTokenManager manager(deps);
+  auto first = manager.issue_session_tokens("admin", {}, {}, {}, {}, true);
+  auto second = manager.issue_session_tokens("admin");
+  ASSERT_TRUE(manager.validate_session_token(first.session_token));
+  ASSERT_TRUE(manager.revoke_all_session_tokens());
+  for (const auto &tokens : {first, second}) {
+    EXPECT_FALSE(manager.validate_session_token(tokens.session_token));
+    EXPECT_FALSE(manager.refresh_session_tokens(tokens.refresh_token));
+  }
+  SessionTokenManager restarted(deps);
+  restarted.load_session_tokens();
+  EXPECT_EQ(restarted.session_count(), 0);
+  EXPECT_FALSE(restarted.validate_session_token(first.session_token));
+  EXPECT_FALSE(restarted.refresh_session_tokens(first.refresh_token));
+}
+
+TEST(SessionTokenManagerStatefulTest, CredentialChangeInvalidatesStoredAndInMemoryTokens) {
+  InMemorySessionState state;
+  auto deps = MakeSessionDependencies(state);
+  std::string credentials = "old-salted-password-hash";
+  deps.credentials_tag = [&] { return credentials; };
+  SessionTokenManager manager(deps);
+  auto access = manager.issue_session_tokens("admin");
+  auto refresh = manager.issue_session_tokens("admin");
+  const auto old_disk = state.root;
+  credentials = "new-salted-password-hash";
+  EXPECT_FALSE(manager.validate_session_token(access.session_token));
+  EXPECT_FALSE(manager.refresh_session_tokens(refresh.refresh_token));
+  // Even an old state file surviving a failed write cannot restore these grants.
+  state.root = old_disk;
+  SessionTokenManager restarted(deps);
+  restarted.load_session_tokens();
+  EXPECT_EQ(restarted.session_count(), 0);
+  EXPECT_FALSE(restarted.refresh_session_tokens(access.refresh_token));
+  auto fresh = restarted.issue_session_tokens("admin");
+  EXPECT_TRUE(restarted.validate_session_token(fresh.session_token));
+  EXPECT_TRUE(restarted.refresh_session_tokens(fresh.refresh_token));
+}
+
+TEST(SessionTokenManagerStatefulTest, LegacySessionsWithoutCredentialBindingRequireLoginAgain) {
+  InMemorySessionState state;
+  auto deps = MakeSessionDependencies(state);
+  SessionTokenManager legacy(deps);
+  auto tokens = legacy.issue_session_tokens("admin");
+  deps.credentials_tag = [] { return "current-credentials"; };
+  SessionTokenManager upgraded(deps);
+  upgraded.load_session_tokens();
+  EXPECT_FALSE(upgraded.validate_session_token(tokens.session_token));
+  EXPECT_FALSE(upgraded.refresh_session_tokens(tokens.refresh_token));
+}
+
+TEST(SessionTokenManagerStatefulTest, RevocationWriteFailureIsReportedAndCanBeRetried) {
+  InMemorySessionState state;
+  auto deps = MakeSessionDependencies(state);
+  bool fail_write = false;
+  const auto write_json = deps.write_json;
+  deps.write_json = [&](const auto &path, const auto &root) {
+    if (fail_write) throw std::runtime_error("disk unavailable");
+    write_json(path, root);
+  };
+  SessionTokenManager manager(deps);
+  auto tokens = manager.issue_session_tokens("admin");
+  fail_write = true;
+  EXPECT_FALSE(manager.revoke_all_session_tokens());
+  EXPECT_FALSE(manager.validate_session_token(tokens.session_token));
+  EXPECT_FALSE(manager.refresh_session_tokens(tokens.refresh_token));
+  fail_write = false;
+  EXPECT_TRUE(manager.revoke_all_session_tokens());
+  SessionTokenManager restarted(deps);
+  restarted.load_session_tokens();
+  EXPECT_EQ(restarted.session_count(), 0);
+}
+
+TEST(SessionTokenManagerStatefulTest, InFlightOlderSaveCannotResurrectRevokedSessions) {
+  InMemorySessionState state;
+  auto deps = MakeSessionDependencies(state);
+  std::mutex gate;
+  std::condition_variable changed;
+  bool writing = false;
+  bool release = false;
+  const auto write_json = deps.write_json;
+  deps.write_json = [&](const auto &path, const auto &root) {
+    std::unique_lock lock(gate);
+    if (!writing) {
+      writing = true;
+      changed.notify_all();
+      changed.wait(lock, [&] { return release; });
+    }
+    write_json(path, root);
+  };
+  SessionTokenManager manager(deps);
+  auto issuing = std::async(std::launch::async, [&] { return manager.issue_session_tokens("admin"); });
+  {
+    std::unique_lock lock(gate);
+    changed.wait(lock, [&] { return writing; });
+  }
+  auto revoking = std::async(std::launch::async, [&] { return manager.revoke_all_session_tokens(); });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (manager.session_count() != 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(manager.session_count(), 0);
+  {
+    std::scoped_lock lock(gate);
+    release = true;
+  }
+  changed.notify_all();
+  const auto tokens = issuing.get();
+  ASSERT_TRUE(revoking.get());
+  SessionTokenManager restarted(deps);
+  restarted.load_session_tokens();
+  EXPECT_FALSE(restarted.validate_session_token(tokens.session_token));
+  EXPECT_FALSE(restarted.refresh_session_tokens(tokens.refresh_token));
+  EXPECT_EQ(restarted.session_count(), 0);
 }
 
 TEST(SessionTokenManagerStatefulTest, RevokingSessionUpdatesStoredState) {

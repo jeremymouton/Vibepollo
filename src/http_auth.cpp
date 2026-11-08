@@ -49,6 +49,16 @@ namespace confighttp {
   ApiTokenManager api_token_manager;
   SessionTokenManager session_token_manager(SessionTokenManager::make_default_dependencies());
   SessionTokenAPI session_token_api(session_token_manager);
+
+  std::recursive_mutex &credentials_mutex() {
+    static std::recursive_mutex mutex;
+    return mutex;
+  }
+
+  namespace {
+    policy::RequestAuthPolicy make_request_auth_policy();
+    policy::PasswordAttemptLimiter password_attempts;
+  }
 #endif
 
   namespace {
@@ -550,6 +560,12 @@ namespace confighttp {
       boost::property_tree::json_parser::write_json(path, tree);
 #endif
     };
+#ifndef SUNSHINE_HTTP_AUTH_POLICY_ONLY
+    deps.credentials_tag = [] {
+      std::scoped_lock credentials_lock(credentials_mutex());
+      return util::hex(crypto::hash(config::sunshine.username + "\n" + config::sunshine.salt + "\n" + config::sunshine.password)).to_string();
+    };
+#endif
     return deps;
   }
 
@@ -578,6 +594,7 @@ namespace confighttp {
     std::string refresh_hash = _dependencies.hash(refresh_token);
     std::string device_label = derive_device_label(user_agent, remote_address);
     std::string rotation_id = _dependencies.rand_alphabet(24);
+    const auto credentials_tag = _dependencies.credentials_tag ? _dependencies.credentials_tag() : std::string {};
 
     {
       std::scoped_lock lock(_mutex);
@@ -593,6 +610,7 @@ namespace confighttp {
         device_label,
         refresh_hash,
         rotation_id,
+        credentials_tag,
       };
       _session_tokens.erase(session_hash);
       _session_tokens.emplace(session_hash, std::move(token));
@@ -618,6 +636,7 @@ namespace confighttp {
     }
 
     auto now = _dependencies.now();
+    const auto credentials_tag = _dependencies.credentials_tag ? _dependencies.credentials_tag() : std::string {};
     std::string refresh_hash = _dependencies.hash(refresh_token);
     std::optional<SessionTokenBundle> result;
     bool needs_persist = false;
@@ -639,7 +658,7 @@ namespace confighttp {
       }
       if (!invalid) {
         auto &entry = sess_it->second;
-        if (now > entry.refresh_expires_at) {
+        if (now > entry.refresh_expires_at || (_dependencies.credentials_tag && entry.credentials_tag != credentials_tag)) {
           _refresh_index.erase(ref_it);
           _session_tokens.erase(sess_it);
           _dirty = true;
@@ -670,6 +689,7 @@ namespace confighttp {
             device_label,
             new_refresh_hash,
             rotation_id,
+            entry.credentials_tag,
           };
 
           _session_tokens.erase(sess_it);
@@ -700,6 +720,7 @@ namespace confighttp {
   }
 
   bool SessionTokenManager::validate_session_token(const std::string &token) {
+    const auto credentials_tag = _dependencies.credentials_tag ? _dependencies.credentials_tag() : std::string {};
     bool should_persist = false;
     bool valid = false;
     {
@@ -710,7 +731,7 @@ namespace confighttp {
         return false;
       }
       auto now = _dependencies.now();
-      if (now > it->second.refresh_expires_at) {
+      if (now > it->second.refresh_expires_at || (_dependencies.credentials_tag && it->second.credentials_tag != credentials_tag)) {
         if (!it->second.refresh_token_hash.empty()) {
           _refresh_index.erase(it->second.refresh_token_hash);
         }
@@ -738,6 +759,16 @@ namespace confighttp {
   void SessionTokenManager::revoke_session_token(const std::string &token) {
     std::string token_hash = _dependencies.hash(token);
     revoke_session_by_hash(token_hash);
+  }
+
+  bool SessionTokenManager::revoke_all_session_tokens() {
+    {
+      std::scoped_lock lock(_mutex);
+      _session_tokens.clear();
+      _refresh_index.clear();
+      _dirty = true;
+    }
+    return save_session_tokens();
   }
 
   bool SessionTokenManager::revoke_session_by_hash(const std::string &token_hash) {
@@ -856,7 +887,9 @@ namespace confighttp {
     return token_hash;
   }
 
-  void SessionTokenManager::save_session_tokens() const {
+  bool SessionTokenManager::save_session_tokens() const {
+    // Serialize the snapshot with its write so an older save cannot resurrect a revoked token.
+    std::scoped_lock persistence_lock(_persistence_mutex);
     const auto state_path = authentication_state_path();
 
     std::vector<std::pair<std::string, SessionToken>> snapshot;
@@ -864,7 +897,7 @@ namespace confighttp {
     {
       std::scoped_lock lock(_mutex);
       if (!_dirty) {
-        return;
+        return true;
       }
       snapshot.reserve(_session_tokens.size());
       for (const auto &entry : _session_tokens) {
@@ -909,6 +942,7 @@ namespace confighttp {
           node.put("refresh_expires_at", std::chrono::duration_cast<std::chrono::seconds>(token.refresh_expires_at.time_since_epoch()).count());
           node.put("last_seen", std::chrono::duration_cast<std::chrono::seconds>(token.last_seen.time_since_epoch()).count());
           node.put("remember_me", token.remember_me);
+          node.put("credentials_tag", token.credentials_tag);
           if (!token.refresh_token_hash.empty()) {
             node.put("refresh_token_hash", token.refresh_token_hash);
           }
@@ -948,9 +982,12 @@ namespace confighttp {
         _last_persist = _dependencies.now();
       }
     }
+    return !write_failed;
   }
 
   void SessionTokenManager::load_session_tokens() {
+    const auto credentials_tag = _dependencies.credentials_tag ? _dependencies.credentials_tag() : std::string {};
+    std::scoped_lock persistence_lock(_persistence_mutex);
     const auto state_path = authentication_state_path();
 
     pt::ptree root;
@@ -991,6 +1028,10 @@ namespace confighttp {
             continue;
           }
           SessionToken token;
+          token.credentials_tag = node.get<std::string>("credentials_tag", "");
+          if (_dependencies.credentials_tag && token.credentials_tag != credentials_tag) {
+            continue;
+          }
           token.username = node.get<std::string>("username", "");
           auto created_secs = node.get<std::int64_t>("created_at", 0);
           token.created_at = std::chrono::system_clock::time_point(std::chrono::seconds(created_secs));
@@ -1069,9 +1110,9 @@ namespace confighttp {
       _session_manager(session_manager) {}
 
   APIResponse SessionTokenAPI::login(const std::string &username, const std::string &password, const std::string &redirect_url, bool remember_me, const std::string &user_agent, const std::string &remote_address) {
-    if (!validate_credentials(username, password)) {
-      BOOST_LOG(info) << "Configuration API: Login failed for user: " << username;
-      return create_error_response("Invalid credentials", StatusCode::client_error_unauthorized);
+    std::scoped_lock credentials_lock(credentials_mutex());
+    if (const auto auth = make_request_auth_policy().check_password(remote_address, username, password); !auth.ok) {
+      return {auth.code, auth.body, auth.headers};
     }
 
     auto issued = _session_manager.issue_session_tokens(
@@ -1174,6 +1215,7 @@ namespace confighttp {
   }
 
   APIResponse SessionTokenAPI::refresh_session(const std::string &refresh_token, const std::string &user_agent, const std::string &remote_address) {
+    std::scoped_lock credentials_lock(credentials_mutex());
     if (refresh_token.empty()) {
       return create_error_response("Refresh token required", StatusCode::client_error_unauthorized);
     }
@@ -1259,21 +1301,16 @@ namespace confighttp {
     return create_success_response(data);
   }
 
-  bool SessionTokenAPI::validate_credentials(const std::string &username, const std::string &password) const {
-    if (auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
-        !boost::iequals(username, config::sunshine.username) || hash != config::sunshine.password) {
-      return false;
-    }
-    return true;
-  }
-
   namespace {
     policy::RequestAuthPolicy make_request_auth_policy() {
       policy::RequestAuthDependencies dependencies;
       dependencies.remote_allowed = [](const std::string &address) { return net::from_address(address) <= http::origin_web_ui_allowed; };
       dependencies.credentials_configured = [] { return !config::sunshine.username.empty(); };
       dependencies.credentials_valid = [](const std::string &username, const std::string &password) {
-        return boost::iequals(username, config::sunshine.username) && util::hex(crypto::hash(password + config::sunshine.salt)).to_string() == config::sunshine.password;
+        return !config::sunshine.username.empty() && boost::iequals(username, config::sunshine.username) && util::hex(crypto::hash(password + config::sunshine.salt)).to_string() == config::sunshine.password;
+      };
+      dependencies.password_auth = [verify = dependencies.credentials_valid](const std::string &remote, const std::string &username, const std::string &password) {
+        return password_attempts.verify(remote, [&] { return verify(username, password); });
       };
       dependencies.bearer_valid = [](const std::string &raw, const std::string &path, const std::string &method) { return api_token_manager.authenticate_bearer(raw, path, method); };
       dependencies.session_valid = [](const std::string &token) { return session_token_api.validate_session(token).status_code == StatusCode::success_ok; };
@@ -1313,192 +1350,33 @@ namespace confighttp {
 
   AuthResult make_auth_error(StatusCode code, const std::string &error) {
     return make_request_auth_policy().make_error(code, error);
-#if 0
-    AuthResult result {false, code, {}, {}};
-    // Always add CORS origin header for auth errors (and redirects) to satisfy UI expectations
-    {
-      std::uint16_t https_port = net::map_port(confighttp::PORT_HTTPS);
-      std::string cors_origin = std::format("https://localhost:{}", https_port);
-      result.headers.emplace("Access-Control-Allow-Origin", cors_origin);
-    }
-    if (!error.empty()) {
-      nlohmann::json j;
-      j["status"] = false;
-      j["error"] = error;
-      result.body = j.dump();
-      result.headers.emplace("Content-Type", "application/json");
-    }
-    return result;
-#endif
-  }
-
-  AuthResult make_basic_auth_error(const std::string &error_message = "Unauthorized") {
-    AuthResult result = make_auth_error(StatusCode::client_error_unauthorized, error_message);
-    result.headers.emplace("WWW-Authenticate", "Basic realm=\"Sunshine\"");
-    return result;
-  }
-
-  namespace {
-    std::optional<std::pair<std::string, std::string>> parse_basic_credentials(const std::string &raw_auth) {
-      auto space_pos = raw_auth.find(' ');
-      if (space_pos == std::string::npos) {
-        return std::nullopt;
-      }
-      std::string scheme = raw_auth.substr(0, space_pos);
-      if (!boost::iequals(scheme, "Basic")) {
-        return std::nullopt;
-      }
-      std::string encoded = raw_auth.substr(space_pos + 1);
-      if (encoded.empty()) {
-        return std::nullopt;
-      }
-      try {
-        std::string decoded = SimpleWeb::Crypto::Base64::decode(encoded);
-        auto colon_pos = decoded.find(':');
-        if (colon_pos == std::string::npos) {
-          return std::nullopt;
-        }
-        return std::make_pair(decoded.substr(0, colon_pos), decoded.substr(colon_pos + 1));
-      } catch (...) {
-        return std::nullopt;
-      }
-    }
-
-    bool validate_basic_credentials(const std::string &username, const std::string &password) {
-      if (config::sunshine.username.empty()) {
-        return false;
-      }
-      auto hashed = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
-      return boost::iequals(username, config::sunshine.username) && hashed == config::sunshine.password;
-    }
-  }  // namespace
-
-  AuthResult check_basic_auth(const std::string &raw_auth) {
-    if (auto credentials = parse_basic_credentials(raw_auth);
-        credentials && validate_basic_credentials(credentials->first, credentials->second)) {
-      return {true, StatusCode::success_ok, {}, {}};
-    }
-    return make_basic_auth_error("Unauthorized");
   }
 
   AuthResult check_bearer_auth(const std::string &raw_auth, const std::string &path, const std::string &method) {
     return make_request_auth_policy().check_bearer(raw_auth, path, method);
-#if 0
-    if (!api_token_manager.authenticate_bearer(raw_auth, path, method)) {
-      return make_auth_error(StatusCode::client_error_forbidden, "Forbidden: Token does not have permission for this path/method.");
-    }
-    return {true, StatusCode::success_ok, {}, {}};
-#endif
   }
 
   AuthResult check_session_auth(const std::string &raw_auth) {
     return make_request_auth_policy().check_session(raw_auth);
-#if 0
-    if (raw_auth.rfind("Session ", 0) != 0) {
-      return make_auth_error(StatusCode::client_error_unauthorized, "Invalid session token format");
-    }
-
-    std::string token = raw_auth.substr(8);
-
-    if (APIResponse api_response = session_token_api.validate_session(token); api_response.status_code == StatusCode::success_ok) {
-      return {true, StatusCode::success_ok, {}, {}};
-    }
-
-    return make_auth_error(StatusCode::client_error_unauthorized, "Invalid or expired session token");
-#endif
   }
 
   bool is_html_request(const std::string &path) {
     return make_request_auth_policy().is_html_request(path);
-#if 0
-    // API requests start with /api/
-    if (path.rfind("/api/", 0) == 0) {
-      return false;
-    }
-
-    // Asset requests in known directories
-    if (path.rfind("/assets/", 0) == 0 || path.rfind("/images/", 0) == 0) {
-      return false;
-    }
-
-    // Static file extensions should not be treated as HTML
-    {
-      std::string ext = std::filesystem::path(path).extension().string();
-      boost::algorithm::to_lower(ext);
-      static const std::vector<std::string> non_html_ext = {".js", ".css", ".map", ".json", ".woff", ".woff2", ".ttf", ".eot", ".ico", ".png", ".jpg", ".jpeg", ".svg"};
-      if (std::ranges::find(non_html_ext, ext) != non_html_ext.end()) {
-        return false;
-      }
-    }
-
-    // Everything else is likely an HTML page request
-    return true;
-#endif
   }
 
   AuthResult check_auth(const std::string &remote_address, const std::string &auth_header, const std::string &path, const std::string &method) {
+    std::scoped_lock credentials_lock(credentials_mutex());
     return make_request_auth_policy().check(remote_address, auth_header, path, method);
-#if 0
-    // Strip query string from path for matching
-    auto base_path = path;
-    if (auto qpos = base_path.find('?'); qpos != std::string::npos) {
-      base_path.resize(qpos);
-    }
+  }
 
-    // Allow welcome page without authentication
-    if (base_path == "/welcome" || base_path == "/welcome/") {
-      return {true, StatusCode::success_ok, {}, {}};
-    }
+  AuthResult check_setup(const std::string &remote_address) {
+    std::scoped_lock credentials_lock(credentials_mutex());
+    return make_request_auth_policy().check_setup(remote_address);
+  }
 
-    if (auto ip_type = net::from_address(remote_address); ip_type > http::origin_web_ui_allowed) {
-      BOOST_LOG(info) << "Configuration API: ["sv << remote_address << "] -- denied"sv;
-      return make_auth_error(StatusCode::client_error_forbidden, "Forbidden");
-    }
-
-    // If no username configured yet, allow unauthenticated access so SPA can drive setup (except protected APIs later)
-    bool credentials_configured = !config::sunshine.username.empty();
-
-    // Only protect /api/ endpoints (except auth endpoints) for SPA model; all other paths (HTML shell, assets) are always allowed
-    bool is_api = base_path.rfind("/api/", 0) == 0;
-    bool is_auth_api = (base_path == "/api/auth/login" || base_path == "/api/auth/logout" || base_path == "/api/csrf-token");
-    if (!is_api) {
-      return {true, StatusCode::success_ok, {}, {}};  // public content served; SPA handles routing and will trigger API calls
-    }
-    if (is_auth_api) {
-      return {true, StatusCode::success_ok, {}, {}};  // login/logout endpoints public (logout will no-op if no token)
-    }
-
-    // From here on: /api/ (non-auth) endpoints must have credentials configured and valid session or bearer token
-    if (!credentials_configured) {
-      return make_auth_error(StatusCode::client_error_unauthorized, "Credentials not configured");
-    }
-
-    if (auth_header.empty()) {
-      return make_auth_error(StatusCode::client_error_unauthorized, "Unauthorized");
-    }
-
-    if (auth_header.rfind("Bearer ", 0) == 0) {
-      return check_bearer_auth(auth_header, path, method);
-    }
-
-    if (auth_header.rfind("Session ", 0) == 0) {
-      {
-        auto session_res = check_session_auth(auth_header);
-        if (!session_res.ok) {
-          return make_auth_error(StatusCode::client_error_unauthorized, "Invalid or expired session token");
-        }
-        return session_res;
-      }
-    }
-
-    if (auto scheme_end = auth_header.find(' ');
-        scheme_end != std::string::npos && boost::iequals(auth_header.substr(0, scheme_end), "Basic")) {
-      return check_basic_auth(auth_header);
-    }
-
-    // Default: unauthorized
-    return make_auth_error(StatusCode::client_error_unauthorized, "Unauthorized");
-#endif
+  AuthResult check_password(const std::string &remote_address, const std::string &username, const std::string &password) {
+    std::scoped_lock credentials_lock(credentials_mutex());
+    return make_request_auth_policy().check_password(remote_address, username, password);
   }
 
   namespace {

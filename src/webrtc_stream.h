@@ -49,6 +49,8 @@ namespace webrtc_stream {
       std::optional<std::string> profile;
       std::optional<int> app_id;
       std::optional<bool> resume;
+      std::optional<int> guest_app_scope;
+      bool guest_may_launch = false;
 
       // Guest access control. Both default to today's behaviour when unset:
       // full input, controller slot 0. A guest is created with a narrower

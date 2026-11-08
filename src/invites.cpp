@@ -24,6 +24,7 @@ namespace invite {
   using namespace std::literals;
 
   namespace {
+    std::shared_mutex g_access_mutex;
     std::mutex g_mutex;
     std::vector<invite_t> g_invites;
     bool g_loaded = false;
@@ -90,6 +91,10 @@ namespace invite {
       return it == g_invites.end() ? nullptr : &*it;
     }
   }  // namespace
+
+  std::shared_lock<std::shared_mutex> acquire_access() {
+    return std::shared_lock<std::shared_mutex> {g_access_mutex};
+  }
 
   void load() {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -174,7 +179,8 @@ namespace invite {
     return invite;
   }
 
-  std::optional<invite_t> update(const std::string &id, const spec_t &spec) {
+  std::optional<invite_t> update(const std::string &id, const spec_t &spec, revoked_access_t &revoked) {
+    std::unique_lock access(g_access_mutex);
     std::lock_guard<std::mutex> lock(g_mutex);
     auto *invite = find_locked(id);
     if (!invite) {
@@ -205,9 +211,13 @@ namespace invite {
     // Narrowing an invite must not leave a wider session already running on it.
     // Sessions snapshot their grant at redemption, so the only way to take one
     // back is to end it; revoking or re-scoping is exactly that intent.
-    const bool narrowed = (spec.revoked && *spec.revoked) || spec.perm || spec.gamepad_base_slot || spec.app_id;
+    const bool narrowed = spec.revoked || spec.perm || spec.gamepad_base_slot || spec.app_id ||
+                          spec.allow_browser || spec.allow_pairing || spec.expires_in_seconds;
     if (narrowed) {
-      guest::revoke_for_invite(invite->id);
+      ++invite->generation;
+      revoked.stream_ids = guest::revoke_for_invite(invite->id);
+      revoked.device_uuids = std::move(invite->paired_device_uuids);
+      invite->paired_device_uuids.clear();
     }
     if (spec.max_uses) {
       invite->max_uses = *spec.max_uses;
@@ -226,7 +236,8 @@ namespace invite {
     return copy;
   }
 
-  std::optional<invite_t> rotate(const std::string &id) {
+  std::optional<invite_t> rotate(const std::string &id, revoked_access_t &revoked) {
+    std::unique_lock access(g_access_mutex);
     std::lock_guard<std::mutex> lock(g_mutex);
     auto *invite = find_locked(id);
     if (!invite) {
@@ -239,34 +250,53 @@ namespace invite {
     invite->locked_until = {};
     invite->failed_attempts = 0;
     // The old link is dead, so anything holding a session from it is too.
-    guest::revoke_for_invite(invite->id);
+    ++invite->generation;
+    revoked.stream_ids = guest::revoke_for_invite(invite->id);
+    revoked.device_uuids = std::move(invite->paired_device_uuids);
+    invite->paired_device_uuids.clear();
 
     const auto copy = *invite;
     save_locked();
     return copy;
   }
 
-  void record_paired_device(const std::string &invite_id, const std::string &device_uuid) {
+  bool commit_pairing(const std::string &invite_id, std::uint64_t generation, const std::string &device_uuid, const std::function<void()> &publish) {
     if (invite_id.empty() || device_uuid.empty()) {
-      return;
+      return false;
     }
+    auto access = acquire_access();
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      auto *invite = find_locked(invite_id);
+      if (!invite || !policy::grant_valid(*invite, mode_e::pairing, generation, policy::clock_t::now())) {
+        return false;
+      }
+      if (std::find(invite->paired_device_uuids.begin(), invite->paired_device_uuids.end(), device_uuid) == invite->paired_device_uuids.end()) {
+        invite->paired_device_uuids.push_back(device_uuid);
+        save_locked();
+      }
+    }
+    // Never hold the storage mutex while publishing a client certificate. The access
+    // gate makes publication indivisible with respect to owner revocation.
+    publish();
+    return true;
+  }
+
+  std::optional<invite_t> paired_grant(const std::string &id, std::uint64_t generation) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    auto *invite = find_locked(invite_id);
-    if (!invite) {
-      // The owner deleted the invite while the handshake was in flight. Nothing to
-      // attach the device to, and nothing that will ever revoke it — so say so
-      // loudly rather than leaving a device paired that no invite accounts for.
-      BOOST_LOG(warning) << "Invites: paired device "sv << device_uuid
-                         << " belongs to invite "sv << invite_id
-                         << ", which no longer exists; it must be removed by hand"sv;
-      return;
+    const auto *invite = find_locked(id);
+    return invite && policy::grant_valid(*invite, mode_e::pairing, generation, policy::clock_t::now()) ?
+      std::optional<invite_t> {*invite} : std::nullopt;
+  }
+
+  std::optional<std::string> invite_for_paired_device(const std::string &device_uuid) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (const auto &invite : g_invites) {
+      if (std::find(invite.paired_device_uuids.begin(), invite.paired_device_uuids.end(), device_uuid) != invite.paired_device_uuids.end()) {
+        return invite.id;
+      }
     }
-    if (std::find(invite->paired_device_uuids.begin(), invite->paired_device_uuids.end(), device_uuid) !=
-        invite->paired_device_uuids.end()) {
-      return;
-    }
-    invite->paired_device_uuids.push_back(device_uuid);
-    save_locked();
+    return std::nullopt;
   }
 
   std::optional<std::uint32_t> perm_for_paired_device(const std::string &device_uuid) {
@@ -301,8 +331,15 @@ namespace invite {
     return taken;
   }
 
-  bool remove(const std::string &id) {
+  bool remove(const std::string &id, revoked_access_t &revoked) {
+    std::unique_lock access(g_access_mutex);
     std::lock_guard<std::mutex> lock(g_mutex);
+    auto *invite = find_locked(id);
+    if (!invite) {
+      return false;
+    }
+    revoked.stream_ids = guest::revoke_for_invite(id);
+    revoked.device_uuids = std::move(invite->paired_device_uuids);
     const auto before = g_invites.size();
     g_invites.erase(
       std::remove_if(g_invites.begin(), g_invites.end(), [&](const invite_t &i) {
@@ -313,9 +350,29 @@ namespace invite {
     if (g_invites.size() == before) {
       return false;
     }
-    guest::revoke_for_invite(id);
     save_locked();
     return true;
+  }
+
+  revoked_access_t expire(policy::time_point_t now) {
+    std::unique_lock access(g_access_mutex);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    revoked_access_t revoked;
+    revoked.stream_ids = guest::expire(now);
+    bool changed = false;
+    for (auto &invite : g_invites) {
+      if (invite.revoked || (invite.expires_at != policy::time_point_t {} && now >= invite.expires_at)) {
+        auto streams = guest::revoke_for_invite(invite.id);
+        revoked.stream_ids.insert(revoked.stream_ids.end(), streams.begin(), streams.end());
+        revoked.device_uuids.insert(revoked.device_uuids.end(), invite.paired_device_uuids.begin(), invite.paired_device_uuids.end());
+        changed |= !invite.paired_device_uuids.empty();
+        invite.paired_device_uuids.clear();
+      }
+    }
+    if (changed) {
+      save_locked();
+    }
+    return revoked;
   }
 
   redemption_t redeem(const std::string &token, mode_e mode, const std::string &pin) {
@@ -373,7 +430,7 @@ namespace invite {
     namespace {
       /// Lock ordering: the invite list's g_mutex is always taken BEFORE this one
       /// — update(), rotate() and remove() all call into here while holding it.
-      /// Nothing in this namespace takes g_mutex, which is what keeps that safe.
+      /// lookups also follow that order. The access gate precedes both mutexes.
       std::mutex g_guest_mutex;
       std::unordered_map<std::string, session_t> g_sessions;
 
@@ -381,16 +438,15 @@ namespace invite {
       /// for a session, so it gets the same 192 bits.
       constexpr std::size_t guest_token_length = 32;
 
-      /// Caller holds g_guest_mutex. Expired sessions are dropped lazily rather than on a
-      /// timer — the map only grows when someone redeems, and every lookup prunes.
-      void sweep_locked(policy::time_point_t now) {
-        for (auto it = g_sessions.begin(); it != g_sessions.end();) {
-          it = it->second.expires_at <= now ? g_sessions.erase(it) : std::next(it);
-        }
-      }
     }  // namespace
 
     std::string issue(const invite_t &invite) {
+      auto access = acquire_access();
+      std::lock_guard<std::mutex> invite_lock(g_mutex);
+      const auto *current = find_locked(invite.id);
+      if (!current || !policy::grant_valid(*current, mode_e::browser, invite.generation, policy::clock_t::now())) {
+        return {};
+      }
       session_t session;
       session.invite_id = invite.id;
       session.label = invite.label;
@@ -400,12 +456,12 @@ namespace invite {
       session.perm = invite.perm;
       session.gamepad_base_slot = invite.gamepad_base_slot;
       session.app_id = invite.app_id;
+      session.generation = invite.generation;
       session.expires_at = policy::clock_t::now() + session_ttl;
 
       auto token = crypto::rand_alphabet(guest_token_length, token_alphabet);
 
       std::lock_guard<std::mutex> lock(g_guest_mutex);
-      sweep_locked(policy::clock_t::now());
       g_sessions.emplace(token, std::move(session));
       return token;
     }
@@ -415,10 +471,14 @@ namespace invite {
         return std::nullopt;
       }
       const auto now = policy::clock_t::now();
+      std::lock_guard<std::mutex> invite_lock(g_mutex);
       std::lock_guard<std::mutex> lock(g_guest_mutex);
-      sweep_locked(now);
       const auto it = g_sessions.find(token);
-      if (it == g_sessions.end()) {
+      if (it == g_sessions.end() || it->second.expires_at <= now) {
+        return std::nullopt;
+      }
+      const auto *current = find_locked(it->second.invite_id);
+      if (!current || !policy::grant_valid(*current, mode_e::browser, it->second.generation, now)) {
         return std::nullopt;
       }
       return it->second;
@@ -429,11 +489,31 @@ namespace invite {
         return;
       }
       std::lock_guard<std::mutex> lock(g_guest_mutex);
-      sweep_locked(policy::clock_t::now());
       if (const auto it = g_sessions.find(token); it != g_sessions.end()) {
-        // Last one wins. A guest who reloads the page creates a fresh session and the
-        // old one is already being torn down, so there is nothing to keep.
-        it->second.stream_session_id = stream_session_id;
+        it->second.stream_session_ids.insert(stream_session_id);
+      }
+    }
+
+    bool create_stream(const std::string &token, const std::function<std::optional<std::string>(const session_t &)> &start) {
+      auto access = acquire_access();
+      const auto session = lookup(token);
+      if (!session) {
+        return false;
+      }
+      const auto id = start(*session);
+      if (id) {
+        // No sweep here: startup may have crossed the TTL boundary. Preserve the
+        // stream so the expiry worker still owns and closes it.
+        std::lock_guard<std::mutex> lock(g_guest_mutex);
+        g_sessions.at(token).stream_session_ids.insert(*id);
+      }
+      return true;
+    }
+
+    void forget_stream_session(const std::string &id) {
+      std::lock_guard<std::mutex> lock(g_guest_mutex);
+      for (auto &entry : g_sessions) {
+        entry.second.stream_session_ids.erase(id);
       }
     }
 
@@ -441,24 +521,27 @@ namespace invite {
       if (token.empty() || stream_session_id.empty()) {
         return false;
       }
-      std::lock_guard<std::mutex> lock(g_guest_mutex);
-      sweep_locked(policy::clock_t::now());
-      const auto it = g_sessions.find(token);
-      return it != g_sessions.end() && it->second.stream_session_id == stream_session_id;
+      const auto session = lookup(token);
+      return session && session->stream_session_ids.count(stream_session_id) != 0;
     }
 
-    void revoke(const std::string &token) {
+    std::vector<std::string> revoke(const std::string &token) {
+      std::unique_lock access(g_access_mutex);
       std::lock_guard<std::mutex> lock(g_guest_mutex);
-      g_sessions.erase(token);
+      std::vector<std::string> ids;
+      if (auto it = g_sessions.find(token); it != g_sessions.end()) {
+        ids.assign(it->second.stream_session_ids.begin(), it->second.stream_session_ids.end());
+        g_sessions.erase(it);
+      }
+      return ids;
     }
 
     int active_count(const std::string &invite_id) {
       const auto now = policy::clock_t::now();
       std::lock_guard<std::mutex> lock(g_guest_mutex);
-      sweep_locked(now);
       int count = 0;
       for (const auto &entry : g_sessions) {
-        if (entry.second.invite_id == invite_id) {
+        if (entry.second.invite_id == invite_id && entry.second.expires_at > now) {
           ++count;
         }
       }
@@ -467,21 +550,41 @@ namespace invite {
 
     std::vector<std::string> stream_sessions_for_invite(const std::string &invite_id) {
       std::lock_guard<std::mutex> lock(g_guest_mutex);
-      sweep_locked(policy::clock_t::now());
       std::vector<std::string> ids;
       for (const auto &entry : g_sessions) {
-        if (entry.second.invite_id == invite_id && !entry.second.stream_session_id.empty()) {
-          ids.push_back(entry.second.stream_session_id);
+        if (entry.second.invite_id == invite_id) {
+          ids.insert(ids.end(), entry.second.stream_session_ids.begin(), entry.second.stream_session_ids.end());
         }
       }
       return ids;
     }
 
-    void revoke_for_invite(const std::string &invite_id) {
+    std::vector<std::string> revoke_for_invite(const std::string &invite_id) {
       std::lock_guard<std::mutex> lock(g_guest_mutex);
+      std::vector<std::string> ids;
       for (auto it = g_sessions.begin(); it != g_sessions.end();) {
-        it = it->second.invite_id == invite_id ? g_sessions.erase(it) : std::next(it);
+        if (it->second.invite_id == invite_id) {
+          ids.insert(ids.end(), it->second.stream_session_ids.begin(), it->second.stream_session_ids.end());
+          it = g_sessions.erase(it);
+        } else {
+          ++it;
+        }
       }
+      return ids;
+    }
+
+    std::vector<std::string> expire(policy::time_point_t now) {
+      std::lock_guard<std::mutex> lock(g_guest_mutex);
+      std::vector<std::string> ids;
+      for (auto it = g_sessions.begin(); it != g_sessions.end();) {
+        if (it->second.expires_at <= now) {
+          ids.insert(ids.end(), it->second.stream_session_ids.begin(), it->second.stream_session_ids.end());
+          it = g_sessions.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      return ids;
     }
 
   }  // namespace guest

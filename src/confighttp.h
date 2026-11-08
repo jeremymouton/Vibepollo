@@ -44,9 +44,6 @@ namespace confighttp {
   // Authentication helpers
   AuthResult check_auth(const req_https_t &request);
   bool authenticate(resp_https_t response, req_https_t request);
-  std::string get_client_id(const req_https_t &request);
-  std::string generate_csrf_token(const std::string &client_id);
-  bool validate_csrf_token(const resp_https_t &response, const req_https_t &request, const std::string &client_id);
 
   // Token scope helpers
   TokenScope scope_from_string(std::string_view scope);

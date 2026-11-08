@@ -50,6 +50,7 @@
 #include "logging.h"
 #include "network.h"
 #include "invites.h"
+#include "http_security.h"
 #include "nvhttp.h"
 #include "platform/common.h"
 #include "state_storage.h"
@@ -82,6 +83,7 @@ namespace nvhttp {
   using p_named_cert_t = crypto::p_named_cert_t;
   using PERM = crypto::PERM;
   using verified_client_t = std::optional<crypto::named_cert_t>;
+  inline PERM client_perm(const verified_client_t &verified_client);
 
   namespace {
     std::int64_t now_seconds() {
@@ -101,6 +103,9 @@ namespace nvhttp {
   crypto::cert_chain_t cert_chain;
   static std::shared_ptr<safe::queue_t<crypto::x509_t>> pending_cert_queue =
     std::make_shared<safe::queue_t<crypto::x509_t>>(30);
+  // HTTP, HTTPS and the configuration API share pending handshakes and OTP state.
+  // Acquire before invite access; release before unpairing active clients.
+  static std::mutex pairing_mutex;
   static std::string one_time_pin;
   static std::string otp_passphrase;
   static std::string otp_device_name;
@@ -1183,7 +1188,7 @@ namespace nvhttp {
 
 #ifndef _WIN32
   namespace {
-    bool has_stream_session_activity_for_http_probe() {
+    bool has_stream_session_activity() {
       return rtsp_stream::has_pending_launch_or_startup() ||
              rtsp_stream::session_count_no_cleanup() > 0 ||
              stream::session::running_sessions.load(std::memory_order_acquire) != 0 ||
@@ -1191,6 +1196,10 @@ namespace nvhttp {
              webrtc_stream::has_active_or_pending_sessions() ||
              webrtc_stream::has_capture_active() ||
              webrtc_stream::has_teardown_in_progress();
+    }
+
+    bool has_stream_session_activity_for_http_probe() {
+      return has_stream_session_activity();
     }
 
     http_encoder_capabilities_t advertised_encoder_capabilities_for_http() {
@@ -1247,6 +1256,40 @@ namespace nvhttp {
 
     // uniqueID, session
     std::unordered_map<std::string, pair_session_t> map_id_sess;
+    constexpr std::size_t max_pending_pairings = 64;
+    constexpr auto pairing_session_expiry = std::chrono::minutes(10);
+
+    // The caller holds pairing_mutex across pruning and handshake use.
+    void prune_pairing_sessions(std::chrono::steady_clock::time_point now) {
+      std::erase_if(map_id_sess, [now](const auto &entry) {
+        return now - entry.second.created_at >= pairing_session_expiry;
+      });
+    }
+
+    template<class Request>
+    bool pairing_request_within_limit(const Request &request) {
+      // A pending PIN response retains its request, including headers and content.
+      std::size_t remaining = 32 * 1024;
+      const auto consume = [&](std::size_t size) {
+        if (size > remaining) {
+          return false;
+        }
+        remaining -= size;
+        return true;
+      };
+      if (!consume(request.method.size()) || !consume(request.path.size()) ||
+          !consume(request.query_string.size()) || !consume(request.http_version.size()) ||
+          !consume(8) || !consume(request.content.size())) {
+        return false;
+      }
+      for (const auto &[name, value] : request.header) {
+        if (!consume(name.size()) || !consume(value.size()) || !consume(4)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
     client_t client_root;
     std::mutex client_mutex;
     std::atomic<uint32_t> session_id_counter;
@@ -1404,6 +1447,10 @@ namespace nvhttp {
           named_cert_node["name"] = final_name;
           named_cert_node["cert"] = named_cert_p->cert;
           named_cert_node["uuid"] = named_cert_p->uuid;
+          if (!named_cert_p->invite_id.empty()) {
+            named_cert_node["invite_id"] = named_cert_p->invite_id;
+            named_cert_node["invite_generation"] = named_cert_p->invite_generation;
+          }
           named_cert_node["display_mode"] = named_cert_p->display_mode;
           if (!named_cert_p->virtual_display_mode_override.empty()) {
             named_cert_node["virtual_display_mode"] = named_cert_p->virtual_display_mode_override;
@@ -1496,6 +1543,9 @@ namespace nvhttp {
     }
 
     void load_state() {
+      // Snapshot before taking state/client locks: invite persistence takes the
+      // state lock after its own storage mutex.
+      const auto invite_snapshot = invite::list();
       statefile::migrate_recent_state_keys();
       const auto &sunshine_path = statefile::sunshine_state_path();
       const auto &vibeshine_path = statefile::vibeshine_state_path();
@@ -1595,6 +1645,17 @@ namespace nvhttp {
           named_cert_p->name = el.value("name", "");
           named_cert_p->cert = el.value("cert", "");
           named_cert_p->uuid = el.value("uuid", "");
+          named_cert_p->invite_id = el.value("invite_id", "");
+          named_cert_p->invite_generation = el.value("invite_generation", std::uint64_t {0});
+          if (named_cert_p->invite_id.empty()) {
+            for (const auto &grant : invite_snapshot) {
+              if (std::find(grant.paired_device_uuids.begin(), grant.paired_device_uuids.end(), named_cert_p->uuid) != grant.paired_device_uuids.end()) {
+                named_cert_p->invite_id = grant.id;
+                named_cert_p->invite_generation = grant.generation;
+                break;
+              }
+            }
+          }
           named_cert_p->display_mode = el.value("display_mode", "");
           named_cert_p->hdr_profile = el.value("hdr_profile", "");
           named_cert_p->output_name_override = el.value("output_name_override", "");
@@ -1848,8 +1909,8 @@ namespace nvhttp {
       launch_session->client_vrr_requested = false;
 #ifdef _WIN32
 #endif
-      const auto identity_uuid = resolved_client_identity ? resolved_client_identity->uuid : (verified_client ? verified_client->uuid : std::string());
-      const auto identity_name = resolved_client_identity ? resolved_client_identity->name : (verified_client ? verified_client->name : std::string());
+      const auto identity_uuid = verified_client ? verified_client->uuid : (resolved_client_identity ? resolved_client_identity->uuid : std::string());
+      const auto identity_name = verified_client ? verified_client->name : (resolved_client_identity ? resolved_client_identity->name : std::string());
       launch_session->device_name = identity_name.empty() ? config::nvhttp.sunshine_name : identity_name;
       launch_session->virtual_display = false;
       launch_session->virtual_display_guid_bytes.fill(0);
@@ -1883,10 +1944,10 @@ namespace nvhttp {
       // UUIDs. Treating placeholder IDs as per-client UUIDs creates a fresh
       // Windows monitor identity and loses DPI/HDR calibration.
       const auto launch_client_uuid = resolve_known_client_uuid_from_launch_id(get_arg(args, "uniqueid", ""));
-      if (launch_session->client_uuid.empty()) {
+      if (!verified_client && launch_session->client_uuid.empty()) {
         launch_session->client_uuid = launch_client_uuid;
         launch_session->client_name = client_name_for_uuid(launch_session->client_uuid);
-      } else if (!launch_client_uuid.empty() && launch_client_uuid != launch_session->client_uuid && is_placeholder_client_name(launch_session->client_name)) {
+      } else if (!verified_client && !launch_client_uuid.empty() && launch_client_uuid != launch_session->client_uuid && is_placeholder_client_name(launch_session->client_name)) {
         BOOST_LOG(warning) << "Resolved TLS client identity '" << launch_session->client_name
                            << "' is a placeholder and conflicts with launch uniqueid; using paired client UUID "
                            << launch_client_uuid << " for this session.";
@@ -2044,25 +2105,7 @@ namespace nvhttp {
         launch_session->hdr_profile = verified_client->hdr_profile;
       }
       launch_session->unique_id = get_arg(args, "uniqueid", "unknown");
-      launch_session->perm = verified_client->perm;
-      // A guest's certificate carries whatever it was granted the day it was paired,
-      // and nothing has looked at it since. Narrowing the invite, or revoking it,
-      // left a native client streaming with its original rights — where the browser
-      // path cannot drift, because its grant is overwritten every session. So the
-      // invite is consulted again here and its CURRENT grant is the ceiling.
-      //
-      // Intersected, never widened: this can only take rights away. A device no
-      // invite paired is untouched, because its permission is the owner's business.
-      if (const auto granted = invite::perm_for_paired_device(verified_client->uuid)) {
-        const auto before = static_cast<std::uint32_t>(launch_session->perm);
-        const auto clamped = before & *granted;
-        if (clamped != before) {
-          BOOST_LOG(info) << "Guest device '"sv << verified_client->name
-                          << "' clamped from permission "sv << before << " to "sv << clamped
-                          << " by its invite"sv;
-        }
-        launch_session->perm = static_cast<crypto::PERM>(clamped);
-      }
+      launch_session->perm = client_perm(verified_client);
       const auto launch_appid_arg = get_arg(args, "appid", "0");
       const auto launch_appuuid_arg = get_arg(args, "appuuid", "");
       auto launch_app_ctx = proc::proc.resolve_app(launch_appid_arg, launch_appuuid_arg);
@@ -2411,7 +2454,8 @@ namespace nvhttp {
           // redeemed, so this is the first and only moment the device can be tied
           // back to the invite that admitted it. Revoking the invite later has
           // nothing to revoke without this line.
-          invite::record_paired_device(sess.granted_invite_id, named_cert_p->uuid);
+          named_cert_p->invite_id = sess.granted_invite_id;
+          named_cert_p->invite_generation = sess.granted_invite_generation;
         } else {
           // If the device is the first one paired with the server, assign full permission.
           bool first_client = false;
@@ -2431,10 +2475,19 @@ namespace nvhttp {
         named_cert_p->always_use_virtual_display = false;
         named_cert_p->output_name_override.clear();
 
-        add_authorized_client(named_cert_p);
-
-        if (pending_certs) {
-          pending_certs->raise(crypto::x509(named_cert_p->cert));
+        const auto publish = [&]() {
+          add_authorized_client(named_cert_p);
+          if (pending_certs) {
+            pending_certs->raise(crypto::x509(named_cert_p->cert));
+          }
+        };
+        if (sess.granted_perm) {
+          if (!invite::commit_pairing(sess.granted_invite_id, sess.granted_invite_generation, named_cert_p->uuid, publish)) {
+            fail_pair(sess, tree, "Invite expired or revoked during pairing");
+            return;
+          }
+        } else {
+          publish();
         }
       } else {
         tree.put("root.paired", 0);
@@ -2494,6 +2547,10 @@ namespace nvhttp {
       if (!verified_client) {
         return PERM::_no;
       }
+      if (!verified_client->invite_id.empty()) {
+        const auto grant = invite::paired_grant(verified_client->invite_id, verified_client->invite_generation);
+        return grant ? static_cast<PERM>(static_cast<std::uint32_t>(verified_client->perm) & grant->perm) : PERM::_no;
+      }
       // A device an invite paired is held to the invite's CURRENT grant on every
       // permission check, not only at launch. Without this, revoking or expiring
       // the invite muted the device's input on a stream it could still start and
@@ -2508,6 +2565,26 @@ namespace nvhttp {
 
     inline bool has_client_perm(const verified_client_t &verified_client, PERM perm) {
       return !!(client_perm(verified_client) & perm);
+    }
+
+    bool client_app_allowed(const verified_client_t &client, int requested, int running, bool may_launch) {
+      if (!client) {
+        return false;
+      }
+      if (client->invite_id.empty()) {
+        return true;
+      }
+      const auto grant = invite::paired_grant(client->invite_id, client->invite_generation);
+      if (!grant) {
+        return false;
+      }
+      auto scope = grant->app_id;
+      if (scope > 0) {
+        if (auto app = proc::proc.resolve_app(scope)) {
+          scope = (int) util::from_view(app->id);
+        }
+      }
+      return invite::policy::app_allowed(scope, requested, running, may_launch, has_stream_session_activity());
     }
 
     // `quiet` keeps high-frequency background polls (e.g. ServerCommand) at debug level
@@ -2540,12 +2617,12 @@ namespace nvhttp {
 
     template<class T>
     void print_req(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
-      BOOST_LOG(verbose) << "HTTP "sv << request->method << ' ' << request->path << " tunnel="sv << tunnel<T>::to_string;
+      BOOST_LOG(verbose) << "HTTP "sv << http::security::log_text(request->method) << ' ' << http::security::log_path(request->path) << " tunnel="sv << tunnel<T>::to_string;
 
       if (!request->header.empty()) {
         BOOST_LOG(verbose) << "Headers:"sv;
         for (auto &[name, val] : request->header) {
-          BOOST_LOG(verbose) << name << " -- " << val;
+          BOOST_LOG(verbose) << http::security::log_text(name) << " -- " << http::security::log_header(name, val);
         }
       }
 
@@ -2553,7 +2630,7 @@ namespace nvhttp {
       if (!query.empty()) {
         BOOST_LOG(verbose) << "Query Params:"sv;
         for (auto &[name, val] : query) {
-          BOOST_LOG(verbose) << name << " -- " << val;
+          BOOST_LOG(verbose) << http::security::log_text(name) << " -- [REDACTED]";
         }
       }
     }
@@ -2591,7 +2668,10 @@ namespace nvhttp {
       auto args = request->parse_query_string();
       auto unique_id = get_arg(args, "uniqueid", "");
 
-      const bool cleaned_pending_pair = !unique_id.empty() && map_id_sess.erase(unique_id) > 0;
+      const bool cleaned_pending_pair = [&]() {
+        std::lock_guard pairing_lock(pairing_mutex);
+        return !unique_id.empty() && map_id_sess.erase(unique_id) > 0;
+      }();
       bool removed = false;
 
       if constexpr (std::is_same_v<T, SunshineHTTPS>) {
@@ -2610,6 +2690,7 @@ namespace nvhttp {
 
     template<class T>
     void pair(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+      std::lock_guard pairing_lock(pairing_mutex);
       print_req<T>(request);
 
       pt::ptree tree;
@@ -2629,6 +2710,12 @@ namespace nvhttp {
         return;
       }
 
+      if (!pairing_request_within_limit(*request)) {
+        tree.put("root.<xmlattr>.status_code", 413);
+        tree.put("root.<xmlattr>.status_message", "Pairing request is too large");
+        return;
+      }
+      prune_pairing_sessions(std::chrono::steady_clock::now());
       auto args = request->parse_query_string();
       if (args.find("uniqueid"s) == std::end(args)) {
         tree.put("root.<xmlattr>.status_code", 400);
@@ -2638,13 +2725,30 @@ namespace nvhttp {
       }
 
       auto uniqID {get_arg(args, "uniqueid")};
+      if (uniqID.empty() || uniqID.size() > 256) {
+        tree.put("root.<xmlattr>.status_code", 400);
+        tree.put("root.<xmlattr>.status_message", "Invalid pairing identity");
+        return;
+      }
 
       args_t::const_iterator it;
       if (it = args.find("phrase"); it != std::end(args)) {
         if (it->second == "getservercert"sv) {
+          if (!map_id_sess.contains(uniqID) && map_id_sess.size() >= max_pending_pairings) {
+            tree.put("root.<xmlattr>.status_code", 503);
+            tree.put("root.<xmlattr>.status_message", "Too many pending pairing requests");
+            return;
+          }
           pair_session_t sess;
 
-          auto deviceName {get_arg(args, "devicename")};
+          auto deviceName {get_arg(args, "devicename", "")};
+          const auto certificate = get_arg(args, "clientcert", "");
+          auto salt = get_arg(args, "salt", "");
+          if (deviceName.size() > 256 || certificate.empty() || certificate.size() > 32 * 1024 || salt.size() < 32 || salt.size() > 128) {
+            tree.put("root.<xmlattr>.status_code", 400);
+            tree.put("root.<xmlattr>.status_message", "Invalid pairing parameters");
+            return;
+          }
 
           if (deviceName == "roth"sv) {
             deviceName = "Legacy Moonlight Client";
@@ -2652,7 +2756,7 @@ namespace nvhttp {
 
           sess.client.uniqueID = std::move(uniqID);
           sess.client.name = std::move(deviceName);
-          sess.client.cert = util::from_hex_vec(get_arg(args, "clientcert"), true);
+          sess.client.cert = util::from_hex_vec(certificate, true);
 
           BOOST_LOG(verbose) << sess.client.cert;
           auto session_id = sess.client.uniqueID;
@@ -2662,7 +2766,7 @@ namespace nvhttp {
           }
           auto ptr = map_id_sess.emplace(std::move(session_id), std::move(sess)).first;
 
-          ptr->second.async_insert_pin.salt = std::move(get_arg(args, "salt"));
+          ptr->second.async_insert_pin.salt = std::move(salt);
 
           auto it = args.find("otpauth");
           if (it != std::end(args)) {
@@ -2740,8 +2844,12 @@ namespace nvhttp {
       }
     }
 
-    bool pin(std::string pin, std::string name, std::optional<crypto::PERM> granted_perm, std::string granted_invite_id) {
+    bool pin(std::string pin, std::string name, std::optional<crypto::PERM> granted_perm, std::string granted_invite_id, std::uint64_t granted_invite_generation) {
+      std::lock_guard pairing_lock(pairing_mutex);
       pt::ptree tree;
+      if (name.size() > 256) {
+        return false;
+      }
       if (map_id_sess.empty()) {
         BOOST_LOG(warning) << "PIN submitted but no pending pairing session exists";
         return false;
@@ -2767,11 +2875,7 @@ namespace nvhttp {
       }
 
       const auto now = std::chrono::steady_clock::now();
-      constexpr auto pairing_session_expiry = std::chrono::minutes(10);
-      std::erase_if(map_id_sess, [now, pairing_session_expiry](const auto &entry) {
-        const auto &sess = entry.second;
-        return sess.last_phase == PAIR_PHASE::NONE && now - sess.created_at > pairing_session_expiry;
-      });
+      prune_pairing_sessions(now);
 
       auto sess_it = map_id_sess.end();
       for (auto it = map_id_sess.begin(); it != map_id_sess.end(); ++it) {
@@ -2799,6 +2903,7 @@ namespace nvhttp {
       // its far end in clientpairingsecret, several round trips from here.
       sess.granted_perm = granted_perm;
       sess.granted_invite_id = std::move(granted_invite_id);
+      sess.granted_invite_generation = granted_invite_generation;
 
       getservercert(sess, tree, pin);
 
@@ -3123,6 +3228,9 @@ namespace nvhttp {
 
         for (const auto &app : app_list) {
           auto appid = util::from_view(app.id);
+          if (!client_app_allowed(verified_client, (int) appid, current_appid, has_client_perm(verified_client, PERM::launch))) {
+            continue;
+          }
           bool include = true;
           if (should_hide_inactive_apps) {
             if (
@@ -3227,6 +3335,13 @@ namespace nvhttp {
       const auto request_client_identity = resolve_client_identity(request, verified_client);
       auto required_perm = PERM::launch;
 
+      if (!client_app_allowed(verified_client, (int) appid, current_appid, has_client_perm(verified_client, PERM::launch))) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 403);
+        tree.put("root.<xmlattr>.status_message", "This invite does not allow launching or viewing that app");
+        return;
+      }
+
       BOOST_LOG(verbose) << "Launching app [" << appid_str << "] with UUID [" << appuuid_str << "]";
       // BOOST_LOG(verbose) << "QS: " << request->query_string;
 
@@ -3310,11 +3425,11 @@ namespace nvhttp {
       }
 
       auto client_settings = verified_client;
-      std::string client_uuid = request_client_identity.uuid;
+      std::string client_uuid = verified_client ? verified_client->uuid : request_client_identity.uuid;
       const auto launch_client_uuid = resolve_known_client_uuid_from_launch_id(get_arg(args, "uniqueid", ""));
       if (client_uuid.empty()) {
         client_uuid = launch_client_uuid;
-      } else if (!launch_client_uuid.empty() && is_placeholder_client_name(request_client_identity.name)) {
+      } else if (!verified_client && !launch_client_uuid.empty() && is_placeholder_client_name(request_client_identity.name)) {
         BOOST_LOG(warning) << "Ignoring placeholder TLS client identity '" << request_client_identity.name
                            << "' for runtime overrides; using launch uniqueid " << launch_client_uuid << ".";
         client_uuid = launch_client_uuid;
@@ -3760,7 +3875,19 @@ namespace nvhttp {
       return;
     }
 
+    if (!client_app_allowed(verified_client, current_appid, current_appid, false)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "This invite does not allow viewing that app");
+      return;
+    }
+
     auto args = request->parse_query_string();
+    if (!verified_client->invite_id.empty()) {
+      args.erase("appid");
+      args.erase("appuuid");
+      args.emplace("appid", std::to_string(current_appid));
+    }
     if (
       args.find("rikey"s) == std::end(args) ||
       args.find("rikeyid"s) == std::end(args)
@@ -3788,11 +3915,11 @@ namespace nvhttp {
     }
 
     auto client_settings = verified_client;
-    std::string client_uuid = request_client_identity.uuid;
+    std::string client_uuid = verified_client ? verified_client->uuid : request_client_identity.uuid;
     const auto resume_client_uuid = resolve_known_client_uuid_from_launch_id(get_arg(args, "uniqueid", ""));
     if (client_uuid.empty()) {
       client_uuid = resume_client_uuid;
-    } else if (!resume_client_uuid.empty() && is_placeholder_client_name(request_client_identity.name)) {
+    } else if (!verified_client && !resume_client_uuid.empty() && is_placeholder_client_name(request_client_identity.name)) {
       BOOST_LOG(warning) << "Ignoring placeholder TLS client identity '" << request_client_identity.name
                          << "' for runtime overrides; using resume uniqueid " << resume_client_uuid << ".";
       client_uuid = resume_client_uuid;
@@ -4198,6 +4325,13 @@ namespace nvhttp {
       return;
     }
 
+    if (!client_app_allowed(verified_client, std::max(proc::proc.current_app_id(), 0), proc::proc.current_app_id(), true)) {
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "This invite does not allow controlling that app");
+      return;
+    }
+
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
 
@@ -4449,6 +4583,18 @@ namespace nvhttp {
     conf_intern.servercert = cert;
   }
 
+  void initialize_client_state() {
+    if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
+      load_state();
+      const auto snapshot = client_root_snapshot();
+      if (std::any_of(snapshot.named_devices.begin(), snapshot.named_devices.end(), [](const auto &client) {
+            return client && !client->invite_id.empty();
+          })) {
+        save_state();
+      }
+    }
+  }
+
   void start() {
     platf::set_thread_name("nvhttp");
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
@@ -4456,12 +4602,6 @@ namespace nvhttp {
     auto port_http = net::map_port(PORT_HTTP);
     auto port_https = net::map_port(PORT_HTTPS);
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
-
-    bool clean_slate = config::sunshine.flags[config::flag::FRESH_STATE];
-
-    if (!clean_slate) {
-      load_state();
-    }
 
     auto pkey = file_handler::read_file(config::nvhttp.pkey.c_str());
     auto cert = file_handler::read_file(config::nvhttp.cert.c_str());
@@ -4612,6 +4752,7 @@ namespace nvhttp {
     https_server.resource["^/launch$"]["GET"] = [&host_audio, run_blocking_nvhttp](auto resp, auto req) {
       run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req)]() mutable {
         std::lock_guard launch_lock {launch_request_mutex};
+        auto invite_access = invite::acquire_access();
         (void) proc::proc.running();
         std::lock_guard lifecycle_lock {stream_lifecycle_gate};
         const int current_appid = proc::proc.current_app_id();
@@ -4621,6 +4762,7 @@ namespace nvhttp {
     https_server.resource["^/resume$"]["GET"] = [&host_audio, run_blocking_nvhttp](auto resp, auto req) {
       run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req)]() mutable {
         std::lock_guard launch_lock {launch_request_mutex};
+        auto invite_access = invite::acquire_access();
         (void) proc::proc.running();
         std::lock_guard lifecycle_lock {stream_lifecycle_gate};
         const int current_appid = proc::proc.current_app_id();
@@ -4630,6 +4772,7 @@ namespace nvhttp {
     https_server.resource["^/cancel$"]["GET"] = [run_blocking_nvhttp](auto resp, auto req) {
       run_blocking_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
         std::lock_guard lock {launch_request_mutex};
+        auto invite_access = invite::acquire_access();
         cancel(std::move(resp), std::move(req));
       });
     };
@@ -4639,6 +4782,7 @@ namespace nvhttp {
     https_server.resource["^/api/abr/capabilities$"]["GET"] = getAbrCapabilities;
 
     https_server.config.reuse_address = true;
+    http::security::configure_request_limits(https_server.config);
     https_server.config.address = net::get_bind_address(address_family);
     https_server.config.port = port_https;
 
@@ -4655,6 +4799,7 @@ namespace nvhttp {
     http_server.resource["^/unpair/?$"]["POST"] = unpair<SimpleWeb::HTTP>;
 
     http_server.config.reuse_address = true;
+    http::security::configure_request_limits(http_server.config);
     http_server.config.address = net::get_bind_address(address_family);
     http_server.config.port = port_http;
 
@@ -4680,7 +4825,10 @@ namespace nvhttp {
     // Wait for any event
     shutdown_event->view();
 
-    map_id_sess.clear();
+    {
+      std::lock_guard pairing_lock(pairing_mutex);
+      map_id_sess.clear();
+    }
 
     https_server.stop();
     http_server.stop();
@@ -4694,6 +4842,7 @@ namespace nvhttp {
   }
 
   std::string request_otp(const std::string &passphrase, const std::string &deviceName) {
+    std::lock_guard pairing_lock(pairing_mutex);
     if (passphrase.size() < 4) {
       return "";
     }
@@ -4955,10 +5104,7 @@ namespace nvhttp {
     load_state();
 
     if (removed) {
-      auto session = rtsp_stream::find_session(uuid);
-      if (session) {
-        stop_session(*session, true);
-      }
+      rtsp_stream::disconnect_client_sessions(std::string {uuid});
 
       if (empty) {
         proc::proc.terminate();

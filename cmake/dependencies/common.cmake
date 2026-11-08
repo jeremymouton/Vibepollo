@@ -15,6 +15,11 @@ add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet")
 
 # web server
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/Simple-Web-Server")
+include("${CMAKE_CURRENT_LIST_DIR}/SimpleWebServerHardening.cmake")
+sunshine_prepare_simple_web_server(
+    "${CMAKE_SOURCE_DIR}"
+    "${CMAKE_BINARY_DIR}/generated/simple-web-server"
+    SUNSHINE_SIMPLE_WEB_INCLUDE_DIR)
 
 # libdisplaydevice
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libdisplaydevice")
