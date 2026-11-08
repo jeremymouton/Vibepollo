@@ -57,6 +57,7 @@ One invite, persisted in `invites.json` beside the state file, written through
 | `label` | what the owner calls it ("Brother") |
 | `token` | 32 random bytes, base64url — the secret in the link |
 | `pin` | 6 digits, the second factor, sent through a different channel |
+| `generation` | persisted grant version; changing access or rotating the link invalidates earlier sessions and pending pairings |
 | `perm` | `crypto::PERM` bitmask. The **ceiling** for anything this invite grants |
 | `gamepad_base_slot` | 0–15, so two players do not share a virtual pad |
 | `app_id` | which app the guest may launch, or -1 for "whatever is running" |
@@ -149,8 +150,16 @@ options.gamepad_base_slot = invite.gamepad_base_slot
 options.app_id            = invite.app_id        (when set)
 ```
 
-Overwritten rather than validated, so a guest cannot ask for more by sending a larger
-bitmask; whatever they send in those fields is discarded.
+These values are replaced before capture startup or application execution. A view-only
+guest may join an existing permitted capture but cannot launch an idle application.
+An app-scoped invite cannot adopt another app's running capture, even with launch
+permission. The invite is rechecked while session creation and revocation share an
+authorization gate; every stream created by the guest is registered before its ID is returned.
+
+Revocation, deletion, rotation, access edits, invite expiry, and the eight-hour guest
+session expiry invalidate all affected sessions. The background worker checks expiry
+each second and collects all browser streams and native device sessions, including
+queued native launches, before closing them outside the invite locks.
 
 ### Native Moonlight
 
@@ -165,6 +174,17 @@ instead of `PERM::_default`.
 
 This needs a `nvhttp::pin()` variant taking an explicit permission. The existing
 signature is kept and delegates, so the admin path is unchanged.
+
+Pairing carries the invite ID and grant generation through the handshake and validates
+them again before publishing a certificate. Certificates retain this ancestry on disk;
+a missing, expired, revoked, or changed invite grants no access. Existing certificates
+still associated with an invite are migrated before either HTTP listener starts.
+Historical orphan certificates whose association was already lost cannot be identified
+automatically; the owner should remove any unrecognized device from Client Management.
+
+Pairing state is serialized across HTTP, HTTPS, and PIN submission. At most 64 handshakes
+are retained, stale handshakes expire after ten minutes, and retained pairing requests
+are limited to 32 KiB. General HTTP headers and bodies are capped at 16 MiB before dispatch.
 
 > **Reachability is a separate problem.** A native client speaks GameStream and needs
 > inbound TCP 47984/47989 plus UDP media. An invite grants permission, not a route to the

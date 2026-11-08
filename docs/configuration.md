@@ -2004,6 +2004,8 @@ editing the `conf` file in a text editor. Use the examples as reference.
         <td>Description</td>
         <td colspan="2">
             The origin of the remote endpoint address that is not denied for HTTPS Web UI.
+            Initial username/password setup always requires a loopback connection (IPv4 or IPv6),
+            regardless of this setting. After setup, this network policy applies to owner authentication.
         </td>
     </tr>
     <tr>
@@ -2356,6 +2358,10 @@ editing the `conf` file in a text editor. Use the examples as reference.
         <td>Notes</td>
         <td colspan="2">
             For higher security on shared systems, reduce this value (e.g. 3600 for 1 hour). Minimum is 1 second.
+            Changing the owner username or password invalidates every browser access and refresh token,
+            including remembered sessions saved on disk. Sessions created before credential binding was
+            introduced also require a new login. Separately issued API bearer tokens retain their own scopes
+            and must be revoked explicitly from token management.
         </td>
     </tr>
     <tr>
