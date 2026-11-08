@@ -318,6 +318,24 @@ TEST(SessionTokenManagerStatefulTest, LegacySessionsWithoutCredentialBindingRequ
   EXPECT_FALSE(upgraded.refresh_session_tokens(tokens.refresh_token));
 }
 
+TEST(SessionTokenManagerStatefulTest, RejectedCredentialGenerationIsRemovedFromDisk) {
+  InMemorySessionState state;
+  auto deps = MakeSessionDependencies(state);
+  std::string generation = "original-credentials";
+  deps.credentials_tag = [&] { return generation; };
+  SessionTokenManager initial(deps);
+  const auto tokens = initial.issue_session_tokens("admin");
+  generation = "replacement-credentials";
+  SessionTokenManager changed(deps);
+  changed.load_session_tokens();
+  EXPECT_TRUE(state.root.get_child("root.session_tokens").empty());
+  generation = "original-credentials";
+  SessionTokenManager restored(deps);
+  restored.load_session_tokens();
+  EXPECT_FALSE(restored.validate_session_token(tokens.session_token));
+  EXPECT_FALSE(restored.refresh_session_tokens(tokens.refresh_token));
+}
+
 TEST(SessionTokenManagerStatefulTest, RevocationWriteFailureIsReportedAndCanBeRetried) {
   InMemorySessionState state;
   auto deps = MakeSessionDependencies(state);

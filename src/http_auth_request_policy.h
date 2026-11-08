@@ -22,6 +22,7 @@ namespace confighttp::policy {
     boost::function<clock::time_point()> _now;
     std::mutex _mutex;
     std::unordered_map<std::string, Attempts> _peers;
+    Attempts _local;
     Attempts _global;
     clock::time_point _next_global_attempt {};
   };

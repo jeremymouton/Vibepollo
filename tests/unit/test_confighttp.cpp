@@ -109,6 +109,16 @@ namespace confighttp {
     EXPECT_EQ(verified.load(), 5);
   }
 
+  TEST(PasswordAttemptLimiterTest, LoopbackAliasesShareReservedAttemptBudget) {
+    policy::PasswordAttemptLimiter limiter;
+    for (int i = 0; i < 5; ++i) {
+      EXPECT_EQ(limiter.verify("127.0.0.1", [] { return false; }).retry_after, 0);
+    }
+    for (const auto &address : {"127.0.0.2", "::1", "::ffff:127.0.0.1"}) {
+      EXPECT_GT(limiter.verify(address, [] { return true; }).retry_after, 0);
+    }
+  }
+
   TEST(PasswordAttemptLimiterTest, DistributedAttackAddsShortBackoffAndKeepsLocalRecovery) {
     using Clock = policy::PasswordAttemptLimiter::clock;
     auto now = Clock::now();

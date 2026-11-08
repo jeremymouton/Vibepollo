@@ -20,28 +20,43 @@ namespace confighttp::policy {
     auto retry = [&](clock::time_point reset_at) {
       return PasswordAuthResult {false, static_cast<int>(std::chrono::ceil<std::chrono::seconds>(reset_at - now).count())};
     };
+    const bool local = http::security::is_loopback(remote_address);
     // Keep local recovery available even during a distributed remote attack.
-    if (_global.failures >= 100 && !http::security::is_loopback(remote_address)) {
+    if (_global.failures >= 100 && !local) {
       if (now < _next_global_attempt) {
         return retry(_next_global_attempt);
       }
       _next_global_attempt = now + std::chrono::seconds(1);
     }
-    auto it = _peers.find(remote_address);
-    if (it == _peers.end()) {
-      if (_peers.size() >= 1024) {
-        return retry(_global.reset_at);
+    Attempts *attempts;
+    if (local) {
+      // Loopback aliases share a reserved bucket outside the remote peer cap.
+      if (_local.reset_at <= now) {
+        _local = {now + window, 0};
       }
-      it = _peers.emplace(remote_address, Attempts {now + window, 0}).first;
+      attempts = &_local;
+    } else {
+      auto it = _peers.find(remote_address);
+      if (it == _peers.end()) {
+        if (_peers.size() >= 1024) {
+          return retry(_global.reset_at);
+        }
+        it = _peers.emplace(remote_address, Attempts {now + window, 0}).first;
+      }
+      attempts = &it->second;
     }
-    if (it->second.failures >= 5) {
-      return retry(it->second.reset_at);
+    if (attempts->failures >= 5) {
+      return retry(attempts->reset_at);
     }
     if (verify_credentials()) {
-      _peers.erase(it);
+      if (local) {
+        _local.failures = 0;
+      } else {
+        _peers.erase(remote_address);
+      }
       return {true, 0};
     }
-    ++it->second.failures;
+    ++attempts->failures;
     ++_global.failures;
     return {false, 0};
   }

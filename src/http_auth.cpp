@@ -1030,6 +1030,7 @@ namespace confighttp {
           SessionToken token;
           token.credentials_tag = node.get<std::string>("credentials_tag", "");
           if (_dependencies.credentials_tag && token.credentials_tag != credentials_tag) {
+            needs_resave = true;
             continue;
           }
           token.username = node.get<std::string>("username", "");
