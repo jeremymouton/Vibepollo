@@ -71,6 +71,7 @@
 #include "utility.h"
 #include "uuid.h"
 #include "webrtc_capture_owner.h"
+#include "webrtc_ice_policy.h"
 #include "video.h"
 #include "video_colorspace.h"
 #include "webrtc_stream.h"
@@ -4793,6 +4794,27 @@ namespace webrtc_stream {
       return constraints;
     }
 
+    // Same source and precedence as the list handed to browsers: config, then the
+    // SUNSHINE_WEBRTC_ICE_SERVERS environment variable.
+    std::vector<std::string> configured_host_stun_urls() {
+      const auto parse = [](const std::string &raw) {
+        if (raw.empty()) {
+          return nlohmann::json();
+        }
+        try {
+          return nlohmann::json::parse(raw);
+        } catch (const std::exception &) {
+          return nlohmann::json();
+        }
+      };
+      auto servers = parse(config::nvhttp.webrtc_ice_servers);
+      if (!servers.is_array()) {
+        const auto *env = std::getenv("SUNSHINE_WEBRTC_ICE_SERVERS");
+        servers = parse(env ? env : "");
+      }
+      return webrtc_ice_policy::host_stun_urls(servers);
+    }
+
     lwrtc_peer_t *create_peer_connection(
       Session &session,
       SessionIceContext *ice_context
@@ -4805,6 +4827,16 @@ namespace webrtc_stream {
       lwrtc_config_t config {};
       config.offer_to_receive_audio = session.state.audio ? 1 : 0;
       config.offer_to_receive_video = session.state.video ? 1 : 0;
+      // Without STUN the host offers only host candidates, so every client off the
+      // LAN and tailnet is forced through the TURN relay.
+      const auto stun_urls = configured_host_stun_urls();
+      std::vector<lwrtc_ice_server_t> ice_servers;
+      ice_servers.reserve(stun_urls.size());
+      for (const auto &url : stun_urls) {
+        ice_servers.push_back({url.c_str(), nullptr, nullptr});
+      }
+      config.ice_servers = ice_servers.empty() ? nullptr : ice_servers.data();
+      config.ice_server_count = ice_servers.size();
 
       BOOST_LOG(debug) << "WebRTC: create_peer_connection constraints";
       auto *constraints = create_constraints();
