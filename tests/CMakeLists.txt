@@ -735,6 +735,9 @@ endif()
 
 sunshine_register_component(NAME test_component_stream_protocol TEST_SOURCE unit/test_stream.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/stream_protocol.cpp")
+sunshine_register_component(NAME test_component_crypto TEST_SOURCE unit/test_crypto.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/crypto.cpp"
+    LINK_LIBRARIES sunshine_test_json_headers Boost::headers OpenSSL::Crypto)
 sunshine_register_component(NAME test_component_video_pacing TEST_SOURCE unit/test_video_pacing.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/stream_protocol.cpp")
 if(SUNSHINE_TEST_ENABLE_COMPONENT)
