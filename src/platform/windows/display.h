@@ -24,6 +24,7 @@
 #include <wrl/client.h>
 
 // local includes
+#include "gpu_priority.h"
 #include "src/platform/common.h"
 #include "src/platform/windows/ipc/pipes.h"
 #include "src/platform/windows/ipc/process_handler.h"
@@ -35,7 +36,12 @@ namespace platf::game_activity {
 }
 
 namespace platf::dxgi {
+  namespace present_timing {
+    class capture_stamper_t;
+  }
+
   extern const char *format_str[];
+  struct img_d3d_t;
 
   // Add D3D11_CREATE_DEVICE_DEBUG here to enable the D3D11 debug runtime.
   // You should have a debugger like WinDbg attached to receive debug messages.
@@ -71,6 +77,10 @@ namespace platf::dxgi {
     mem_type_e hwdevice_type,
     const std::optional<adapter_id_t> &required_adapter = std::nullopt
   );
+
+  // Read the exact output's effective DXGI capture color state. Unknown or
+  // ambiguous output identities return nullopt, never a guessed SDR value.
+  std::optional<bool> capture_output_hdr_state(const std::string &output_name);
 
   void set_last_wgc_adapter_luid(std::optional<LUID> luid, std::string output_name = {});
   std::optional<LUID> get_last_wgc_adapter_luid();
@@ -200,26 +210,32 @@ namespace platf::dxgi {
     bool visible;
   };
 
+  class display_output_monitor_t;
+
   class display_base_t: public display_t {
   public:
-    enum class output_refresh_e {
-      refreshed,
-      retry_later,
-      structural_change,
-    };
+    display_base_t();
+    ~display_base_t() override;
 
     int init(
       const ::video::config_t &config,
       const std::string &display_name,
       bool skip_dd_test = false,
-      const std::optional<LUID> &required_adapter_luid = std::nullopt
+      const std::optional<LUID> &required_adapter_luid = std::nullopt,
+      bool preserve_capture_for_input_geometry = false
     );
 
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override;
     void prepare_for_reinit() override;
-    std::optional<adapter_id_t> capture_adapter_id() const override;
-    output_refresh_e refresh_output_after_nonstructural_change();
+    std::optional<input_geometry_snapshot_t> input_geometry_snapshot() const override;
+    // A teardown notification only; derived implementations must not block.
+    virtual void request_capture_stop() noexcept {}
 
+    std::optional<adapter_id_t> capture_adapter_id() const override;
+
+    // Declared before the D3D resources so the process priority is restored
+    // only after those resources have been released.
+    std::unique_ptr<gpu_priority_manager_t::lease_t> gpu_priority_lease;
     factory1_t factory;
     adapter_t adapter;
     output_t output;
@@ -228,10 +244,11 @@ namespace platf::dxgi {
     DXGI_RATIONAL display_refresh_rate {0, 1};
     int display_refresh_rate_rounded {};
     DXGI_OUTPUT_DESC captured_output_desc {};
+    DXGI_OUTPUT_DESC1 captured_color_desc {};
+    std::unique_ptr<display_output_monitor_t> output_monitor;
     LUID captured_adapter_luid {};
     bool captured_hdr_state {false};
     bool captured_hdr_state_valid {false};
-    bool refresh_only_changes_supported {false};
     std::shared_ptr<platf::game_activity::refresh_target_t> game_refresh_target;
 
     DXGI_MODE_ROTATION display_rotation = DXGI_MODE_ROTATION_UNSPECIFIED;
@@ -470,6 +487,7 @@ namespace platf::dxgi {
      * Cleans up resources and IPC session associated with the WGC IPC VRAM display backend.
      */
     ~display_wgc_ipc_vram_t() override;
+    void request_capture_stop() noexcept override;
 
     /**
      * @brief Factory method to create a WGC IPC VRAM display instance or fallback.
@@ -533,14 +551,30 @@ namespace platf::dxgi {
     capture_e release_snapshot() override;
 
   private:
+    /**
+     * @brief Hand the helper's shared frame to the encoder without a host-side copy.
+     * @details The pool image aliases the shared texture; the encoder device opens it
+     *          and orders its reads with the texture's keyed mutex.
+     */
+    capture_e snapshot_direct(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out);
+
+    /**
+     * @brief Point a pool image at the helper's shared texture.
+     * @return 0 on success, -1 on failure.
+     */
+    int alias_shared_frame(img_d3d_t &img);
+
     std::unique_ptr<class ipc_session_t> _ipc_session;
     ::video::config_t _config;
     std::string _display_name;
+    bool _direct_encoder_input = false;  ///< Latched from config at init so one pool never mixes modes.
+    bool _constant_frame_rate = false;  ///< Latched with `_direct_encoder_input`: a timeout re-sends `_last_cached_frame` (copy path only).
     bool _session_initialized_logged = false;
     bool _frame_locked = false;
     std::shared_ptr<platf::img_t> _last_cached_frame;
     std::chrono::steady_clock::time_point _wgc_stall_start {};  ///< Start of the current frame-wait stall (zero when frames are flowing).
     std::chrono::steady_clock::time_point _last_secure_desktop_probe {};  ///< Last secure-desktop probe performed during a stall.
+    std::shared_ptr<present_timing::capture_stamper_t> _present_stamper;  ///< Refines composition-quantized RTP timestamps at send time.
   };
 
   class display_wgc_ipc_ram_t: public display_ram_t {
@@ -556,6 +590,7 @@ namespace platf::dxgi {
      * Cleans up resources associated with the WGC IPC RAM display backend.
      */
     ~display_wgc_ipc_ram_t() override;
+    void request_capture_stop() noexcept override;
 
     /**
      * @brief Factory method to create a WGC IPC RAM display instance or fallback.
@@ -643,6 +678,11 @@ namespace platf::dxgi {
      * @brief Last secure-desktop probe performed during a stall.
      */
     std::chrono::steady_clock::time_point _last_secure_desktop_probe {};
+
+    /**
+     * @brief Refines composition-quantized RTP timestamps at send time.
+     */
+    std::shared_ptr<present_timing::capture_stamper_t> _present_stamper;
   };
 
   /**
@@ -692,14 +732,5 @@ namespace platf::dxgi {
   // Type aliases for WGC data structures
   using shared_handle_data_t = platf::dxgi::shared_handle_data_t;
   using config_data_t = platf::dxgi::config_data_t;
-
-  /**
-   * @brief Check whether HDR is currently active on an output, without creating a capture device.
-   * @details Uses the same DXGI colorspace predicate as display_base_t::is_hdr(), so a caller that
-   *          waits on this will reach the same conclusion the capture path does. Cheap enough to poll.
-   * @param output_name GDI display name (e.g. `\\.\DISPLAY1`). Empty matches any attached output.
-   * @return true if the matched output reports the HDR10 colorspace.
-   */
-  bool is_hdr_active_for_output(const std::string &output_name);
 
 }  // namespace platf::dxgi

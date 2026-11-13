@@ -2,7 +2,9 @@
 import { computed, reactive, toRaw, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 
+import ClientCommands from '@/components/devices/ClientCommands.vue';
 import SettingsOverrideEditor from '@/components/settings/SettingsOverrideEditor.vue';
+import DisplayTopologyEditor from '@/components/devices/DisplayTopologyEditor.vue';
 import { AppButton, SettingRow, StatusBadge, UiIcon } from '@/components/ui';
 
 export type ClientVirtualDisplayMode = 'global' | 'per_client' | 'shared' | 'disabled' | null;
@@ -22,6 +24,7 @@ export interface ClientCommandDraft {
 
 export interface ClientDeviceDraft {
   name: string;
+  allowSleep: boolean;
   permissions: number;
   enableLegacyOrdering: boolean;
   allowClientCommands: boolean;
@@ -35,6 +38,7 @@ export interface ClientDeviceDraft {
   virtualDisplayLayout: ClientVirtualDisplayLayout;
   hdrProfile: string;
   prefer10BitSdr: boolean;
+  requestedResolutionOnly?: boolean;
   configOverrides: Record<string, unknown>;
 }
 
@@ -57,6 +61,7 @@ export interface HdrProfileEntry {
 
 const props = defineProps<{
   modelValue: ClientDeviceDraft;
+  requestedResolutionCatalogSupported?: boolean;
   commonSettings: Record<string, unknown>;
   metadata: ClientSettingsMetadata;
   displayDevices: DisplayDevice[];
@@ -70,6 +75,8 @@ const props = defineProps<{
   busy: boolean;
   controlIdPrefix: string;
 }>();
+
+const catalogInitiallyRequested = Boolean(props.modelValue.requestedResolutionOnly);
 
 const emit = defineEmits<{
   'update:modelValue': [value: ClientDeviceDraft];
@@ -200,8 +207,8 @@ const globalVirtualDisplayLayoutLabel = computed(() =>
 );
 
 const globalVirtualDisplayScale = computed(() => {
-  const value = Number(props.commonSettings.dd_virtual_display_scale ?? -1);
-  return Number.isFinite(value) ? value : -1;
+  const value = Number(props.commonSettings.dd_virtual_display_scale ?? 0);
+  return Number.isFinite(value) ? value : 0;
 });
 
 const globalVirtualDisplayScaleLabel = computed(() => {
@@ -423,6 +430,23 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
         </div>
       </div>
       <div class="vs-settings-group">
+        <SettingRow
+          class="client-setting-row--switch"
+          :label="t('ui.devices.editor.allow_sleep')"
+          :description="t('ui.devices.editor.allow_sleep_description')"
+          :control-id="`${controlIdPrefix}-allow-sleep`"
+        >
+          <label class="vs-switch">
+            <input
+              :id="`${controlIdPrefix}-allow-sleep`"
+              v-model="draft.allowSleep"
+              type="checkbox"
+              :disabled="busy"
+            />
+            <span class="vs-switch__track" aria-hidden="true" />
+            <span class="vs-sr-only">{{ t('ui.devices.editor.allow_sleep') }}</span>
+          </label>
+        </SettingRow>
         <SettingRow :label="t('pin.device_name')" :control-id="`${controlIdPrefix}-name`">
           <input
             :id="`${controlIdPrefix}-name`"
@@ -650,6 +674,7 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
               </option>
             </select>
           </SettingRow>
+
           <p class="client-settings-helper">
             {{
               t('ui.devices.editor.common_display_summary', {
@@ -660,6 +685,41 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
           </p>
         </template>
       </div>
+    </section>
+
+    <section
+      v-if="
+        isWindows &&
+        (requestedResolutionCatalogSupported ||
+          catalogInitiallyRequested ||
+          draft.requestedResolutionOnly)
+      "
+      class="client-settings-section"
+    >
+      <SettingRow
+        v-if="
+          isWindows &&
+          (requestedResolutionCatalogSupported ||
+            catalogInitiallyRequested ||
+            draft.requestedResolutionOnly)
+        "
+        label="Advertise only this client's resolution"
+        description="Limits this private virtual display's advertised resolutions while retaining matching refresh rates. Requires bundled driver control 3.8 or later and a new session. Shared displays are unsupported."
+        :control-id="`${controlIdPrefix}-requested-resolution-only`"
+      >
+        <input
+          :id="`${controlIdPrefix}-requested-resolution-only`"
+          v-model="draft.requestedResolutionOnly"
+          type="checkbox"
+          :disabled="
+            busy || (!requestedResolutionCatalogSupported && !draft.requestedResolutionOnly)
+          "
+        />
+        <p v-if="!requestedResolutionCatalogSupported" class="client-settings-helper">
+          The opened driver cannot confirm support. Disable this setting or install a qualified
+          compatible driver before streaming.
+        </p>
+      </SettingRow>
     </section>
 
     <section
@@ -784,6 +844,21 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
       :display-selection="visibleOverrideDisplaySelection"
       :hidden-keys="hiddenOverrideKeys"
       :control-id-prefix="`${controlIdPrefix}-override`"
+    />
+
+    <DisplayTopologyEditor
+      v-if="isWindows"
+      :client-uuid="controlIdPrefix.replace(/^client-/, '')"
+      compact
+    />
+
+    <ClientCommands
+      v-model:allow-client-commands="draft.allowClientCommands"
+      v-model:do-commands="draft.doCommands"
+      v-model:undo-commands="draft.undoCommands"
+      :platform="metadata.platform"
+      :disabled="busy"
+      :control-id-prefix="`${controlIdPrefix}-commands`"
     />
 
     <div class="client-settings-editor__footer">
@@ -989,11 +1064,17 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
 }
 
 .client-settings-editor__footer {
+  position: sticky;
+  inset-block-end: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--vs-space-16);
-  padding-top: var(--vs-space-4);
+  padding: var(--vs-space-12);
+  border-top: var(--vs-border-width) solid var(--vs-color-border-subtle);
+  border-radius: var(--vs-radius-control);
+  background: var(--vs-color-bg-subtle);
 }
 
 .client-settings-editor__actions {

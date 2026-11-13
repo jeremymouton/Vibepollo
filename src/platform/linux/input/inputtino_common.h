@@ -13,12 +13,17 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/platform/linux/input/inputtino_ds4.h"
 #include "src/platform/linux/input/inputtino_seat.h"
 #include "src/utility.h"
 
 using namespace std::literals;
 
 namespace platf {
+
+  namespace touch {
+    struct worker_t;
+  }
 
   inline std::string inputtino_name_for_seat(std::string_view base_name) {
     auto seat_id = inputtino_seat::get_target_seat();
@@ -35,7 +40,7 @@ namespace platf {
     return name;
   }
 
-  using joypads_t = std::variant<inputtino::XboxOneJoypad, inputtino::SwitchJoypad, inputtino::PS5Joypad>;
+  using joypads_t = std::variant<inputtino::XboxOneJoypad, inputtino::SwitchJoypad, gamepad::ds4_joypad_t, inputtino::PS5Joypad>;
 
   struct joypad_state {
     std::unique_ptr<joypads_t> joypad;
@@ -110,6 +115,8 @@ namespace platf {
     // for each client.
     inputtino::Result<inputtino::TouchScreen> touch;
     inputtino::Result<inputtino::PenTablet> pen;
+    // Destroy/join the touch worker before its uinput handle disappears.
+    std::shared_ptr<touch::worker_t> touch_worker;
   };
 
   inline float deg2rad(float degree) {

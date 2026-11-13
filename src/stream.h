@@ -21,9 +21,11 @@
 // local includes
 #include "audio.h"
 #include "crypto.h"
+#include "input_session_config.h"
 #include "thread_safe.h"
 #include "video.h"
 #include "stream_protocol.h"
+#include "remote_session.h"
 
 namespace rtsp_stream {
   struct launch_session_t;
@@ -42,6 +44,8 @@ namespace stream {
         return "HEVC";
       case 2:
         return "AV1";
+      case 3:
+        return "PyroWave";
       default:
         return "Unknown";
     }
@@ -63,6 +67,8 @@ namespace stream {
     uint32_t encryptionFlagsEnabled;
 
     std::optional<int> gcmap;
+    bool gcpersist = false;
+    input::guide_button_config_t guide_button;
     bool gen1_framegen_fix;
     bool gen2_framegen_fix;
     bool frame_generation_enabled;
@@ -73,6 +79,7 @@ namespace stream {
   };
 
   namespace session {
+    constexpr int START_PACING_REJECTED = -2;
     extern std::atomic_uint running_sessions;
     // Counts RTSP joins through their complete post-session cleanup tail.
     // Observers use this instead of entering blocking session cleanup.
@@ -99,11 +106,16 @@ namespace stream {
     /**
      * These helpers require nvhttp::stream_lifecycle_mutex() to be held.
      */
+    bool has_capture_runtime_owner(const shared_runtime_finalize_context_t &context = {});
     bool has_shared_runtime_owner(const shared_runtime_finalize_context_t &context = {});
     void arm_shared_runtime_cleanup(
       std::optional<std::array<std::uint8_t, 16>> virtual_display_guid_bytes = std::nullopt
     );
     void start_shared_platform_if_needed();
+    // Called after RTSP game transports stop, while the lifecycle mutex is held.
+    // Other capture owners defer raw GUID removal until final idle cleanup.
+    // Remote Monitor and Remote Input ownership survives this terminal action.
+    void release_terminated_game_displays();
     bool finalize_shared_runtime_if_idle(
       std::string_view reason,
       const shared_runtime_finalize_context_t &context = {}
@@ -120,11 +132,14 @@ namespace stream {
     std::string uuid(const session_t &session);
     bool uuid_match(const session_t &session, const std::string_view &uuid);
     bool update_device_info(session_t &session, const std::string &name, const crypto::PERM &newPerm);
+    bool remote_role_match(const session_t &session, remote_session::role_e role, std::optional<std::uint64_t> generation = std::nullopt);
+    void mark_client_disconnected(session_t &session);
     int start(session_t &session, const std::string &addr_string);
     void stop(session_t &session);
     void graceful_stop(session_t &session);
-    void join(session_t &session);
+    void join(session_t &session, bool lifecycle_lock_held = false);
     state_e state(session_t &session);
+    bool has_running_video(const session_t &session);
     inline bool send(session_t &session, const std::string_view &payload);
   }  // namespace session
 

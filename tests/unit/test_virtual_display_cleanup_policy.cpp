@@ -3,10 +3,172 @@
  * @brief Pure retained-display cleanup and restore-order contracts.
  */
 #include <gtest/gtest.h>
+#include <src/platform/windows/virtual_display_policy.h>
+
+#include <optional>
+#include <string>
+
+TEST(VirtualDisplayCleanupPolicy, RetainedResumeRecoveryExcludesLiveAndSecondaryPeers) {
+  EXPECT_TRUE(VDISPLAY::policy::should_rearm_retained_game_output_recovery(
+    true,
+    true,
+    false,
+    true,
+    41,
+    "retained-owner"
+  ));
+  // An existing capture is a live peer; its worker must not be replaced.
+  EXPECT_FALSE(VDISPLAY::policy::should_rearm_retained_game_output_recovery(
+    false,
+    true,
+    false,
+    true,
+    41,
+    "retained-owner"
+  ));
+  EXPECT_FALSE(VDISPLAY::policy::should_rearm_retained_game_output_recovery(
+    true,
+    true,
+    true,
+    true,
+    41,
+    "retained-owner"
+  ));
+  EXPECT_FALSE(VDISPLAY::policy::should_rearm_retained_game_output_recovery(
+    true,
+    false,
+    false,
+    true,
+    41,
+    "retained-owner"
+  ));
+  EXPECT_FALSE(VDISPLAY::policy::should_rearm_retained_game_output_recovery(
+    true,
+    true,
+    false,
+    false,
+    41,
+    "retained-owner"
+  ));
+  EXPECT_FALSE(VDISPLAY::policy::should_rearm_retained_game_output_recovery(
+    true,
+    true,
+    false,
+    true,
+    0,
+    "retained-owner"
+  ));
+  EXPECT_FALSE(VDISPLAY::policy::should_rearm_retained_game_output_recovery(
+    true,
+    true,
+    false,
+    true,
+    41,
+    ""
+  ));
+}
+
+TEST(VirtualDisplayCleanupPolicy, PausedRetainedResumeRearmsBothReusePathsOnlyAfterAdmission) {
+  struct recovery_context_t {
+    std::string device_id;
+    unsigned int width;
+    unsigned int height;
+    unsigned int refresh_millihz;
+    bool hdr;
+
+    bool operator==(const recovery_context_t &) const = default;
+  };
+
+  const recovery_context_t retained_mode {
+    .device_id = R"(\\.\DISPLAY17)",
+    .width = 2560,
+    .height = 1440,
+    .refresh_millihz = 117'500,
+    .hdr = true,
+  };
+  bool recovery_armed = false;
+  std::optional<recovery_context_t> scheduled_context;
+
+  {
+    VDISPLAY::policy::retained_resume_recovery_rearm_t rejected_resume;
+    rejected_resume.stage(VDISPLAY::policy::retained_resume_reuse_path_e::capture_ready_output, [&] {
+      recovery_armed = true;
+    });
+    EXPECT_TRUE(rejected_resume.pending());
+    EXPECT_EQ(
+      rejected_resume.path(),
+      VDISPLAY::policy::retained_resume_reuse_path_e::capture_ready_output
+    );
+    EXPECT_FALSE(recovery_armed);
+    EXPECT_FALSE(rejected_resume.admit_and_commit([] {
+      return false;
+    }));
+    EXPECT_FALSE(rejected_resume.pending());
+    EXPECT_FALSE(rejected_resume.path());
+  }
+  EXPECT_FALSE(recovery_armed);
+
+  for (const auto reuse_path : {
+         VDISPLAY::policy::retained_resume_reuse_path_e::prepared_existing_display,
+         VDISPLAY::policy::retained_resume_reuse_path_e::capture_ready_output,
+       }) {
+    VDISPLAY::policy::retained_resume_recovery_rearm_t accepted_resume;
+    bool pending_owner_published = false;
+    recovery_armed = false;
+    scheduled_context.reset();
+    accepted_resume.stage(reuse_path, [&, retained_mode] {
+      EXPECT_TRUE(pending_owner_published);
+      recovery_armed = true;
+      scheduled_context = retained_mode;
+    });
+    EXPECT_TRUE(accepted_resume.pending());
+    EXPECT_EQ(accepted_resume.path(), reuse_path);
+    EXPECT_FALSE(recovery_armed);
+    EXPECT_TRUE(accepted_resume.admit_and_commit([&] {
+      pending_owner_published = true;
+      return true;
+    }));
+    EXPECT_TRUE(recovery_armed);
+    EXPECT_EQ(scheduled_context, retained_mode);
+    EXPECT_FALSE(accepted_resume.pending());
+    EXPECT_FALSE(accepted_resume.path());
+  }
+
+  VDISPLAY::policy::retained_resume_recovery_rearm_t no_rearm;
+  bool admitted_without_rearm = false;
+  EXPECT_TRUE(no_rearm.admit_and_commit([&] {
+    admitted_without_rearm = true;
+    return true;
+  }));
+  EXPECT_TRUE(admitted_without_rearm);
+}
 
 #ifdef _WIN32
+  #include <src/platform/windows/virtual_display.h>
   #include <src/platform/windows/virtual_display_cleanup.h>
-  #include <src/platform/windows/virtual_display_policy.h>
+
+TEST(VirtualDisplayCleanupPolicy, OwnedProbeRequestDoesNotImplyCaptureReadiness) {
+  const VDISPLAY::ensure_display_result result {
+    .readiness = VDISPLAY::ensure_display_readiness_e::request_retained,
+    .tracks_temporary_for_probe = true,
+    .temporary_generation = 1,
+  };
+
+  EXPECT_TRUE(result.owns_temporary_probe_request());
+  EXPECT_FALSE(result.ready_for_capture());
+}
+
+TEST(VirtualDisplayCleanupPolicy, ExactPublishedTargetIsCaptureReady) {
+  const VDISPLAY::ensure_display_result result {
+    .readiness = VDISPLAY::ensure_display_readiness_e::target_ready,
+    .tracks_temporary_for_probe = true,
+    .temporary_generation = 1,
+    .display_name = R"(\\.\DISPLAY55)",
+  };
+
+  EXPECT_TRUE(result.owns_temporary_probe_request());
+  EXPECT_TRUE(result.ready_for_capture());
+}
 
 TEST(VirtualDisplayCleanupPolicy, RestoreBeforeRemoveKeepsHelperFirst) {
   const auto steps = platf::virtual_display_cleanup::ordered_restore_steps(
@@ -26,6 +188,28 @@ TEST(VirtualDisplayCleanupPolicy, RemoveBeforeRestoreKeepsTeardownOnlyOrder) {
   EXPECT_EQ(steps[1], platf::virtual_display_cleanup::cleanup_step_t::explicit_display_remove);
   EXPECT_EQ(steps[2], platf::virtual_display_cleanup::cleanup_step_t::helper_revert);
   EXPECT_EQ(steps[3], platf::virtual_display_cleanup::cleanup_step_t::database_restore);
+}
+
+TEST(VirtualDisplayCleanupPolicy, OnlyTerminalUserActionOverridesManagedOwnership) {
+  using platf::virtual_display_cleanup::cleanup_admission_policy_t;
+  using platf::virtual_display_cleanup::cleanup_admitted;
+
+  EXPECT_TRUE(cleanup_admitted(true, cleanup_admission_policy_t::respect_managed_owners));
+  EXPECT_FALSE(cleanup_admitted(false, cleanup_admission_policy_t::respect_managed_owners));
+  EXPECT_TRUE(cleanup_admitted(false, cleanup_admission_policy_t::override_managed_owners));
+}
+
+TEST(VirtualDisplayCleanupPolicy, IdleEndedOrPausedStreamDisengagesRecoveryMonitor) {
+  using platf::virtual_display_cleanup::idle_stream_cleanup_recovery_policy;
+  using platf::virtual_display_cleanup::idle_stream_disengages_recovery_monitor;
+  using platf::virtual_display_cleanup::recovery_monitor_policy_t;
+
+  EXPECT_TRUE(idle_stream_disengages_recovery_monitor(true));
+  EXPECT_FALSE(idle_stream_disengages_recovery_monitor(false));
+  EXPECT_EQ(
+    idle_stream_cleanup_recovery_policy(),
+    recovery_monitor_policy_t::disengage_before_admission
+  );
 }
 
 TEST(VirtualDisplayCleanupPolicy, SunshineLeaseOwnedGuidSurvivesMissingWindowsEnumeration) {

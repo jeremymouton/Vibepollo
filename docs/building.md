@@ -21,6 +21,29 @@ It is recommended to use one of the following compilers:
 | Clang       | 17+     |
 | Apple Clang | 15+     |
 
+### Linux release CUDA compatibility
+
+Linux release packages pin CUDA Toolkit **12.9.1** (runfile build **575.57.08**)
+to retain Maxwell, Pascal (including GTX 1070), and Volta GPU targets. CUDA 13
+cannot compile those targets. Use GCC 14 as the CUDA host compiler; older
+supported builders may use GCC 13. The runfile installs only the toolkit,
+not a GPU driver.
+
+The shared Linux build script uses the pinned runfile in `build/cuda` by
+default, ignoring a newer system toolkit. It rejects an incompatible cached
+toolkit. Arch's PKGBUILD downloads architecture-specific, SHA-256-verified
+runfiles into its source directory and explicitly selects GCC 14. Arch CI
+installs the signed, versioned GCC 14 packages from the Arch Linux Archive,
+because rolling Arch repositories no longer provide them. Manual Arch package
+builds also need the `gcc14` build dependency installed.
+
+Release packaging enables `SUNSHINE_REQUIRE_CUDA_PASCAL=ON`, which requires
+CUDA 12.9 and the `sm_61` target. Flatpak retains its existing 12.9.1 pin.
+When changing toolchain versions, run
+`python3 tests/unit/test_cuda_release_policy.py` and build the affected
+packages locally before publishing. Developer builds can leave that option
+off to use newer CUDA toolkits with a reduced set of GPU targets.
+
 ### Dependencies
 
 #### FreeBSD
@@ -62,23 +85,29 @@ dependencies we use in Debian-based, Fedora-based and Arch-based distributions. 
 script to support other distributions.
 
 ##### KMS Capture
-If you are using KMS, patching the Sunshine binary with `setcap` is required. Some post-install scripts handle this. If building
-from source and using the binary directly, this will also work:
-
-```bash
-sudo cp build/sunshine /tmp
-sudo setcap cap_sys_admin,cap_sys_nice+p /tmp/sunshine
-sudo getcap /tmp/sunshine
-sudo mv /tmp/sunshine build/sunshine
-```
+Do **not** add file capabilities to the `vibepollo` binary. On Linux the public `/usr/bin/vibepollo`
+must stay unprivileged; KMS capture runs inside the private `/usr/libexec/vibeshine/vibepollo-host`,
+which the package installs with exactly `cap_sys_admin,cap_sys_nice=p`, and the package hook
+verifies that the public binary has no capabilities. Install through the Arch package (or follow the
+staged-install recipe in `AGENTS.md`) rather than running a capability-patched build directly.
 
 ##### CUDA Toolkit
-Sunshine requires CUDA Toolkit for NVFBC capture. There are two caveats to CUDA:
+CUDA-enabled builds require CUDA Toolkit **12.0 or newer**. The native
+[local build/deploy script](linux/local-development.md#build-settings) uses an
+installed toolkit and compiler; it does not pin CUDA 13 or GCC 15. Choose a
+host compiler supported by that toolkit and a C++ compiler/standard library
+that meets the project's C++23 requirements.
 
-1. The version installed depends on the version of GCC.
-2. The version of CUDA you use will determine compatibility with various GPU generations.
-   At the time of writing, the recommended version to use is CUDA ~13.1.
-   See [CUDA compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/index.html) for more info.
+The selected toolkit determines which GPU generations can be targeted. Release
+packages deliberately use **CUDA 12.9.1 with GCC 14**, as described above, to
+cover both older and newer GPUs. This release pin is not the minimum for local
+builds. CUDA 13 removes compilation support for Maxwell, Pascal, and Volta;
+upgrading the toolkit can therefore reduce GPU compatibility. See NVIDIA's
+[CUDA 13 release notes](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html)
+and [CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/index.html).
+
+The native Arch/CachyOS release package uses a private build-time toolkit and
+does not require users to install the CUDA toolkit to run Vibepollo.
 
 > [!NOTE]
 > To install older versions, select the appropriate run file based on your desired CUDA version and architecture
@@ -166,6 +195,9 @@ dependencies=(
   "mingw-w64-${TOOLCHAIN}-curl-winssl"
   "mingw-w64-${TOOLCHAIN}-doxygen"  # Optional, for docs... better to install official Doxygen
   "mingw-w64-${TOOLCHAIN}-graphviz"  # Optional, for docs
+  "mingw-w64-${TOOLCHAIN}-libjpeg-turbo"
+  "mingw-w64-${TOOLCHAIN}-libpng"
+  "mingw-w64-${TOOLCHAIN}-libwebp"
   "mingw-w64-${TOOLCHAIN}-miniupnpc"
   "mingw-w64-${TOOLCHAIN}-onevpl"
   "mingw-w64-${TOOLCHAIN}-openssl"
@@ -194,12 +226,20 @@ A helper script automates the full depot_tools / gclient / gn / ninja flow:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_mingw_webrtc.ps1
 ```
 
-By default the script caches its working tree and output to `%LOCALAPPDATA%\Vibepollo\deps\libwebrtc\{src,out}`,
-which is **shared across every Vibepollo build dir, worktree, and git checkout on the machine**. This means:
+By default the script builds under `%LOCALAPPDATA%\Vibepollo\deps\libwebrtc\src`, stages the reusable SDK under
+`%LOCALAPPDATA%\Vibepollo\deps\libwebrtc\out`, and removes the large source workspace only after verifying the
+staged headers, DLL, import library, and completed-build DLL identity. The retained `out` directory is **shared
+across every Vibepollo build dir, worktree, and git checkout on the machine**. This means:
 
 - Wiping `build/` does not destroy libwebrtc — the next CMake configure picks it back up.
-- Switching git branches does not require rebuilding libwebrtc unless the WebRTC branch (`m125_release` etc.) actually changed.
-- Multiple Vibepollo build dirs share one cached libwebrtc.
+- A successful local dependency build does not leave the multi-gigabyte Chromium/WebRTC source and Git cache behind.
+- A failed build retains its source workspace for diagnosis and retry.
+- Multiple Vibepollo build dirs share one small staged libwebrtc SDK.
+
+Pass `-RetainBuildSources` while actively iterating on WebRTC itself. `-Stage Sync` always retains sources because
+its purpose is to prepare a later `-Stage Build`; a successful `All` or `Build` stage cleans sources by default.
+Explicit `WEBRTC_GIT_CACHE_DIR` or `WEBRTC_DEPOT_TOOLS_DIR` paths outside `WEBRTC_BUILD_DIR` are treated as shared
+external caches and are not removed.
 
 `cmake/dependencies/webrtc.cmake` looks at the same default location, so no `-DWEBRTC_ROOT=...` is needed after the
 first build. To relocate the cache, set `VIBEPOLLO_DEPS_DIR=<path>` in your environment before invoking either the
@@ -240,7 +280,8 @@ If you cannot use the helper script, the underlying steps are:
 8. Configure Sunshine with `-DSUNSHINE_ENABLE_WEBRTC=ON`. If CMake still fails to find libwebrtc, pass
    `WEBRTC_INCLUDE_DIR` and `WEBRTC_LIBRARY` explicitly.
 
-To create a WiX installer, you also need to install [.NET](https://dotnet.microsoft.com/download).
+The Windows build requires the [.NET SDK](https://dotnet.microsoft.com/download)
+to compile the bundled Playnite plugin. It is also used when creating a WiX installer.
 
 ### Clone
 Ensure [git](https://git-scm.com) is installed on your system, then clone the repository using the following command:
@@ -292,10 +333,55 @@ ninja -C build
       cpack -G WIX --config ./build/CPackConfig.cmake
       ```}
     @tab{Portable | ```bash
-      cpack -G ZIP --config ./build/CPackConfig.cmake
+      cmake --build build --target package_portable --parallel 2
       ```}
   }}
 }
+
+### Windows portable package
+
+The opt-in `package_portable` target builds the runtime and creates
+`Vibepollo-Windows-<architecture>-<version>-portable.zip` in `build/cpack_artifacts`.
+Configure with an explicit `BUILD_VERSION` and `SUNSHINE_ASSETS_DIR=assets`.
+The default Windows package target still creates the WiX installer.
+
+The ZIP stage rejects existing user configuration, missing runtime/UI files,
+unbundled PE imports and debug compiler runtimes. The native host, listed runtime
+helpers, explicitly loaded libraries and resolved DLL imports must pass basic
+PE header checks, match the configured x86, AMD64 or ARM64 target, and have a
+complete section table with every nonempty raw section after that table and
+within the file. Zero-filled sections and trailing data are allowed. This is
+not complete Windows loader or ABI validation, and does not cover managed
+plugins or optional driver installer payloads. The installed
+product's `uninstall.exe` is excluded; remove a portable copy by deleting its
+folder after stopping the host. Release compiler DLLs must come
+from redistributable payloads; Visual Studio release CRT directories and the
+MinGW compiler directory are searched automatically. Additional directories can
+be supplied as a CMake list with `SUNSHINE_PORTABLE_REDISTRIBUTABLE_DIRS`.
+A developer's System32 CRT is not a redistributable source.
+
+Extract the complete ZIP to a private folder writable by the Windows user, then
+run `start-portable.cmd`. The launcher starts the host as the current user with
+physical-display defaults and configuration, pairing keys and logs in `config`.
+The packaged `README-portable.txt` describes setup and upgrade steps. Firewall
+policy must already permit Moonlight; the launcher changes no firewall rules.
+Virtual display, virtual controller and virtual audio features require separately
+installed drivers. Elevated applications and secure desktops cannot be controlled
+by this ordinary-user path.
+
+Existing non-PR Windows CI builds with a nonempty nonzero release/nightly version
+also build this target and recheck the extracted ZIP with the configured packaging
+hook. The separate `ci-portable-Windows` CI artifact is unsigned, is not included
+in the MSI/Setup or nightly public assets, and does not establish native runtime
+acceptance. Ordinary branch pushes retain their existing package-build skip;
+PR builds explicitly skip this check, including callers with a nonzero fallback
+version. The next qualifying scheduled/tag build must succeed before a complete product ZIP can be claimed as CI validated.
+
+Creating an archive is a packaging check. Before publishing it, build and extract
+the actual Windows runtime on a clean standard-user account without optional
+drivers, pair a normal Moonlight client and verify physical-desktop video, audio,
+keyboard/mouse, reconnect and clean exit. Check that no elevation prompt or
+machine setup occurs and that a second launch preserves pairing/configuration.
 
 ### Remote Build
 It may be beneficial to build remotely in some cases. This will enable easier building on different operating systems.
@@ -317,3 +403,13 @@ It may be beneficial to build remotely in some cases. This will enable easier bu
   <summary></summary>
   [TOC]
 </details>
+
+### CUDA compatibility for scripted Linux builds
+
+`scripts/linux_build.sh` pins CUDA 12.9.1 and a compatible host compiler to
+retain Maxwell, Pascal (including GTX 10-series), and Volta targets. It rejects
+incompatible cached toolkits before configuration. Direct CMake builds may
+still use newer CUDA with `SUNSHINE_REQUIRE_CUDA_PASCAL=OFF` (the default);
+CUDA 13 builds omit those older GPU targets. Set the option to `ON` when
+producing a Pascal-compatible build with CUDA 12.9. This does not enable Linux
+release publishing in Vibepollo's Windows release workflow.

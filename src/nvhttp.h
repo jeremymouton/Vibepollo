@@ -7,10 +7,13 @@
 
 // standard includes
 #include <chrono>
+#include <functional>
+#include <cstdint>
 #include <list>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 // lib includes
@@ -20,6 +23,7 @@
 
 // local includes
 #include "crypto.h"
+#include "nvhttp_server.h"
 #include "rtsp.h"
 #include "thread_safe.h"
 
@@ -84,18 +88,15 @@ namespace nvhttp {
    */
   void setup(const std::string &pkey, const std::string &cert);
 
-  class SunshineHTTPS: public SimpleWeb::HTTPS {
-  public:
-    SunshineHTTPS(boost::asio::io_context &io_context, boost::asio::ssl::context &ctx):
-        SimpleWeb::HTTPS(io_context, ctx) {
-    }
-
-    virtual ~SunshineHTTPS() {
-      // Gracefully shutdown the TLS connection
-      SimpleWeb::error_code ec;
-      shutdown(ec);
-    }
-  };
+  // Remote Input has no retained resource; its catalogue ownership ends with
+  // the exact transport generation that created it.
+  void notify_remote_input_transport_lost(std::string_view client_uuid, std::uint64_t generation);
+  void notify_remote_monitor_released(std::string_view client_uuid, std::uint64_t generation);
+  void reconcile_remote_monitor_owners();
+  // Conservative ownership observation for automatic display recovery. Call
+  // under stream_lifecycle_mutex() so a fresh remote-role launch cannot enter
+  // between this check and a guarded display mutation.
+  bool has_remote_role_owner();
 
   enum class PAIR_PHASE {
     NONE,  ///< Sunshine is not in a pairing phase
@@ -254,6 +255,14 @@ namespace nvhttp {
   bool get_client_always_use_virtual_display(const std::string &uuid);
 
   /**
+   * @brief Enable or disable a client.
+   * @param uuid The UUID of the client.
+   * @param enabled Whether the client should be enabled.
+   * @return true if the client was found and updated.
+   */
+  bool set_client_enabled(std::string_view uuid, bool enabled);
+
+  /**
    * @brief Get all paired clients.
    * @return The list of all paired clients.
    * @examples
@@ -261,6 +270,9 @@ namespace nvhttp {
    * @examples_end
    */
   nlohmann::json get_all_clients();
+
+  nlohmann::json get_remote_display_layout();
+  bool set_remote_display_layout(const nlohmann::json &layout, std::string &error);
 
   /**
    * @brief Record a client's last seen time (seconds since epoch).
@@ -281,7 +293,8 @@ namespace nvhttp {
     const std::string &virtual_display_layout,
     std::optional<std::unordered_map<std::string, std::string>> config_overrides,
     bool prefer_10bit_sdr,
-    std::optional<std::string> hdr_profile
+    std::optional<std::string> hdr_profile,
+    std::optional<bool> requested_resolution_only = std::nullopt
   );
 
   /**
@@ -326,19 +339,29 @@ namespace nvhttp {
    */
   std::mutex &stream_lifecycle_mutex();
 
+#ifdef _WIN32
+  /** End all transports, pending launches and the app, then restore displays.
+   * Revalidate the pinned local helper after draining in-flight starts.
+   */
+  void terminate_all_streams_from_host(const std::function<bool()> &authorized);
+#endif
+
   /**
    * @brief Persist a per-client HDR color profile selection (Windows only).
    * @return True if the client was found and updated.
    */
+  bool set_client_sleep_allowed(std::string_view uuid, bool allowed);
+
   bool set_client_hdr_profile(const std::string &uuid, const std::string &hdr_profile);
 
   /**
    * @brief Remove all paired clients.
+   * @return True only when the cleared machine pairing state was persisted.
    * @examples
    * nvhttp::erase_all_clients();
    * @examples_end
    */
-  void erase_all_clients();
+  bool erase_all_clients();
 
   /**
    * @brief      Stops a session.
@@ -410,5 +433,5 @@ namespace nvhttp {
    * @brief Persist current nvhttp-related state (paired clients, update subsystem markers, etc.).
    * @note Exposed so subsystems (e.g. update) can trigger a save after mutating persisted fields.
    */
-  void save_state();
+  bool save_state();
 }  // namespace nvhttp

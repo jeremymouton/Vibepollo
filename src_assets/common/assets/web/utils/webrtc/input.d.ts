@@ -34,3 +34,5 @@ export declare function attachInputCapture(
 
 /** Publish a Gamepad-shaped object so the capture loop reads it as hardware. */
 export declare function setVirtualGamepad(pad?: Gamepad): void;
+/** Hardware pads with the virtual one seated in the first free slot. */
+export declare function getGamepads(): (Gamepad | null)[];

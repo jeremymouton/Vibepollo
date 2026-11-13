@@ -34,6 +34,8 @@
   #include <windows.h>
 
   #include "src/logging.h"
+  #include "src/platform/windows/display_helper_borrow_control.h"
+  #include "src/platform/windows/display_helper_borrow_native.h"
   #include "src/platform/windows/display_helper_v2/async_dispatcher.h"
   #include "src/platform/windows/display_helper_v2/file_text_storage.h"
   #include "src/platform/windows/display_helper_v2/golden_health.h"
@@ -50,6 +52,8 @@
   #include "src/platform/windows/display_helper_v2/win_virtual_display_driver.h"
   #include "src/platform/windows/ipc/pipes.h"
   #include "tools/display_helper_paths.h"
+  #include "tools/display_helper_ipc.h"
+  #include "src/platform/windows/display_restore_policy.h"
 
   #include <display_device/json.h>
   #include <display_device/logging.h>
@@ -68,6 +72,10 @@ namespace {
     VerificationResult = 9,
     RefreshRate = 10,
     RefreshRateResult = 11,
+    RecoveryStatus = 15,
+    RecoveryStatusResult = 16,
+    BorrowAcquire = display_helper::borrow::acquire_message,
+    BorrowRelease = display_helper::borrow::release_message,
     SnapshotResult = 12,
     Ping = 0xFE,
     Stop = 0xFF,
@@ -189,9 +197,9 @@ namespace {
            std::holds_alternative<display_helper::v2::ResetCommand>(message);
   }
 
-  bool is_stabilization_completion(const display_helper::v2::Message &message) {
+  bool is_delayed_disconnect_verification_completion(const display_helper::v2::Message &message) {
     const auto *completion = std::get_if<display_helper::v2::VerificationCompleted>(&message);
-    return completion && completion->purpose == display_helper::v2::VerificationPurpose::Stabilization;
+    return completion && completion->purpose == display_helper::v2::VerificationPurpose::TransientDisconnect;
   }
 
   bool is_async_completion(const display_helper::v2::Message &message) {
@@ -364,6 +372,21 @@ namespace {
             j["sunshine_omit_final_initial_hdr_reapply"].get<bool>();
           j.erase("sunshine_omit_final_initial_hdr_reapply");
         }
+        if (j.contains("sunshine_reactivate_of")) {
+          out_request.reactivation_of = j.at("sunshine_reactivate_of").get<std::uint64_t>();
+          j.erase("sunshine_reactivate_of");
+        }
+        if (j.contains("sunshine_apply_budget_ms")) {
+          const auto ms = j["sunshine_apply_budget_ms"].get<std::int64_t>();
+          out_request.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::clamp<std::int64_t>(ms, 0, 15000));
+          j.erase("sunshine_apply_budget_ms");
+        }
+        if (j.contains("sunshine_refresh_settings_baseline")) {
+          out_request.refresh_settings_baseline =
+            j["sunshine_refresh_settings_baseline"].is_boolean() &&
+            j["sunshine_refresh_settings_baseline"].get<bool>();
+          j.erase("sunshine_refresh_settings_baseline");
+        }
         if (j.contains("wa_hdr_toggle")) {
           out_request.hdr_blank = j["wa_hdr_toggle"].get<bool>();
           j.erase("wa_hdr_toggle");
@@ -480,6 +503,11 @@ namespace {
       if (it != j.end() && it->is_boolean()) {
         out.always_restore_from_golden = it->get<bool>();
       }
+
+      it = j.find("sunshine_restore_ticket");
+      if (it != j.end() && it->is_number_unsigned()) {
+        out.restore_ticket = it->get<std::uint64_t>();
+      }
     } catch (...) {
     }
   }
@@ -540,9 +568,9 @@ namespace {
     }
   };
 
-  /// Validate a session snapshot file found in a search root; remove it when it
-  /// has no usable restore payload (legacy validate_session_snapshot).
-  bool validate_session_snapshot_file(const std::filesystem::path &path) {
+  /// Validate a snapshot file found in a search root; remove it when it has no
+  /// usable restore payload (legacy validate_session_snapshot).
+  bool validate_snapshot_file(const std::filesystem::path &path, const char *label) {
     display_helper::v2::AtomicFileTextStorage files;
     const auto text = files.read(path.string());
     if (!text) {
@@ -552,7 +580,7 @@ namespace {
       return true;
     }
 
-    BOOST_LOG(warning) << "Existing session snapshot is missing restore topology/mode data; removing path=" << path.string();
+    BOOST_LOG(warning) << "Existing " << label << " snapshot is missing restore topology/mode data; removing path=" << path.string();
     std::error_code ec_rm;
     std::filesystem::remove(path, ec_rm);
     return false;
@@ -568,7 +596,7 @@ namespace {
       const auto paths = display_helper_paths::make_snapshot_paths(root);
       std::error_code ec_cur;
       if (std::filesystem::exists(paths.session_current, ec_cur) && !ec_cur) {
-        if (validate_session_snapshot_file(paths.session_current)) {
+        if (validate_snapshot_file(paths.session_current, "session")) {
           BOOST_LOG(info) << "Existing current session snapshot detected; will preserve until confirmed restore: "
                           << paths.session_current.string();
           if (paths.session_current != active_current) {
@@ -584,7 +612,7 @@ namespace {
       const auto paths = display_helper_paths::make_snapshot_paths(root);
       std::error_code ec_prev;
       if (std::filesystem::exists(paths.session_previous, ec_prev) && !ec_prev) {
-        if (validate_session_snapshot_file(paths.session_previous)) {
+        if (validate_snapshot_file(paths.session_previous, "session")) {
           if (paths.session_previous != active_previous) {
             std::error_code ec_copy;
             std::filesystem::create_directories(active_previous.parent_path(), ec_copy);
@@ -598,6 +626,7 @@ namespace {
 }  // namespace
 
 int run_v2_helper(int argc, char *argv[]) {
+  display_helper::borrow::helper_process().store(true, std::memory_order_release);
   bool restore_mode = false;
   std::optional<int> log_level_override;
   constexpr const char *kLogLevelPrefix = "--log-level=";
@@ -623,7 +652,6 @@ int run_v2_helper(int argc, char *argv[]) {
 
   // Initialize logging early so we can log singleton conflicts and other early exits
   const auto log_dir = display_helper_paths::compute_log_dir();
-  const auto snapshot_dir = display_helper_paths::compute_snapshot_dir();
   const auto log_file = log_dir / L"sunshine_display_helper.log";
   const int min_log_level = log_level_override.value_or(2);
   auto log_guard = logging::init(min_log_level, log_file);
@@ -635,6 +663,22 @@ int run_v2_helper(int argc, char *argv[]) {
     BOOST_LOG(warning) << "Display helper: another instance is already running (singleton conflict). Exiting with code 3.";
     logging::log_flush();
     return 3;
+  }
+
+  std::optional<display_helper_ipc::endpoint_t> ipc_endpoint;
+  if (!restore_mode) {
+    ipc_endpoint = display_helper_ipc::endpoint_from_command_line(argc, argv);
+    if (!ipc_endpoint) {
+      BOOST_LOG(error) << "Display helper: missing or invalid private IPC endpoint.";
+      return 2;
+    }
+  }
+
+  // Every mode holds the singleton while resolving and mutating shared state.
+  const auto snapshot_dir = display_helper_paths::compute_snapshot_dir();
+  if (snapshot_dir.empty()) {
+    BOOST_LOG(error) << "Display helper v2: refusing SYSTEM startup because no trusted shared snapshot directory is available.";
+    return 2;
   }
 
   DisplayDeviceLogBridge log_bridge;
@@ -660,8 +704,14 @@ int run_v2_helper(int argc, char *argv[]) {
   display_helper::v2::AtomicFileTextStorage golden_status_storage;
   display_helper::v2::GoldenHealth golden_health(golden_status_storage, active_snapshots.golden_status.string());
   display_helper::v2::RestoreState restore_state;
+  restore_state.preserve_active_physical_primary.store(restore_mode);
   display_helper::v2::ApplyPolicy apply_policy(clock);
   display_helper::v2::WinVirtualDisplayDriver virtual_display;
+  display_helper::borrow::control_t borrow_control(
+    display_helper::borrow::process_gate(), display_helper::borrow::current_context(),
+    display_helper::borrow::controller_alive,
+    [&virtual_display] { return virtual_display.control_handle_for_borrow(); });
+  display_helper::borrow::mailbox_t borrow_mailbox(borrow_control);
   display_helper::v2::WinPlatformWorkarounds workarounds;
   display_helper::v2::WinScheduledTaskManager task_manager;
   display_helper::v2::HeartbeatMonitor heartbeat(clock);
@@ -695,6 +745,16 @@ int run_v2_helper(int argc, char *argv[]) {
 
   // Adopt snapshots written by other contexts (SYSTEM vs user) or the legacy engine.
   adopt_snapshots_from_search_roots(search_roots, paths.current, paths.previous);
+
+  // A payload-less golden file (e.g. a crash-truncated overwrite) makes the
+  // restore strategy see an existing-but-unloadable golden tier; drop it so
+  // tier existence stays consistent with loadability.
+  {
+    std::error_code ec_golden;
+    if (std::filesystem::exists(paths.golden, ec_golden) && !ec_golden) {
+      (void) validate_snapshot_file(paths.golden, "golden");
+    }
+  }
 
   // Load snapshot exclusions (user-configured + Sunshine-managed virtual display ids).
   std::set<std::string> initial_blacklist;
@@ -794,19 +854,34 @@ int run_v2_helper(int argc, char *argv[]) {
     }
     response_pipe.send_for_epoch(origin_epoch, MsgType::RefreshRateResult, payload);
   });
+  state_machine.set_recovery_status_result_callback(
+    [&response_pipe](std::uint64_t ticket, display_helper::v2::RecoveryStatus status,
+                     std::uint64_t event_revision, bool parked, std::uint64_t origin_epoch) {
+      std::vector<std::uint8_t> payload;
+      append_u64_le(payload, ticket);
+      payload.push_back(static_cast<std::uint8_t>(status));
+      append_u64_le(payload, event_revision);
+      payload.push_back(parked ? 1u : 0u);
+      response_pipe.send_for_epoch(origin_epoch, MsgType::RecoveryStatusResult, payload);
+    });
 
   display_helper::v2::DebouncedTrigger debouncer(std::chrono::milliseconds(500));
   std::mutex debounce_mutex;
   display_helper::v2::WinEventPump event_pump;
-  event_pump.start([&](display_helper::v2::DisplayEvent) {
+  event_pump.start([&](display_helper::v2::DisplayEvent event) {
     std::lock_guard<std::mutex> lock(debounce_mutex);
     // Tag at notification time. A WM_DISPLAYCHANGE emitted by a cancelled
     // transaction must not be relabelled as an event for a newer APPLY when
     // the debounce delay expires.
-    debouncer.notify(clock.now(), cancellation.current_generation());
+    debouncer.notify(
+      clock.now(),
+      cancellation.current_generation(),
+      connection_epoch.load(std::memory_order_acquire),
+      event);
   });
 
   auto service_timers = [&]() {
+    if (borrow_mailbox.inhibited()) return;
     if (heartbeat.check_timeout()) {
       const auto origin_epoch = connection_epoch.load(std::memory_order_acquire);
       if (origin_epoch != 0) {
@@ -815,15 +890,16 @@ int run_v2_helper(int argc, char *argv[]) {
       }
     }
 
-    std::optional<std::uint64_t> event_generation;
+    std::optional<display_helper::v2::DebouncedTrigger::Ticket> display_event;
     {
       std::lock_guard<std::mutex> lock(debounce_mutex);
-      event_generation = debouncer.take_if_due(clock.now());
+      display_event = debouncer.take_if_due(clock.now());
     }
-    if (event_generation) {
+    if (display_event) {
       queue.push(display_helper::v2::DisplayEventMessage {
-        display_helper::v2::DisplayEvent::DisplayChange,
-        *event_generation
+        .event = display_event->event,
+        .generation = display_event->generation,
+        .connection_epoch = display_event->connection_epoch,
       });
     }
 
@@ -831,8 +907,18 @@ int run_v2_helper(int argc, char *argv[]) {
   };
 
   auto process_queue = [&]() {
+    const bool borrow_command = borrow_mailbox.service([&response_pipe](std::uint8_t type,
+        const display_helper::borrow::result_t &result, std::uint64_t epoch) {
+      response_pipe.send_for_epoch(epoch, static_cast<MsgType>(type), display_helper::borrow::encode_result(result));
+    });
+    if (borrow_mailbox.inhibited()) {
+      // The complete ordinary mailbox and FSM timer state stay parked. No
+      // completion/queued restore is mistaken for cancellation or success.
+      if (!borrow_command) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      return;
+    }
     if (auto message = queue.wait_for(std::chrono::milliseconds(100))) {
-      // A stabilization-verification completion may race a replacement
+      // A delayed disconnect-verification completion may race a replacement
       // APPLY/REVERT/DISARM or refresh command arriving from the pipe. Give a
       // contiguous replacement-intent prefix priority so the state machine can
       // coalesce it behind the active mutation fence before that completion
@@ -843,7 +929,7 @@ int run_v2_helper(int argc, char *argv[]) {
       // pipe order is a baseline-capture contract. Only a contiguous control
       // prefix immediately following an asynchronous completion may supersede
       // that completion.
-      const bool prioritize_refresh_rate = is_stabilization_completion(*message);
+      const bool prioritize_refresh_rate = is_delayed_disconnect_verification_completion(*message);
       auto queued_controls = is_async_completion(*message) ?
                                queue.extract_prefix_while([prioritize_refresh_rate](const display_helper::v2::Message &queued) {
                                  return is_replacement_control_intent(queued) ||
@@ -872,6 +958,9 @@ int run_v2_helper(int argc, char *argv[]) {
     BOOST_LOG(info) << "Display helper v2 running in restore mode.";
     display_helper::v2::RevertCommand revert {cancellation.current_generation()};
     revert.immediate = true;
+    revert.always_restore_from_golden = display_helper::load_boot_restore_prefer_golden(
+      display_helper_paths::executable_config_search_roots(), search_roots,
+      display_helper_paths::restore_state_file_from_command_line());
     queue.push(revert);
     while (running.load(std::memory_order_acquire)) {
       process_queue();
@@ -885,21 +974,21 @@ int run_v2_helper(int argc, char *argv[]) {
   auto last_connect_wait_log = std::chrono::steady_clock::time_point::min();
   constexpr auto kReconnectLogInterval = std::chrono::hours(1);
   while (running.load(std::memory_order_acquire)) {
-    platf::dxgi::FramedPipeFactory pipe_factory(std::make_unique<platf::dxgi::AnonymousPipeFactory>());
-    auto server_pipe = pipe_factory.create_server("sunshine_display_helper");
+    platf::dxgi::NamedPipeFactory factory;
+    factory.set_client_identification_only();
+    factory.set_client_data_access_only();
+    factory.set_expected_server_process_id(ipc_endpoint->parent_pid);
+    auto raw_pipe = factory.create_client(ipc_endpoint->pipe_name);
+    if (!raw_pipe) {
+      process_queue();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+    auto server_pipe = raw_pipe ? std::make_unique<platf::dxgi::FramedPipe>(std::move(raw_pipe)) : nullptr;
     if (!server_pipe) {
-      platf::dxgi::FramedPipeFactory fallback_factory(std::make_unique<platf::dxgi::NamedPipeFactory>());
-      server_pipe = fallback_factory.create_server("sunshine_display_helper");
-      if (!server_pipe) {
-        BOOST_LOG(error) << "Failed to create control pipe; retrying while keeping recovery timers alive.";
-        // Listener creation is incidental to recovery. Continue driving the
-        // FSM and restore scheduler while it is unavailable, matching v1's
-        // listener-independent restore poll.
-        for (int retry_slice = 0; retry_slice < 5 && running.load(std::memory_order_acquire); ++retry_slice) {
-          process_queue();
-        }
-        continue;
-      }
+      BOOST_LOG(error) << "Display helper v2: authenticated IPC client could not be created.";
+      event_pump.stop();
+      return 2;
     }
 
     platf::dxgi::AsyncNamedPipe async_pipe(std::move(server_pipe));
@@ -949,6 +1038,10 @@ int run_v2_helper(int argc, char *argv[]) {
       }
 
       switch (type) {
+        case MsgType::BorrowAcquire:
+        case MsgType::BorrowRelease:
+          (void) borrow_mailbox.post(static_cast<std::uint8_t>(type), payload, epoch, async_pipe.peer_process_id());
+          break;
         case MsgType::Apply: {
           display_helper::v2::ApplyRequest request;
           std::string parse_failure;
@@ -973,6 +1066,18 @@ int run_v2_helper(int argc, char *argv[]) {
           revert.connection_epoch = epoch;
           restore_origin_epoch.store(epoch, std::memory_order_release);
           queue.push(revert);
+          break;
+        }
+        case MsgType::RecoveryStatus: {
+          const auto ticket = read_u64_le(payload, 0);
+          const bool valid_shape = ticket && (payload.size() == 8 || payload.size() == 9) &&
+                                   (payload.size() == 8 || payload[8] <= 1);
+          queue.push(display_helper::v2::RecoveryStatusCommand {
+            .ticket = valid_shape ? *ticket : 0,
+            .generation = cancellation.current_generation(),
+            .connection_epoch = epoch,
+            .park = valid_shape && payload.size() == 9 && payload[8] != 0,
+          });
           break;
         }
         case MsgType::Disarm:
@@ -1065,6 +1170,10 @@ int run_v2_helper(int argc, char *argv[]) {
           }
           break;
         case MsgType::Stop:
+          if (borrow_mailbox.inhibited()) {
+            queue.push(display_helper::v2::StopCommand {cancellation.current_generation(), epoch});
+            break;
+          }
           BOOST_LOG(info) << "Display helper: received STOP command, exiting gracefully.";
           cancellation.cancel();
           running.store(false, std::memory_order_release);
@@ -1150,7 +1259,7 @@ int run_v2_helper(int argc, char *argv[]) {
           revert.connection_epoch = 0;
           revert.from_disconnect = true;
           restore_origin_epoch.store(epoch, std::memory_order_release);
-          state_machine.handle_message(revert);
+          queue.push(revert);
         }
         break;
       }

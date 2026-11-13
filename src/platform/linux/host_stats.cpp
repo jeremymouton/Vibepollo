@@ -299,7 +299,6 @@ namespace {
         return false;
       }
       _inited = true;
-      _shutdown = nvmlShutdown;
       if (nvmlDeviceGetHandleByIndex_v2(0, &_dev) != NVML_SUCCESS) {
         _dev = nullptr;
       }
@@ -320,8 +319,8 @@ namespace {
 
   private:
     void reset() {
-      if (_inited && _shutdown) {
-        _shutdown();
+      if (_inited && nvmlShutdown) {
+        nvmlShutdown();
       }
       if (_handle) {
         dlclose(_handle);
@@ -330,7 +329,7 @@ namespace {
       _dev = nullptr;
       _inited = false;
       nvmlInit_v2 = nullptr;
-      _shutdown = nullptr;
+      nvmlShutdown = nullptr;
       nvmlDeviceGetCount_v2 = nullptr;
       nvmlDeviceGetHandleByIndex_v2 = nullptr;
       nvmlDeviceGetUtilizationRates = nullptr;
@@ -391,6 +390,11 @@ namespace {
         }
       }
       return out;
+    }
+
+    void reset_rate_baselines() override {
+      _have_cpu_baseline = false;
+      _have_net_baseline = false;
     }
 
   private:
@@ -470,10 +474,19 @@ namespace {
     void sample_gpu(platf::host_stats_t &out) {
       if (!_have_nvml || !_nvml.device()) return;
       void *dev = _nvml.device();
+      platf::client_gpu_stats_t gpu;
+      gpu.id = 1;  // Provider-local NVML device identity, not a display/encoder index.
+      if (_nvml.nvmlDeviceGetName) {
+        char name[96] {};
+        if (_nvml.nvmlDeviceGetName(dev, name, sizeof(name)) == NVML_SUCCESS) {
+          gpu.name = name;
+        }
+      }
       if (_nvml.nvmlDeviceGetUtilizationRates) {
         nvml_utilization_t u {};
         if (_nvml.nvmlDeviceGetUtilizationRates(dev, &u) == NVML_SUCCESS) {
           out.gpu_percent = static_cast<float>(u.gpu);
+          gpu.usage_percent = out.gpu_percent;
         }
       }
       if (_nvml.nvmlDeviceGetEncoderUtilization) {
@@ -481,12 +494,14 @@ namespace {
         unsigned int sampling = 0;
         if (_nvml.nvmlDeviceGetEncoderUtilization(dev, &util, &sampling) == NVML_SUCCESS) {
           out.gpu_encoder_percent = static_cast<float>(util);
+          gpu.encoder_percent = out.gpu_encoder_percent;
         }
       }
       if (_nvml.nvmlDeviceGetTemperature) {
         unsigned int temp = 0;
         if (_nvml.nvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &temp) == NVML_SUCCESS) {
           out.gpu_temp_c = static_cast<float>(temp);
+          gpu.temperature_c = out.gpu_temp_c;
         }
       }
       if (_nvml.nvmlDeviceGetMemoryInfo) {
@@ -494,8 +509,11 @@ namespace {
         if (_nvml.nvmlDeviceGetMemoryInfo(dev, &mem) == NVML_SUCCESS) {
           out.vram_total_bytes = mem.total;
           out.vram_used_bytes = mem.used;
+          gpu.vram_used_bytes = mem.used;
+          gpu.vram_total_bytes = mem.total;
         }
       }
+      out.client_gpus.push_back(std::move(gpu));
     }
 
     cpu_jiffies_t _last_cpu {};

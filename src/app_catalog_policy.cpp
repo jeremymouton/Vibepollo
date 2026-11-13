@@ -4,13 +4,14 @@
  */
 
 #include "app_catalog_policy.h"
+#include "remote_session.h"
 
 #include <algorithm>
 #include <array>
 #include <boost/crc.hpp>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <sstream>
 
@@ -25,11 +26,35 @@ namespace proc::catalog {
         const auto suffix = std::to_string(*index);
         crc.process_bytes(suffix.data(), suffix.size());
       }
-      return std::to_string(std::abs(static_cast<std::int32_t>(crc.checksum())));
+      const auto signed_crc = static_cast<std::int32_t>(crc.checksum());
+      return std::to_string(signed_crc < 0 ? -static_cast<std::int64_t>(signed_crc) : signed_crc);
+    }
+
+    bool usable_configured_id(const std::string &id) {
+      std::int32_t value {};
+      const auto [end, error] = std::from_chars(id.data(), id.data() + id.size(), value);
+      if (error != std::errc {} || end != id.data() + id.size() || value <= 0 || id != std::to_string(value)) {
+        return false;
+      }
+      // Admission and routing must agree on all current and legacy controls.
+      return remote_session::configured_app_id(value);
+    }
+
+    bool unavailable_id(const std::string &id, const std::set<std::string> &occupied) {
+      return !usable_configured_id(id) || occupied.contains(id);
+    }
+
+    std::string available_id(std::string preferred, const app_identity_t &app, int index, const std::set<std::string> &occupied) {
+      // Keep existing compatible IDs whenever available. Only exhausted,
+      // reserved or malformed candidates use the deterministic retry sequence.
+      for (std::uint64_t attempt = 0; unavailable_id(preferred, occupied); ++attempt) {
+        preferred = numeric_id({app.name, "\n", app.uuid, "\n", app.legacy_image_identity, "\n", app.art_version, "\ncollision\n", std::to_string(index), "\n", std::to_string(attempt)});
+      }
+      return preferred;
     }
 
     void remember_alias(alias_state_t &state, const std::string &alias) {
-      if (!alias.empty() && alias != state.current_id) {
+      if (usable_configured_id(alias) && alias != state.current_id) {
         state.aliases.insert(alias);
       }
     }
@@ -41,6 +66,27 @@ namespace proc::catalog {
       });
       return extension;
     }
+
+    bool is_strict_descendant(
+      const std::filesystem::path &candidate,
+      const std::filesystem::path &root) {
+      const auto normalized_candidate = candidate.lexically_normal();
+      const auto normalized_root = root.lexically_normal();
+      if (!normalized_candidate.is_absolute() || !normalized_root.is_absolute()) {
+        return false;
+      }
+
+      auto candidate_component = normalized_candidate.begin();
+      for (auto root_component = normalized_root.begin();
+           root_component != normalized_root.end();
+           ++root_component, ++candidate_component) {
+        if (candidate_component == normalized_candidate.end() ||
+            *candidate_component != *root_component) {
+          return false;
+        }
+      }
+      return candidate_component != normalized_candidate.end();
+    }
   }  // namespace
 
   bool has_png_signature(std::span<const std::uint8_t> bytes) {
@@ -50,6 +96,29 @@ namespace proc::catalog {
 
   std::string asset_path(const std::string &assets_root, const std::string &relative_path) {
     return (std::filesystem::path(assets_root) / relative_path).string();
+  }
+
+  bool machine_image_path_is_confined(
+    const std::string &image_path,
+    const std::string &assets_root,
+    const std::string &covers_root) {
+    if (image_path.empty()) {
+      return false;
+    }
+
+    const std::filesystem::path requested {image_path};
+    if (requested.is_absolute()) {
+      return is_strict_descendant(requested, assets_root) ||
+             is_strict_descendant(requested, covers_root);
+    }
+
+    // Legacy Steam catalogs used this client-facing spelling even though the
+    // installed file lives directly in the immutable assets root.
+    if (requested == std::filesystem::path {"./assets/steam.png"}) {
+      return true;
+    }
+    return is_strict_descendant(std::filesystem::path {assets_root} / requested,
+                                assets_root);
   }
 
   std::string validate_image_path(
@@ -70,6 +139,40 @@ namespace proc::catalog {
     }
     const auto bytes = read_image(image_path);
     return bytes && has_png_signature(*bytes) ? image_path : default_image;
+  }
+
+  std::optional<std::string> read_configured_image(
+    const std::string &image_path,
+    const std::string &assets_root,
+    const image_reader_t &read_header,
+    const image_content_reader_t &read_content
+  ) {
+    const auto path = validate_image_path(image_path, assets_root, {}, read_header);
+    if (path.empty()) {
+      return std::nullopt;
+    }
+    auto content = read_content(path);
+    if (!content || content->size() > maximum_image_bytes || !has_png_signature(std::span<const std::uint8_t> {reinterpret_cast<const std::uint8_t *>(content->data()), content->size()})) {
+      return std::nullopt;
+    }
+    return content;
+  }
+
+  std::string configured_image_version(
+    const std::string &image_path,
+    const std::string &assets_root,
+    const std::string &art_version,
+    const image_reader_t &read_header,
+    const image_stamp_reader_t &read_stamp) {
+    const auto path = validate_image_path(image_path, assets_root, {}, read_header);
+    boost::crc_32_type crc;
+    crc.process_bytes(art_version.data(), art_version.size());
+    const char separator = '\0';
+    crc.process_bytes(&separator, 1);
+    const auto &identity = path.empty() ? image_path : path;
+    crc.process_bytes(identity.data(), identity.size());
+    const auto stamp = path.empty() ? std::nullopt : read_stamp(path);
+    return std::to_string(crc.checksum()) + "-" + stamp.value_or("unavailable");
   }
 
   std::tuple<std::string, std::string> calculate_ids(
@@ -106,7 +209,7 @@ namespace proc::catalog {
     bool &state_changed) {
     const auto legacy_ids = calculate_ids(app.name, app.uuid, app.legacy_image_identity, index);
     if (app.uuid.empty()) {
-      app.id = occupied_ids.contains(std::get<0>(legacy_ids)) ? std::get<1>(legacy_ids) : std::get<0>(legacy_ids);
+      app.id = available_id(unavailable_id(std::get<0>(legacy_ids), occupied_ids) ? std::get<1>(legacy_ids) : std::get<0>(legacy_ids), app, index, occupied_ids);
       occupied_ids.insert(app.id);
       return;
     }
@@ -125,19 +228,24 @@ namespace proc::catalog {
       state.cover_fingerprint = app.art_version;
       state_changed = true;
     }
-    if (state.cover_fingerprint != app.art_version) {
+    // A UUID-only ID may already be cached with placeholder artwork on a
+    // client, including after removal pruned our previous fingerprint.
+    // Version first-seen and existing UUID-only entries too, so re-adding
+    // an app cannot resurrect that stale client cache.
+    if (state.cover_fingerprint != app.art_version ||
+        (!app.art_version.empty() && state.current_id == std::get<0>(legacy_ids))) {
       const auto previous = state.current_id;
       const auto versioned = calculate_versioned_ids(app.uuid, app.art_version, index);
-      state.current_id = occupied_ids.contains(std::get<0>(versioned)) ? std::get<1>(versioned) : std::get<0>(versioned);
+      state.current_id = available_id(unavailable_id(std::get<0>(versioned), occupied_ids) ? std::get<1>(versioned) : std::get<0>(versioned), app, index, occupied_ids);
       state.cover_fingerprint = app.art_version;
       remember_alias(state, previous);
       remember_alias(state, std::get<0>(legacy_ids));
       state_changed = true;
     }
-    if (occupied_ids.contains(state.current_id)) {
+    if (unavailable_id(state.current_id, occupied_ids)) {
       remember_alias(state, state.current_id);
       const auto versioned = calculate_versioned_ids(app.uuid, app.art_version, index);
-      state.current_id = occupied_ids.contains(std::get<1>(versioned)) ? std::get<1>(legacy_ids) : std::get<1>(versioned);
+      state.current_id = available_id(unavailable_id(std::get<1>(versioned), occupied_ids) ? std::get<1>(legacy_ids) : std::get<1>(versioned), app, index, occupied_ids);
       state_changed = true;
     }
     app.id = state.current_id;
@@ -174,7 +282,7 @@ namespace proc::catalog {
       std::vector<std::string> filtered;
       std::set<std::string> seen;
       for (const auto &alias : app.aliases) {
-        if (alias.empty() || alias == app.id || !seen.insert(alias).second || current_ids.contains(alias) || alias_counts[alias] > 1) {
+        if (!usable_configured_id(alias) || alias == app.id || !seen.insert(alias).second || current_ids.contains(alias) || alias_counts[alias] > 1) {
           state_changed = true;
           continue;
         }

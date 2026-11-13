@@ -155,11 +155,30 @@ export function getConfigSelectOptions(
         switch: 'config.gamepad_switch',
         x360: 'config.gamepad_x360',
         xone: 'config.gamepad_xone',
+        vhf: 'config.gamepad_vhf',
+        vhf_xbox: 'config.gamepad_vhf_xbox',
+        vhf_xbox_one: 'config.gamepad_vhf_xbox_one',
+        vhf_ds4: 'config.gamepad_vhf_ds4',
+        vhf_ds5: 'config.gamepad_vhf_ds5',
+        usbip_ds5: 'config.gamepad_usbip_ds5',
+        vhf_switch: 'config.gamepad_vhf_switch',
+        vhf_steam: 'config.gamepad_vhf_steam',
       };
       const prioritizedByPlatform: Record<string, string[]> = {
         freebsd: ['switch', 'xone'],
-        linux: ['ds5', 'xone', 'switch', 'x360'],
-        windows: ['x360', 'ds4'],
+        linux: ['xone', 'ds4', 'ds5', 'switch'],
+        windows: [
+          'x360',
+          'ds4',
+          'vhf',
+          'vhf_xbox',
+          'vhf_xbox_one',
+          'vhf_ds4',
+          'vhf_ds5',
+          'usbip_ds5',
+          'vhf_switch',
+          'vhf_steam',
+        ],
       };
       const fallbackOrder = ['x360', 'ds5', 'ds4'];
 
@@ -193,6 +212,7 @@ export function getConfigSelectOptions(
         options.push(
           { label: 'NvFBC', value: 'nvfbc' },
           { label: 'KWin', value: 'kwin' },
+          { label: 'SteamOS / Gamescope', value: 'gamescope' },
           { label: 'wlroots', value: 'wlr' },
           { label: 'KMS', value: 'kms' },
           { label: 'X11', value: 'x11' },
@@ -206,13 +226,14 @@ export function getConfigSelectOptions(
       if (platform === 'windows') {
         if (hasNvidia) options.push({ label: 'NVIDIA NVENC', value: 'nvenc' });
         if (hasIntel) options.push({ label: 'Intel QuickSync', value: 'quicksync' });
-        if (hasAmd) options.push({ label: 'AMD AMF/VCE', value: 'amdvce' });
-        // Explicit rollback to the FFmpeg AMF path — never probed automatically,
-        // so it must stay selectable here.
-        if (hasAmd) options.push({ label: 'AMD AMF/VCE (legacy FFmpeg)', value: 'amdvce_legacy' });
+        if (hasAmd) options.push({ label: 'AMD AMF/VCE (Legacy FFmpeg)', value: 'amdvce_ffmpeg' });
+        if (hasAmd) {
+          options.push({ label: 'AMD AMF/VCE (Native)', value: 'amdvce_experimental' });
+        }
       } else if (platform === 'linux') {
         options.push(
-          { label: 'NVIDIA NVENC', value: 'nvenc' },
+          { label: 'NVIDIA NVENC (Native)', value: 'nvenc' },
+          { label: 'NVIDIA NVENC (Legacy FFmpeg)', value: 'nvenc_legacy' },
           { label: 'Vulkan', value: 'vulkan' },
           { label: 'VA-API', value: 'vaapi' },
         );
@@ -425,29 +446,50 @@ export function getConfigSelectOptions(
       return ensureIncludesCurrentValue(options, ctx.currentValue);
     }
     case 'frame_limiter_provider': {
+      const options = platform.includes('linux')
+        ? [
+            { label: t('frameLimiter.provider.autoLinux'), value: 'auto' },
+            { label: t('frameLimiter.provider.mangohudProton'), value: 'mangohud-proton' },
+            { label: t('frameLimiter.provider.proton'), value: 'proton' },
+            { label: t('frameLimiter.provider.mangohud'), value: 'mangohud' },
+            { label: t('frameLimiter.provider.none'), value: 'none' },
+          ]
+        : [
+            { label: t('frameLimiter.provider.auto'), value: 'auto' },
+            { label: t('frameLimiter.provider.rtss'), value: 'rtss' },
+            {
+              label: t('frameLimiter.provider.nvcp'),
+              value: 'nvidia-control-panel',
+            },
+            { label: t('frameLimiter.provider.none'), value: 'none' },
+          ];
+      return ensureIncludesCurrentValue(options, ctx.currentValue);
+    }
+    case 'mangohud_limiter_method': {
       const options = [
-        { label: t('frameLimiter.provider.auto'), value: 'auto' },
-        { label: t('frameLimiter.provider.rtss'), value: 'rtss' },
-        {
-          label: t('frameLimiter.provider.nvcp'),
-          value: 'nvidia-control-panel',
-        },
+        { label: t('frameLimiter.mangohudMethod.early'), value: 'early' },
+        { label: t('frameLimiter.mangohudMethod.late'), value: 'late' },
       ];
       return ensureIncludesCurrentValue(options, ctx.currentValue);
     }
     case 'frame_limiter_auto_virtual_framegen': {
+      // Fastest to slowest virtual-screen refresh. The fixed 1000 Hz VRR mode is a
+      // Windows capture option; Linux virtual displays already present with real VRR.
       const options = [
+        ...(platform.includes('linux')
+          ? []
+          : [{ label: t('frameLimiter.virtual.modeVrr'), value: 'vrr' }]),
         {
           label: t('frameLimiter.virtual.modeEnabled'),
           value: 'enabled',
         },
         {
-          label: t('frameLimiter.virtual.modeDisabled'),
-          value: 'disabled',
-        },
-        {
           label: t('frameLimiter.virtual.modeLegacy'),
           value: 'legacy',
+        },
+        {
+          label: t('frameLimiter.virtual.modeDisabled'),
+          value: 'disabled',
         },
       ];
       return ensureIncludesCurrentValue(options, ctx.currentValue);

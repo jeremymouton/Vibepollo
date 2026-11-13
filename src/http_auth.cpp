@@ -474,10 +474,20 @@ namespace confighttp {
   ApiTokenManagerDependencies ApiTokenManager::make_default_dependencies() {
     ApiTokenManagerDependencies dependencies;
     dependencies.file_exists = [](const std::string &path) {
+#ifndef SUNSHINE_HTTP_AUTH_POLICY_ONLY
+      return fs::exists(path) || fs::exists(path + ".bak");
+#else
       return fs::exists(path);
+#endif
     };
     dependencies.read_json = [](const std::string &path, pt::ptree &tree) {
+#ifndef SUNSHINE_HTTP_AUTH_POLICY_ONLY
+      if (statefile::load_json(path, tree) != statefile::json_load_result_e::loaded) {
+        throw std::runtime_error("authentication state is unavailable");
+      }
+#else
       boost::property_tree::json_parser::read_json(path, tree);
+#endif
     };
     dependencies.write_json = [](const std::string &path, const pt::ptree &tree) {
 #ifndef SUNSHINE_HTTP_AUTH_POLICY_ONLY
@@ -548,10 +558,20 @@ namespace confighttp {
 #endif
     };
     deps.file_exists = [](const std::string &path) {
+#ifndef SUNSHINE_HTTP_AUTH_POLICY_ONLY
+      return fs::exists(path) || fs::exists(path + ".bak");
+#else
       return fs::exists(path);
+#endif
     };
     deps.read_json = [](const std::string &path, pt::ptree &tree) {
+#ifndef SUNSHINE_HTTP_AUTH_POLICY_ONLY
+      if (statefile::load_json(path, tree) != statefile::json_load_result_e::loaded) {
+        throw std::runtime_error("authentication state is unavailable");
+      }
+#else
       boost::property_tree::json_parser::read_json(path, tree);
+#endif
     };
     deps.write_json = [](const std::string &path, const pt::ptree &tree) {
 #ifndef SUNSHINE_HTTP_AUTH_POLICY_ONLY
@@ -1378,6 +1398,10 @@ namespace confighttp {
   AuthResult check_password(const std::string &remote_address, const std::string &username, const std::string &password) {
     std::scoped_lock credentials_lock(credentials_mutex());
     return make_request_auth_policy().check_password(remote_address, username, password);
+  }
+
+  AuthResult check_remote_access(const std::string &remote_address) {
+    return make_request_auth_policy().check_remote(remote_address);
   }
 
   namespace {

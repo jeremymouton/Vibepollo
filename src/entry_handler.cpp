@@ -12,6 +12,7 @@
 // local includes
 #include "config.h"
 #include "confighttp.h"
+#include "entry_credentials.h"
 #include "entry_handler.h"
 #include "entry_metadata.h"
 #include "globals.h"
@@ -35,11 +36,15 @@ void launch_ui(const std::optional<std::string> &path) {
 
 namespace args {
   int creds(const char *name, int argc, char *argv[]) {
-    if (argc < 2 || argv[0] == "help"sv || argv[1] == "help"sv) {
-      help(name);
-    }
-
-    return http::save_user_creds(config::sunshine.credentials_file, argv[0], argv[1]);
+    return creds(
+      name,
+      argc,
+      argv,
+      help,
+      [](const char *username, const char *password) {
+        return http::save_user_creds(config::sunshine.credentials_file, username, password);
+      }
+    );
   }
 
   int help(const char *name) {
@@ -72,8 +77,18 @@ namespace lifetime {
     int zero = 0;
     desired_exit_code.compare_exchange_strong(zero, exit_code);
 
-    // Raise SIGINT to start termination
-    std::raise(SIGINT);
+    // Internal shutdown requests already run in ordinary thread context. Wake
+    // main directly instead of synchronously executing the process signal
+    // handler on an HTTP or tray thread. The latter performs logging and other
+    // lock-taking work and can therefore stall the caller before shutdown is
+    // ever published.
+    if (mail::man) {
+      mail::man->event<bool>(mail::shutdown)->raise(true);
+    } else {
+      // main() constructs process mail before any runtime caller can request
+      // shutdown. Keep a startup fallback for defensive completeness.
+      std::raise(SIGINT);
+    }
 
     // Termination will happen asynchronously, but the caller may
     // have wanted synchronous behavior.

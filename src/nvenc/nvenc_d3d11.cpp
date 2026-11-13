@@ -2,14 +2,32 @@
  * @file src/nvenc/nvenc_d3d11.cpp
  * @brief Definitions for abstract Direct3D11 NVENC encoder.
  */
-// local includes
-#include "src/logging.h"
-
 #ifdef _WIN32
+  // Include the D3D11 platform header before logging can include Windows.h.
   #include "nvenc_d3d11.h"
   #include "nvenc_api.h"
+  #include "nvenc_event_wait.h"
+  #include "src/logging.h"
 
 namespace nvenc {
+  namespace {
+    static_assert(sizeof(DWORD) == sizeof(std::uint32_t));
+    static_assert(WAIT_OBJECT_0 == event_wait::signaled);
+    static_assert(WAIT_TIMEOUT == event_wait::timed_out);
+    static_assert(WAIT_FAILED == event_wait::failed);
+
+    class win32_event_wait_t final: public event_wait::api_t {
+    public:
+      std::uint32_t wait(void *event, std::uint32_t timeout_ms) override {
+        const DWORD result = WaitForSingleObject(event, timeout_ms);
+        return result;
+      }
+
+      std::uint32_t last_error() override {
+        return GetLastError();
+      }
+    };
+  }  // namespace
 
   nvenc_d3d11::nvenc_d3d11(NV_ENC_DEVICE_TYPE device_type):
       nvenc_base(device_type) {
@@ -47,9 +65,9 @@ namespace nvenc {
         if (auto get_max_ver = (decltype(NvEncodeAPIGetMaxSupportedVersion) *) GetProcAddress(dll, "NvEncodeAPIGetMaxSupportedVersion")) {
           uint32_t max_ver = 0;
           if (get_max_ver(&max_ver) == NV_ENC_SUCCESS) {
-            max_driver_api_version = max_ver;
+            max_driver_api_version = api::driver_max_to_api_version(max_ver);
             BOOST_LOG(info) << "NvEnc: driver supports up to API "
-                            << api::version_string(max_ver)
+                            << api::version_string(max_driver_api_version)
                             << ", compiled SDK " << NVENCAPI_MAJOR_VERSION << "." << NVENCAPI_MINOR_VERSION;
           } else {
             BOOST_LOG(warning) << "NvEnc: NvEncodeAPIGetMaxSupportedVersion() failed";
@@ -95,7 +113,12 @@ namespace nvenc {
   }
 
   bool nvenc_d3d11::wait_for_async_event(uint32_t timeout_ms) {
-    return WaitForSingleObject(async_event_handle, timeout_ms) == WAIT_OBJECT_0;
+    win32_event_wait_t api;
+    const auto result = event_wait::wait(async_event_handle, timeout_ms, api);
+    if (!result.succeeded()) {
+      BOOST_LOG(error) << "NvEnc: " << event_wait::describe(result, timeout_ms);
+    }
+    return result.succeeded();
   }
 
 }  // namespace nvenc

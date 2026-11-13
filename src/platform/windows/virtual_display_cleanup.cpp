@@ -3,9 +3,12 @@
 #ifdef _WIN32
 
   #include "display_helper_integration.h"
+  #include "src/platform/windows/display_helper_borrow_native.h"
   #include "src/logging.h"
   #include "src/platform/windows/impersonating_display_device.h"
   #include "src/platform/windows/virtual_display.h"
+  #include "src/process.h"
+  #include "src/remote_display_topology.h"
 
   #include <algorithm>
   #include <array>
@@ -16,12 +19,14 @@
   #include <display_device/windows/win_display_device.h>
   #include <exception>
   #include <memory>
+  #include <mutex>
   #include <string>
   #include <thread>
 
 namespace platf::virtual_display_cleanup {
   namespace {
     std::atomic_uint g_cleanup_reservations {0};
+    std::mutex g_terminal_cleanup_mutex;
 
     class cleanup_reservation_t {
     public:
@@ -80,6 +85,8 @@ namespace platf::virtual_display_cleanup {
     }
 
     bool restore_windows_display_database() {
+      auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(false);
+      if (!borrowed_output_mutation) return false;
       try {
         auto api = std::make_shared<display_device::WinApiLayer>();
         auto win_dd = std::make_shared<display_device::WinDisplayDevice>(api);
@@ -109,6 +116,18 @@ namespace platf::virtual_display_cleanup {
       std::memcpy(&guid, guid_bytes->data(), sizeof(guid));
       return VDISPLAY::removeVirtualDisplay(guid);
     }
+
+    void disengage_recovery_monitors(const std::optional<std::array<std::uint8_t, 16>> &guid_bytes) {
+      if (!guid_bytes || guid_bytes_are_empty(*guid_bytes)) {
+        VDISPLAY::cancel_all_virtual_display_recovery_monitors();
+        return;
+      }
+
+      GUID guid {};
+      static_assert(sizeof(guid) == 16);
+      std::memcpy(&guid, guid_bytes->data(), sizeof(guid));
+      VDISPLAY::cancel_virtual_display_recovery_monitor(guid);
+    }
   }  // namespace
 
   cleanup_result_t run(
@@ -116,12 +135,39 @@ namespace platf::virtual_display_cleanup {
     const bool enforce_db_restore,
     const revert_order_t revert_order,
     const bool prefer_golden_if_current_missing,
-    const std::optional<std::array<std::uint8_t, 16>> virtual_display_guid_bytes
+    const std::optional<std::array<std::uint8_t, 16>> virtual_display_guid_bytes,
+    const recovery_monitor_policy_t recovery_monitor_policy,
+    const cleanup_admission_policy_t cleanup_admission_policy
   ) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(false);
+    if (!borrowed_output_mutation) return {};
     cleanup_reservation_t cleanup_reservation;
     cleanup_result_t result;
 
     const std::string reason_text = reason.empty() ? "unspecified" : std::string(reason);
+    if (recovery_monitor_policy == recovery_monitor_policy_t::disengage_before_admission) {
+      // Terminal intent is authoritative even while a managed session still
+      // owns the display. Cancel before the ownership guard so an intentionally
+      // expired or externally removed lease can never be classified as a crash
+      // and recreated by that ended session's recovery worker.
+      disengage_recovery_monitors(virtual_display_guid_bytes);
+      BOOST_LOG(info) << "Virtual display cleanup: recovery monitors disengaged before terminal cleanup admission (reason="
+                      << reason_text << ").";
+    }
+    const bool managed_cleanup_allowed = remote_display_topology::instance().generic_virtual_display_cleanup_allowed();
+    if (!cleanup_admitted(managed_cleanup_allowed, cleanup_admission_policy)) {
+      if (enforce_db_restore) {
+        proc::defer_display_revert();
+      }
+      BOOST_LOG(info) << "Virtual display cleanup: deferred (reason=" << reason_text
+                      << ") until the remaining managed client display sessions release ownership.";
+      return result;
+    }
+    if (!managed_cleanup_allowed) {
+      BOOST_LOG(warning) << "Virtual display cleanup: overriding managed display ownership for terminal user action (reason="
+                         << reason_text << ").";
+    }
+
     BOOST_LOG(info) << "Virtual display cleanup: begin (reason=" << reason_text
                     << ", enforce_db_restore=" << (enforce_db_restore ? "true" : "false")
                     << ", revert_order="
@@ -137,10 +183,12 @@ namespace platf::virtual_display_cleanup {
         return;
       }
 
-      result.helper_revert_dispatched = display_helper_integration::revert(prefer_golden_if_current_missing);
-      if (result.helper_revert_dispatched) {
-        result.database_restore_applied = true;
-      }
+      result.helper_revert_dispatched = display_helper_integration::revert(
+        prefer_golden_if_current_missing,
+        cleanup_admission_policy == cleanup_admission_policy_t::override_managed_owners
+      );
+      // REVERT is asynchronous. A successful send does not establish that the
+      // helper restored or verified the desktop; report dispatch separately.
     };
 
     bool teardown_completed = false;
@@ -194,6 +242,80 @@ namespace platf::virtual_display_cleanup {
                     << ", helper_revert_dispatched=" << (result.helper_revert_dispatched ? "true" : "false")
                     << ", database_restore_applied=" << (result.database_restore_applied ? "true" : "false")
                     << ")";
+    return result;
+  }
+
+  static bool recover_emergency_physical_display(bool &database_restore_applied) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(false);
+    if (!borrowed_output_mutation) return false;
+    try {
+      auto api = std::make_shared<display_device::WinApiLayer>();
+      auto win_dd = std::make_shared<display_device::WinDisplayDevice>(api);
+      display_device::ImpersonatingDisplayDevice device {win_dd};
+      const auto physical = [](const display_device::EnumeratedDevice &output) {
+        return !output.m_device_id.empty() &&
+               !VDISPLAY::is_virtual_display_monitor_path(platf::from_utf8(output.m_monitor_device_path)) &&
+               !(output.m_edid && (output.m_edid->m_manufacturer_id == "SDD" || output.m_edid->m_manufacturer_id == "SMK"));
+      };
+      const auto active = [&](const auto &outputs) {
+        return std::ranges::any_of(outputs, [&](const auto &output) { return physical(output) && output.m_info.has_value(); });
+      };
+      auto outputs = device.enumAvailableDevices();
+      if (active(outputs)) return true;
+      // The terminal dispatch fence has verified helper exit before this native
+      // fallback; a dispatched but failed REVERT cannot race the repair.
+      database_restore_applied = device.restoreMonitorSettings() || database_restore_applied;
+      outputs = device.enumAvailableDevices();
+      if (active(outputs)) return true;
+      // With no working physical layout left, try one connected physical target
+      // at a time. setTopology lets Windows choose a supported display mode.
+      for (const auto &output : outputs) {
+        if (!physical(output)) continue;
+        if (device.setTopology({{output.m_device_id}}) && active(device.enumAvailableDevices())) {
+          BOOST_LOG(info) << "Virtual display cleanup: emergency recovery activated a physical monitor.";
+          return true;
+        }
+      }
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "Virtual display cleanup: emergency physical recovery failed: " << e.what();
+    } catch (...) {
+      BOOST_LOG(warning) << "Virtual display cleanup: emergency physical recovery failed.";
+    }
+    return false;
+  }
+
+  cleanup_result_t terminate_all(const std::string_view reason) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(false);
+    if (!borrowed_output_mutation) return {};
+    std::lock_guard terminal_lock {g_terminal_cleanup_mutex};
+    cleanup_reservation_t cleanup_reservation;
+    // A previous ordinary cleanup may have queued a restore behind the same
+    // managed-owner gate this terminal action intentionally overrides. This
+    // action consumes that intent now, so it must not fire again later.
+    proc::clear_deferred_display_revert();
+    auto result = run(
+      reason,
+      true,
+      revert_order_t::remove_before_restore,
+      true,
+      std::nullopt,
+      recovery_monitor_policy_t::disengage_before_admission,
+      cleanup_admission_policy_t::override_managed_owners
+    );
+
+    // A terminal user action must also end the helper restart loop. Forced
+    // stop is safe here because run() has already completed the synchronous
+    // REVERT attempt and display teardown. Closing the driver transport stops
+    // its ping/watchdog worker; a later new session may open it again.
+    VDISPLAY::closeVDisplayDevice();
+    display_helper_integration::stop_watchdog(true);
+    if (result.virtual_displays_removed) {
+      result.physical_display_recovered = display_helper_integration::run_terminal_physical_recovery([&] {
+        return recover_emergency_physical_display(result.database_restore_applied);
+      });
+    }
+    BOOST_LOG(info) << "Virtual display cleanup: terminal driver and helper watchdog shutdown completed (reason="
+                    << (reason.empty() ? "unspecified" : std::string(reason)) << ").";
     return result;
   }
 

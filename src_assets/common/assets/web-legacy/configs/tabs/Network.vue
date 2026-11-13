@@ -182,10 +182,16 @@ const effectivePort = computed(() => Number(config.port ?? defaultMoonlightPort)
       class="mb-6"
     />
     <ConfigFieldRenderer setting-key="ping_timeout" v-model="config.ping_timeout" class="mb-6" />
+    <ConfigFieldRenderer setting-key="control_peer_timeout" v-model="config.control_peer_timeout" class="mb-6" />
 
     <ConfigFieldRenderer
       setting-key="video_max_batch_size_kb"
       v-model="config.video_max_batch_size_kb"
+      class="mb-6"
+    />
+    <ConfigFieldRenderer
+      setting-key="pyrowave_critical_fec_percentage"
+      v-model="config.pyrowave_critical_fec_percentage"
       class="mb-6"
     />
   </div>

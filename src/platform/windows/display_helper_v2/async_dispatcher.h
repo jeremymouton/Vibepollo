@@ -126,6 +126,7 @@ namespace display_helper::v2 {
 
   private:
     void enqueue_task(std::function<void()> task);
+    void enqueue_operation(std::function<void()> task, std::function<void()> report_failure);
     void enqueue_delayed_task(std::function<void(std::stop_token)> task);
     void worker_loop(std::stop_token st);
     void timer_loop(std::stop_token st);
@@ -142,8 +143,8 @@ namespace display_helper::v2 {
     std::deque<std::function<void()>> tasks_;
     std::jthread worker_;
 
-    // Delays are scheduled off the serialized mutation worker. A 5.5-second
-    // HDR settling check must not block an immediate refresh or RESET command.
+    // Delays are scheduled off the serialized mutation worker. A disconnected
+    // session's bounded verification must not block refresh or RESET commands.
     std::mutex timer_mutex_;
     std::condition_variable timer_cv_;
     std::deque<std::function<void(std::stop_token)>> timer_tasks_;

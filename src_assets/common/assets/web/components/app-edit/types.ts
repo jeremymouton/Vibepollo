@@ -65,6 +65,7 @@ export interface AppForm {
   excludeGlobalStateCmd: boolean;
   configOverrides: Record<string, unknown>;
   elevated: boolean;
+  dualsenseHaptics: boolean;
   autoDetach: boolean;
   waitAll: boolean;
   terminateOnPause: boolean;
@@ -99,6 +100,19 @@ export interface AppForm {
   rtxHdrSaturation: number;
   playniteId?: string | undefined;
   playniteManaged?: 'manual' | string | undefined;
+  'steam-id'?: string | undefined;
+  'steam-managed'?: 'auto' | 'manual' | string | undefined;
+  'steam-source'?: string | undefined;
+  'steam-install-dir'?: string | undefined;
+  'steam-library-path'?: string | undefined;
+  'steam-icon-path'?: string | undefined;
+  'steam-header-path'?: string | undefined;
+  'steam-boxart-path'?: string | undefined;
+  'steam-artwork-path'?: string | undefined;
+  'steam-artwork-client-path'?: string | undefined;
+  'steam-artwork-format'?: string | undefined;
+  'steam-artwork-client-compatible'?: boolean | undefined;
+  'steam-app-type'?: string | undefined;
   ddConfigurationOption?:
     | 'disabled'
     | 'verify_only'
@@ -120,6 +134,7 @@ export interface ServerApp {
   'exclude-global-prep-cmd'?: boolean;
   'config-overrides'?: Record<string, unknown>;
   elevated?: boolean;
+  'dualsense-haptics'?: boolean;
   'auto-detach'?: boolean;
   'wait-all'?: boolean;
   'exclude-global-state-cmd'?: boolean;

@@ -15,6 +15,9 @@
 #include <system_error>
 #include <vector>
 
+// lib includes
+#include <boost/asio/ip/address.hpp>
+
 // platform includes
 #include <WinSock2.h>
 #include <Windows.h>
@@ -23,8 +26,20 @@
 #include "utf_utils.h"
 
 namespace platf {
+  /// Interface resolved by routed_link_bps(), for diagnostics.
+  struct routed_link_info_t {
+    std::uint64_t luid = 0;
+    std::string alias;
+    unsigned long if_type = 0;
+    std::uint64_t transmit_bps = 0;
+  };
+
+  /// Current transmit speed of the routed interface, or zero when unavailable.
+  std::uint64_t routed_link_bps(const boost::asio::ip::address &source, const boost::asio::ip::address &target, routed_link_info_t *info = nullptr);
+
   void print_status(const std::string_view &prefix, HRESULT status);
-  HDESK syncThreadDesktop();
+  /// Bind the calling thread to the input desktop, retaining its owned handle.
+  bool syncThreadDesktop();
 
   int64_t qpc_counter();
 
@@ -66,12 +81,6 @@ namespace platf {
   bool is_lock_screen_active();
 
   /**
-   * @brief Check whether the active input desktop is the normal interactive desktop.
-   * @return true when the current desktop is Default, false otherwise.
-   */
-  bool is_default_input_desktop_active();
-
-  /**
    * @brief Cache the interactive user's screen saver enabled state before launching an app.
    * @details Repeated calls preserve the first captured value until it is restored.
    */
@@ -81,6 +90,10 @@ namespace platf {
    * @brief Restore the screen saver enabled state cached by cache_screen_saver_state().
    */
   void restore_screen_saver_state();
+
+  // Register a pause worker before restoring immediately. Invoke the returned
+  // completion once it exits, or if it cannot start; active resumes are kept.
+  std::function<void()> deferred_screen_saver_restore();
 
   /**
    * @brief Launch a process with user impersonation (for use when running as SYSTEM).
@@ -162,19 +175,27 @@ namespace platf {
   bool is_vigem_installed(std::string *version_out = nullptr);
 
   /**
+   * @brief Check whether Vibepollo's own virtual gamepad driver is usable.
+   * @details Probes the driver's private control interface, so it reports what a stream would
+   *          actually get rather than merely whether files are present.
+   * @return true when a virtual controller can be created without ViGEmBus.
+   */
+  bool is_virtual_gamepad_driver_available();
+
+  /**
    * @brief Check whether the Sunshine Vulkan HDR implicit layer is registered for the system.
-   * @details Reads HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers (64-bit view) and confirms a value
-   *          pointing at VkLayer_sunshine_hdr.json whose manifest still exists on disk.
-   * @return true if the implicit layer is registered and its manifest is present, false otherwise.
+   * @details Requires enabled DWORD values for the shipped x64 and x86 manifests in their
+   *          respective registry views, and both manifest/DLL pairs on disk.
+   * @return true if both architectures are registered and their payloads are present.
    */
   bool is_vulkan_hdr_layer_registered();
 
   /**
    * @brief Register or unregister the Sunshine Vulkan HDR implicit layer (system-wide, HKLM).
    * @details Registering writes the manifest path (shipped under drivers\sunshine\vulkan-layer) into
-   *          the 64-bit ImplicitLayers key; unregistering removes our manifest from both registry
-   *          views. Requires administrative/SYSTEM rights (best-effort otherwise). No-op when the
-   *          layer is already in the requested state.
+   *          each architecture's ImplicitLayers registry view; unregistering removes only our
+   *          manifest values from both views, including partial or stale registrations.
+   *          Requires administrative/SYSTEM rights (best-effort otherwise).
    * @param enabled true to register the layer, false to unregister it.
    * @return true on success (or when already in the desired state), false on failure.
    */
@@ -211,6 +232,7 @@ namespace platf {
     std::optional<LUID> luid;
     std::string description;
     std::string pnp_id;
+    std::uint32_t vendor_id = 0;
     std::uint64_t dedicated_video_memory = 0;
     std::uint64_t shared_system_memory = 0;
 

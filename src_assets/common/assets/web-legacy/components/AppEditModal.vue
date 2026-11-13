@@ -47,10 +47,10 @@
           </div>
           <div class="shrink-0">
             <span
-              v-if="isPlayniteManaged"
+              v-if="linkedLibraryLabel"
               class="inline-flex items-center px-2 py-0.5 rounded bg-primary/15 text-primary text-[11px] font-semibold"
             >
-              {{ t('apps.playnite_badge') }}
+              {{ linkedLibraryLabel }}
             </span>
             <span
               v-else
@@ -80,21 +80,17 @@
             v-model:form="form"
             v-model:cmd-text="cmdText"
             v-model:name-select-value="nameSelectValue"
-            v-model:selected-playnite-id="selectedPlayniteId"
             :is-playnite="isPlayniteManaged"
-            :show-playnite-picker="showPlaynitePicker"
-            :playnite-installed="playniteInstalled"
             :name-select-options="nameSelectOptions"
-            :games-loading="gamesLoading"
+            :games-loading="gamesLoading || otherGamesLoading"
+            :library-options="libraryOptions"
+            :selected-library-key="selectedLibraryKey"
+            :linked-library-label="linkedLibraryLabel"
+            @change-library="changeLibrary"
             :fallback-option="fallbackOption"
-            :playnite-options="playniteOptions"
-            :lock-playnite="lockPlaynite"
             @name-focus="onNameFocus"
             @name-search="onNameSearch"
             @name-picked="onNamePicked"
-            @load-playnite-games="loadPlayniteGames"
-            @pick-playnite="onPickPlaynite"
-            @unlock-playnite="unlockPlaynite"
             @open-cover-finder="openCoverFinder"
           />
 
@@ -105,9 +101,9 @@
             <n-checkbox v-if="!isPlayniteManaged" v-model:checked="form.autoDetach" size="small">
               {{ t('apps.auto_detach') }}
             </n-checkbox>
-            <n-checkbox v-if="!isPlayniteManaged" v-model:checked="form.waitAll" size="small"
-              >{{ t('apps.wait_all') }}</n-checkbox
-            >
+            <n-checkbox v-if="!isPlayniteManaged" v-model:checked="form.waitAll" size="small">{{
+              t('apps.wait_all')
+            }}</n-checkbox>
             <n-checkbox
               v-if="isWindows && !isPlayniteManaged"
               v-model:checked="form.elevated"
@@ -134,6 +130,17 @@
             </n-checkbox>
             <n-checkbox
               v-if="isWindows"
+              v-model:checked="form.dualsenseHaptics"
+              size="small"
+              class="md:col-span-2"
+            >
+              <div class="flex flex-col">
+                <span>{{ t('apps.dualsense_haptics') }}</span>
+                <span class="text-[11px] opacity-60">{{ t('apps.dualsense_haptics_desc') }}</span>
+              </div>
+            </n-checkbox>
+            <n-checkbox
+              v-if="isWindows && !isRemoteMonitor"
               v-model:checked="displayOverrideEnabled"
               size="small"
               class="md:col-span-2"
@@ -148,7 +155,20 @@
           </div>
 
           <div
-            v-if="isWindows && displayOverrideEnabled"
+            v-if="isRemoteMonitor"
+            class="space-y-2 rounded-xl border border-primary/20 bg-primary/5 p-4"
+            role="note"
+          >
+            <h3 class="font-semibold">{{ t('config.remote_monitor_display_title') }}</h3>
+            <p>{{ t('config.remote_monitor_display_description') }}</p>
+            <p>{{ t('config.remote_monitor_display_limits') }}</p>
+            <a href="/v2/devices" class="text-primary underline">
+              {{ t('config.remote_monitor_display_layout_action') }}
+            </a>
+          </div>
+
+          <div
+            v-if="isWindows && !isRemoteMonitor && displayOverrideEnabled"
             class="space-y-5 rounded-xl border border-dark/10 dark:border-light/10 bg-light/60 dark:bg-dark/40 p-4"
           >
             <div class="space-y-2">
@@ -241,7 +261,7 @@
               </div>
             </div>
 
-            <div v-if="displaySelection === 'physical'" class="space-y-3">
+            <div class="space-y-3">
               <div class="flex items-center justify-between gap-3">
                 <span class="text-xs font-semibold uppercase tracking-wide opacity-70">
                   {{ t('config.dd_config_label') }}
@@ -256,6 +276,23 @@
                 </n-button>
               </div>
               <p class="text-[11px] opacity-70">{{ t('config.dd_config_hint') }}</p>
+              <p v-if="displaySelection === 'virtual'" class="text-[11px] opacity-70">
+                {{ t('config.app_virtual_display_layout_action_hint') }}
+              </p>
+              <p v-if="displaySelection === 'virtual' && effectiveAppDisplayAction === 'verify_only'">
+                {{ t('config.app_virtual_display_verify_override') }}
+              </p>
+              <div
+                v-if="virtualDisplayLayoutBlocked"
+                role="alert"
+                data-testid="app-display-layout-conflict"
+                class="space-y-2 rounded-md border border-amber-500 p-3"
+              >
+                <p>{{ t('config.app_virtual_display_layout_blocked') }}</p>
+                <n-button size="small" @click="form.ddConfigurationOption = 'ensure_active'">
+                  {{ t('config.app_virtual_display_layout_enable') }}
+                </n-button>
+              </div>
               <n-radio-group v-model:value="form.ddConfigurationOption" class="grid gap-2">
                 <n-radio
                   v-for="opt in appDdConfigurationOptions"
@@ -326,9 +363,7 @@
               </div>
               <n-radio-group
                 :value="resolvedVirtualDisplayLayout"
-                @update:value="
-                  (v) => (form.virtualDisplayLayout = v === globalVirtualDisplayLayout ? null : v)
-                "
+                @update:value="selectVirtualDisplayLayout"
                 class="space-y-4"
               >
                 <div
@@ -341,7 +376,7 @@
                   tabindex="0"
                 >
                   <div class="flex items-center gap-3">
-                    <n-radio :value="option.value" />
+                    <n-radio :value="option.value" :aria-label="option.label" />
                     <span class="text-sm font-semibold">{{ option.label }}</span>
                   </div>
                   <span class="text-[11px] opacity-70 leading-snug ml-6">{{
@@ -352,8 +387,24 @@
             </div>
           </div>
 
+          <div class="space-y-2">
+            <label for="app-prefer-10bit-sdr" class="block text-sm font-semibold">
+              {{ t('config.prefer_10bit_sdr') }}
+            </label>
+            <select
+              id="app-prefer-10bit-sdr"
+              v-model="form.prefer10BitSdr"
+              class="w-full rounded-md border border-dark/20 dark:border-light/20 bg-light dark:bg-surface p-2"
+            >
+              <option :value="null">{{ t('config.app_prefer_10bit_sdr_inherit') }}</option>
+              <option :value="true">{{ t('_common.enabled') }}</option>
+              <option :value="false">{{ t('_common.disabled') }}</option>
+            </select>
+            <p class="text-[11px] opacity-70">{{ t('config.app_prefer_10bit_sdr_desc') }}</p>
+          </div>
+
           <AppEditRtxHdrSection
-            v-if="isWindows && hasNvidia"
+            v-if="(isWindows || isLinux) && hasNvidia && (!isLinux || rtxHdrSupported)"
             v-model:form="form"
             :live-status="liveRtxHdrStatus"
             :live-error="liveRtxHdrError"
@@ -375,7 +426,9 @@
             :health="frameGenHealth"
             :health-loading="frameGenHealthLoading"
             :health-error="frameGenHealthError"
+            :is-playnite-managed="isPlayniteManaged"
             :lossless-active="losslessFrameGenEnabled"
+            :lossless-scaling-enabled="form.losslessScalingEnabled"
             :nvidia-active="nvidiaFrameGenEnabled"
             :using-virtual-display="usingVirtualDisplay"
             :windows10="isWindows10"
@@ -395,7 +448,6 @@
             v-model:lossless-sharpening="losslessSharpeningModel"
             v-model:lossless-anime-size="losslessAnimeSizeModel"
             v-model:lossless-anime-vrs="losslessAnimeVrsModel"
-            :is-playnite-managed="isPlayniteManaged"
             :show-lossless-resolution="showLosslessResolution"
             :show-lossless-sharpening="showLosslessSharpening"
             :show-lossless-anime-options="showLosslessAnimeOptions"
@@ -504,6 +556,13 @@
 </template>
 
 <script setup lang="ts">
+import { providerSupported } from '../../web/utils/providerCapabilities';
+import { groupLibraryGames, providerLabels, type GameProvider } from '../utils/libraryGames';
+import {
+  isRemoteMonitorApplication,
+  preserveRemoteMonitorRouting,
+} from '../utils/remoteMonitorPolicy';
+import { preservePlayniteFullscreen } from '../utils/playniteFullscreenPolicy';
 import { computed, ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import { useMessage } from 'naive-ui';
 import { http } from '@/http';
@@ -581,6 +640,7 @@ const emit = defineEmits<{
   (e: 'deleted'): void;
 }>();
 const open = computed<boolean>(() => !!props.modelValue);
+const isRemoteMonitor = computed(() => isRemoteMonitorApplication(props.app));
 const message = useMessage();
 const { t } = useI18n();
 function fresh(): AppForm {
@@ -596,6 +656,7 @@ function fresh(): AppForm {
     excludeGlobalStateCmd: false,
     configOverrides: {},
     elevated: false,
+    dualsenseHaptics: false,
     autoDetach: true,
     waitAll: true,
     terminateOnPause: false,
@@ -610,6 +671,8 @@ function fresh(): AppForm {
     stateCmd: [],
     detached: [],
     virtualScreen: false,
+    prefer10BitSdr: null,
+    commandOutput: '',
     output: '',
     frameGenerationProvider: 'game-provided',
     frameGenerationMode: 'off',
@@ -920,8 +983,8 @@ function fromServerApp(src?: ServerApp | null, idx: number = -1): AppForm {
       ? (frameGenerationModeFromConfig as FrameGenerationProvider)
       : normalizedProvider;
   const hasDisplayOutput = Object.prototype.hasOwnProperty.call(src, 'display-output');
-  const rawOutput = String(hasDisplayOutput ? ((src as any)['display-output'] ?? '') : (src.output ?? ''));
-  const rawVirtualScreen = src['virtual-screen'];
+  const rawOutput = String(hasDisplayOutput ? ((src as any)['display-output'] ?? '') : '');
+  const rawVirtualScreen = (src as any)?.['virtual-screen'];
   const virtualScreen =
     typeof rawVirtualScreen === 'boolean'
       ? rawVirtualScreen
@@ -954,7 +1017,8 @@ function fromServerApp(src?: ServerApp | null, idx: number = -1): AppForm {
     index: idx,
     uuid: typeof src.uuid === 'string' ? src.uuid : undefined,
     name: String(src.name ?? ''),
-    output: rawOutput,
+    commandOutput: String(src.output ?? ''),
+    output: sanitizedOutput,
     cmd: String(cmdStr ?? ''),
     workingDir: String(src['working-dir'] ?? ''),
     imagePath: String(src['image-path'] ?? ''),
@@ -963,6 +1027,7 @@ function fromServerApp(src?: ServerApp | null, idx: number = -1): AppForm {
     excludeGlobalStateCmd: !!src['exclude-global-state-cmd'],
     configOverrides: rtxHdrOverrides.rest,
     elevated: !!src.elevated,
+    dualsenseHaptics: !!src['dualsense-haptics'],
     autoDetach: src['auto-detach'] !== undefined ? !!src['auto-detach'] : base.autoDetach,
     waitAll: src['wait-all'] !== undefined ? !!src['wait-all'] : base.waitAll,
     terminateOnPause:
@@ -987,6 +1052,9 @@ function fromServerApp(src?: ServerApp | null, idx: number = -1): AppForm {
     stateCmd: state,
     detached: Array.isArray(src.detached) ? src.detached.map((s) => String(s)) : [],
     virtualScreen,
+    providerFields: Object.fromEntries(
+      Object.entries(src).filter(([key]) => key.startsWith('steam-') || key.startsWith('lutris-')),
+    ),
     playniteId: src['playnite-id'] || undefined,
     playniteManaged: src['playnite-managed'] || undefined,
     frameGenerationProvider,
@@ -998,6 +1066,7 @@ function fromServerApp(src?: ServerApp | null, idx: number = -1): AppForm {
     losslessScalingProfile: profileKey,
     losslessScalingProfiles: losslessProfiles,
     losslessScalingLaunchDelay: lsLaunchDelay,
+    prefer10BitSdr: typeof src?.['prefer-10bit-sdr'] === 'boolean' ? src['prefer-10bit-sdr'] : null,
     rtxHdrMode: rtxHdrOverrides.mode,
     rtxHdrValuesOverride: rtxHdrOverrides.valuesOverride,
     rtxHdrForceSdr: rtxHdrOverrides.forceSdr,
@@ -1018,6 +1087,7 @@ function toServerPayload(f: AppForm): Record<string, any> {
     // Index is required by the backend to determine add (-1) vs update (>= 0)
     index: typeof f.index === 'number' ? f.index : -1,
     name: f.name,
+    ...(f.commandOutput ? { output: f.commandOutput } : {}),
     cmd: f.cmd,
     'working-dir': f.workingDir,
     'image-path': String(f.imagePath || '').replace(/\"/g, ''),
@@ -1027,6 +1097,7 @@ function toServerPayload(f: AppForm): Record<string, any> {
       ? { 'config-overrides': configOverridesPayload }
       : {}),
     elevated: !!f.elevated,
+    'dualsense-haptics': !!f.dualsenseHaptics,
     'auto-detach': !!f.autoDetach,
     'wait-all': !!f.waitAll,
     'terminate-on-pause': !!f.terminateOnPause,
@@ -1051,7 +1122,6 @@ function toServerPayload(f: AppForm): Record<string, any> {
       ...(isWindows.value ? { elevated: !!p.elevated } : {}),
     })),
     detached: Array.isArray(f.detached) ? f.detached : [],
-    // Leave 'virtual-screen' to be persisted only if explicitly different from the global setting.
   };
 
   // Include uuid to enable backend UUID-matching for updates
@@ -1059,16 +1129,17 @@ function toServerPayload(f: AppForm): Record<string, any> {
     payload['uuid'] = f.uuid;
   }
 
-  // Only persist virtual display mode/layout if explicitly set and different from global defaults
-  const _globalVDMode = globalVirtualDisplayMode.value;
-  const _globalVDLayout = globalVirtualDisplayLayout.value;
-  const _globalOutput = globalOutputName.value;
-  if (f.virtualDisplayMode !== null && f.virtualDisplayMode !== _globalVDMode) {
+  if (f.prefer10BitSdr !== null) {
+    payload['prefer-10bit-sdr'] = f.prefer10BitSdr;
+  }
+  // Explicit per-game choices must survive later changes to the host defaults.
+  if (f.virtualDisplayMode !== null) {
     payload['virtual-display-mode'] = f.virtualDisplayMode;
   }
-  if (f.virtualDisplayLayout !== null && f.virtualDisplayLayout !== _globalVDLayout) {
+  if (f.virtualDisplayLayout !== null) {
     payload['virtual-display-layout'] = f.virtualDisplayLayout;
   }
+  Object.assign(payload, f.providerFields ?? {});
   if (f.playniteId) payload['playnite-id'] = f.playniteId;
   if (f.playniteManaged) payload['playnite-managed'] = f.playniteManaged;
   if (f.playniteIconPath) payload['playnite-icon-path'] = f.playniteIconPath;
@@ -1141,14 +1212,14 @@ function toServerPayload(f: AppForm): Record<string, any> {
     payload['display-output'] = typeof f.output === 'string' ? f.output.trim() : '';
   }
 
-  // Only persist virtual-screen if it differs from the global virtual output flag.
-  const globalIsVirtual = _globalOutput === VIRTUAL_DISPLAY_SELECTION;
-  if (!!f.virtualScreen !== globalIsVirtual) {
-    payload['virtual-screen'] = !!f.virtualScreen;
+  if (selection !== 'global') {
+    payload['virtual-screen'] = selection === 'virtual';
   }
   if (f.ddConfigurationOption) {
     payload['dd-configuration-option'] = f.ddConfigurationOption;
   }
+  preserveRemoteMonitorRouting(props.app, payload);
+  preservePlayniteFullscreen(props.app, payload);
   return payload;
 }
 let liveRtxHdrSuppress = false;
@@ -1198,21 +1269,21 @@ const headerArtworkKey = computed(() => {
       '',
   );
   const appAny = props.app as any;
-  return `${identity}|${form.value.playniteIconPath || ''}|${appAny?.['playnite-icon-version'] || ''}`;
+  return `${identity}|${form.value.playniteIconPath || form.value.imagePath || ''}|${appAny?.['playnite-icon-version'] || appAny?.['image-version'] || ''}`;
 });
 const headerArtworkUrl = computed(() => {
   const uuid = String((props.app as ServerApp | null | undefined)?.uuid || '');
   if (!uuid) return '';
   const appAny = props.app as any;
-  const version = appAny?.['playnite-icon-version'];
-  const base = `/api/apps/${encodeURIComponent(uuid)}/icon`;
+  const icon = !!form.value.playniteIconPath;
+  const version = appAny?.[icon ? 'playnite-icon-version' : 'image-version'];
+  const base = `/api/apps/${encodeURIComponent(uuid)}/${icon ? 'icon' : 'cover'}`;
   return version ? `${base}?v=${version}` : base;
 });
 const hasHeaderArtwork = computed(
   () =>
-    isPlayniteManaged.value &&
     !!headerArtworkUrl.value &&
-    !!form.value.playniteIconPath &&
+    !!(form.value.playniteIconPath || form.value.imagePath) &&
     !headerArtworkFailed.value,
 );
 watch(headerArtworkKey, () => {
@@ -1678,64 +1749,193 @@ function resetActiveLosslessProfile(): void {
   overrides.anime4kSize = null;
   overrides.anime4kVrs = null;
 }
-// Unified name combobox state (supports Playnite suggestions + free-form)
-const nameSelectValue = ref<string>('');
-const nameOptions = ref<{ label: string; value: string }[]>([]);
-const fallbackOption = (value: unknown) => {
-  const v = String(value ?? '');
-  const label = String(form.value.name || '').trim() || v;
-  return { label, value: v };
+type LegacyLibraryEntry = {
+  provider: GameProvider;
+  id: string;
+  name: string;
+  game: Record<string, any>;
 };
+const otherLibraryGames = ref<LegacyLibraryEntry[]>([]);
+const otherGamesLoading = ref(false);
+const otherGamesLoaded = ref(false);
+const libraryEntries = computed<LegacyLibraryEntry[]>(() => [
+  ...playniteOptions.value.map((option) => ({
+    provider: 'playnite' as const,
+    id: option.value,
+    name: option.label,
+    game: {},
+  })),
+  ...otherLibraryGames.value,
+]);
+const nameSelectValue = ref<string>('');
 const nameSearchQuery = ref('');
+let selectedSteamCoverRequest: Promise<void> | undefined;
 const nameSelectOptions = computed(() => {
-  // Prefer dynamically built options (from search)
-  if (nameOptions.value.length) return nameOptions.value;
-  const list: { label: string; value: string }[] = [];
-  const cur = String(form.value.name || '').trim();
-  if (cur)
-    list.push({
-      label: t('apps.source_custom_named', { name: cur }),
-      value: `__custom__:${cur}`,
+  const groups = groupLibraryGames(libraryEntries.value, nameSearchQuery.value).slice(0, 100);
+  const options = groups.map((group) => ({
+    label:
+      group.name +
+      ' — ' +
+      [...new Set(group.entries.map((entry) => providerLabels[entry.provider]))].join(' · '),
+    value: '__library__:' + group.key,
+  }));
+  const custom = nameSearchQuery.value.trim() || form.value.name.trim();
+  if (custom)
+    options.push({
+      label: t('apps.source_custom_named', { name: custom }),
+      value: '__custom__:' + custom,
     });
-  if (playniteOptions.value.length) {
-    list.push(...playniteOptions.value.slice(0, 20));
-  }
-  return list;
+  return options;
 });
+const fallbackOption = (value: unknown) => ({
+  label: form.value.name || String(value ?? ''),
+  value: String(value ?? ''),
+});
+const selectedLibraryKey = computed(() =>
+  form.value.playniteId
+    ? 'playnite:' + form.value.playniteId
+    : form.value.providerFields?.['steam-id']
+      ? 'steam:' + form.value.providerFields['steam-id']
+      : form.value.providerFields?.['lutris-id']
+        ? 'lutris:' + form.value.providerFields['lutris-id']
+        : '',
+);
+const selectedLibraryAlternatives = computed(
+  () =>
+    groupLibraryGames(libraryEntries.value).find((group) =>
+      group.entries.some((entry) => entry.provider + ':' + entry.id === selectedLibraryKey.value),
+    )?.entries ?? [],
+);
+const libraryOptions = computed(() =>
+  selectedLibraryAlternatives.value.map((entry) => ({
+    label: providerLabels[entry.provider],
+    value: entry.provider + ':' + entry.id,
+  })),
+);
+const linkedLibraryLabel = computed(() =>
+  selectedLibraryKey.value
+    ? providerLabels[selectedLibraryKey.value.split(':')[0] as GameProvider]
+    : '',
+);
 
-// Populate suggestions immediately on focus so dropdown isn't empty
-async function onNameFocus() {
-  // Show a friendly placeholder immediately to avoid "No Data"
-  if (!playniteOptions.value.length) {
-    nameOptions.value = [
-      { label: t('apps.loading'), value: '__loading__', disabled: true } as any,
-    ];
+async function loadOtherLibraries() {
+  if (otherGamesLoading.value || otherGamesLoaded.value) return;
+  otherGamesLoading.value = true;
+  const providers = (['steam', 'lutris'] as GameProvider[]).filter((provider) => providerSupported(configStore.metadata, provider));
+  try {
+    const results = await Promise.allSettled(
+      providers.map(async (provider) => {
+        const response = await http.get('/api/' + provider + '/games');
+        if (response.data?.enabled === false) return [];
+        const games: Record<string, any>[] = Array.isArray(response.data)
+          ? response.data
+          : (response.data?.games ?? []);
+        return games
+          .filter((game) => !game['filtered'] && (provider !== 'steam' || game['installed']))
+          .map((game) => ({
+            provider,
+            id: String(game['steam_id'] ?? game['appid'] ?? game['lutris_id'] ?? game['id'] ?? ''),
+            name: String(game['name'] ?? ''),
+            game,
+          }))
+          .filter((entry) => entry.id && entry.name);
+      }),
+    );
+    otherLibraryGames.value = results.flatMap((result) =>
+      result.status === 'fulfilled' ? result.value : [],
+    );
+    otherGamesLoaded.value = results.every((result) => result.status === 'fulfilled');
+  } finally {
+    otherGamesLoading.value = false;
   }
-  // Kick off loading (don’t block the UI), then refresh list
-  loadPlayniteGames()
-    .catch(() => {})
-    .finally(() => {
-      onNameSearch(nameSearchQuery.value);
-    });
 }
-
+async function onNameFocus() {
+  await Promise.allSettled([loadPlayniteGames(), loadOtherLibraries()]);
+}
 function ensureNameSelectionFromForm() {
-  const currentName = String(form.value.name || '').trim();
-  const opts: { label: string; value: string }[] = [];
-  if (currentName) {
-    opts.push({
-      label: t('apps.source_custom_named', { name: currentName }),
-      value: `__custom__:${currentName}`,
-    });
+  const group = groupLibraryGames(libraryEntries.value).find((group) =>
+    group.entries.some((entry) => entry.provider + ':' + entry.id === selectedLibraryKey.value),
+  );
+  nameSelectValue.value = group
+    ? '__library__:' + group.key
+    : form.value.name
+      ? '__custom__:' + form.value.name
+      : '';
+}
+function clearLibraryLinks() {
+  form.value.playniteId = undefined;
+  form.value.playniteManaged = undefined;
+  form.value.playniteIconPath = '';
+  form.value.providerFields = {};
+}
+function selectLibraryEntry(entry: LegacyLibraryEntry) {
+  clearLibraryLinks();
+  form.value.name = entry.name;
+  form.value.cmd = '';
+  form.value.workingDir = '';
+  form.value.imagePath = '';
+  if (entry.provider === 'playnite') onPickPlaynite(entry.id);
+  else {
+    const game = entry.game;
+    const fields: Record<string, unknown> = {
+      [entry.provider + '-id']: entry.id,
+      [entry.provider + '-managed']: 'manual',
+    };
+    form.value.autoDetach = true;
+    form.value.waitAll = false;
+    if (entry.provider === 'steam') {
+      const uri = game['launch_uri'] || 'steam://rungameid/' + entry.id;
+      form.value.cmd = isWindows.value ? 'cmd /c start "" ' + uri : 'xdg-open ' + uri;
+      form.value.workingDir = game['install_dir'] || '';
+      form.value.imagePath = game['artwork_client_path'] || './assets/steam.png';
+      for (const key of [
+        'install_dir',
+        'library_path',
+        'icon_path',
+        'header_path',
+        'boxart_path',
+        'artwork_path',
+        'artwork_client_path',
+        'artwork_format',
+        'app_type',
+      ]) {
+        if (game[key]) fields['steam-' + key.replaceAll('_', '-')] = game[key];
+      }
+      fields['steam-source'] = 'installed';
+      if (game['artwork_client_path']) fields['steam-artwork-client-compatible'] = true;
+      else selectedSteamCoverRequest = loadSelectedSteamCover(entry.id);
+    } else {
+      form.value.cmd = 'lutris ' + (game['launch_uri'] || 'lutris:rungameid/' + entry.id);
+      form.value.workingDir = game['directory'] || '';
+      form.value.imagePath = game['image_path'] || './assets/box.png';
+      for (const key of ['slug', 'runner', 'platform', 'directory', 'service', 'service_id']) {
+        if (game[key]) fields['lutris-' + key.replaceAll('_', '-')] = game[key];
+      }
+    }
+    form.value.providerFields = fields;
   }
-  const pid = form.value.playniteId;
-  if (pid) {
-    const found = playniteOptions.value.find((o) => o.value === String(pid));
-    if (found) opts.push(found);
-    else if (currentName) opts.push({ label: currentName, value: String(pid) });
-  }
-  nameOptions.value = opts;
-  nameSelectValue.value = pid ? String(pid) : currentName ? `__custom__:${currentName}` : '';
+  ensureNameSelectionFromForm();
+}
+async function loadSelectedSteamCover(id: string) {
+  try {
+    const response = await http.get('/api/steam/games', { params: { appid: id } });
+    const game = response.data?.games?.[0];
+    if (
+      form.value.providerFields?.['steam-id'] !== id ||
+      form.value.imagePath !== './assets/steam.png' ||
+      !game?.artwork_client_path
+    )
+      return;
+    form.value.imagePath = game['artwork_client_path'];
+    form.value.providerFields['steam-artwork-client-path'] = game['artwork_client_path'];
+    form.value.providerFields['steam-artwork-client-compatible'] = true;
+  } catch {}
+}
+function changeLibrary(key: string) {
+  const entry = selectedLibraryAlternatives.value.find(
+    (entry) => entry.provider + ':' + entry.id === key,
+  );
+  if (entry) selectLibraryEntry(entry);
 }
 
 async function close(options: { rollbackLiveRtxHdr?: boolean } = {}) {
@@ -1899,6 +2099,7 @@ const platformName = computed(() => (configStore.metadata?.platform || '').toLow
 const isWindows = computed(() => platformName.value === 'windows');
 const isLinux = computed(() => platformName.value === 'linux');
 const isMac = computed(() => platformName.value === 'macos');
+const rtxHdrSupported = computed(() => (configStore.metadata as any)?.rtx_hdr_supported === true);
 const gamepadOptions = computed(() => {
   const options = [
     { label: 'Default (Global)', value: '' },
@@ -1984,10 +2185,33 @@ const appDdConfigurationOptions = computed(() => [
   { label: t('config.dd_config_ensure_only_display') as string, value: 'ensure_only_display' },
 ]);
 
+const effectiveAppDisplayAction = computed(() =>
+  form.value.ddConfigurationOption ||
+  form.value.configOverrides?.dd_configuration_option ||
+  (configStore.config as any)?.dd_configuration_option ||
+  'verify_only',
+);
+
+const virtualDisplayLayoutBlocked = computed(() => {
+  const action = effectiveAppDisplayAction.value;
+  return (
+    displaySelection.value === 'virtual' &&
+    resolvedVirtualDisplayLayout.value !== 'exclusive' &&
+    action === 'disabled'
+  );
+});
+
 function selectVirtualDisplayLayout(v: unknown) {
   const sv = String(v).trim().toLowerCase();
   if (APP_VIRTUAL_DISPLAY_LAYOUTS.includes(sv as AppVirtualDisplayLayout)) {
     form.value.virtualDisplayLayout = sv as AppVirtualDisplayLayout;
+    // Only a user layout selection enables preparation; hydration preserves saved policy.
+    if (
+      !form.value.ddConfigurationOption ||
+      ['verify_only', 'disabled'].includes(form.value.ddConfigurationOption)
+    ) {
+      form.value.ddConfigurationOption = 'ensure_active';
+    }
   }
 }
 const lastPhysicalOutput = ref('');
@@ -1995,7 +2219,6 @@ const lastVirtualDisplayMode = ref<AppVirtualDisplayMode | null>(null);
 const displaySelection = computed<DisplaySelection>({
   get: () => {
     const currentOutput = typeof form.value.output === 'string' ? form.value.output.trim() : '';
-    const globalMode = globalVirtualDisplayMode.value;
     const appMode = form.value.virtualDisplayMode;
     if (form.value.virtualScreen || form.value.output === VIRTUAL_DISPLAY_SELECTION) {
       return 'virtual';
@@ -2006,7 +2229,7 @@ const displaySelection = computed<DisplaySelection>({
     if (appMode === 'disabled') {
       return 'physical';
     }
-    if (appMode !== null && appMode !== globalMode) {
+    if (appMode !== null) {
       return 'virtual';
     }
     return 'global';
@@ -2015,11 +2238,9 @@ const displaySelection = computed<DisplaySelection>({
     if (selection === 'virtual') {
       form.value.virtualScreen = true;
       if (form.value.virtualDisplayMode === 'disabled') {
-        form.value.virtualDisplayMode =
-          lastVirtualDisplayMode.value ?? globalVirtualDisplayMode.value ?? null;
+        form.value.virtualDisplayMode = lastVirtualDisplayMode.value ?? 'per_client';
       }
       form.value.output = '';
-      form.value.ddConfigurationOption = null;
     } else if (selection === 'physical') {
       if (form.value.virtualDisplayMode && form.value.virtualDisplayMode !== 'disabled') {
         lastVirtualDisplayMode.value = form.value.virtualDisplayMode;
@@ -2265,9 +2486,6 @@ watch(open, (o) => {
       liveRtxHdrSuppress = false;
       formHydratingFromServer = false;
     });
-    selectedPlayniteId.value = '';
-    lockPlaynite.value = false;
-    newAppSource.value = 'custom';
     refreshPlayniteStatus().then(() => {
       if (playniteInstalled.value) void loadPlayniteGames();
     });
@@ -2696,9 +2914,12 @@ async function refreshFrameGenHealth(options: FrameGenHealthOptions = {}): Promi
                       hz: Math.round(highestSupported),
                     });
                   } else if (deltaSupported && highestSupported !== null) {
-                    displayMessage += ` ${t('apps.framegen.health_display_switch_when_stream_starts', {
-                      hz: Math.round(highestSupported),
-                    })}`;
+                    displayMessage += ` ${t(
+                      'apps.framegen.health_display_switch_when_stream_starts',
+                      {
+                        hz: Math.round(highestSupported),
+                      },
+                    )}`;
                   }
                 } else if (!hasActive && highestSupported !== null) {
                   displayMessage = t('apps.framegen.health_display_double_120', {
@@ -2884,19 +3105,11 @@ function handleEnableVirtualScreen() {
 }
 
 const playniteInstalled = ref(false);
-const APP_UUID_RE = /^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$/;
 const isNew = computed(() => !form.value.uuid && form.value.index < 0);
-// New app source: 'custom' or 'playnite' (Windows only)
-const newAppSource = ref<'custom' | 'playnite'>('custom');
-const showPlaynitePicker = computed(
-  () => isNew.value && isWindows.value && newAppSource.value === 'playnite',
-);
-
+const APP_UUID_RE = /^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$/;
 // Playnite picker state
 const gamesLoading = ref(false);
 const playniteOptions = ref<{ label: string; value: string }[]>([]);
-const selectedPlayniteId = ref('');
-const lockPlaynite = ref(false);
 
 function deleteTargetForForm(f: AppForm): string {
   const uuid = String(f.uuid || '').trim();
@@ -2931,6 +3144,7 @@ async function loadPlayniteGames() {
 }
 
 async function refreshPlayniteStatus() {
+  if (!isWindows.value) return;
   try {
     const r = await http.get('/api/playnite/status', { validateStatus: () => true });
     if (r.status === 200 && r.data && typeof r.data === 'object' && r.data !== null) {
@@ -2950,22 +3164,9 @@ function onPickPlaynite(id: string) {
   form.value.playniteManaged = 'manual';
   // clear command by default for Playnite managed entries
   if (!form.value.cmd) form.value.cmd = '';
-  lockPlaynite.value = true;
   // Reflect selection in unified combobox
   ensureNameSelectionFromForm();
 }
-function unlockPlaynite() {
-  lockPlaynite.value = false;
-}
-// When switching to custom source, clear Playnite-specific markers
-watch(newAppSource, (v) => {
-  if (v === 'custom') {
-    form.value.playniteId = undefined;
-    form.value.playniteManaged = undefined;
-    lockPlaynite.value = false;
-    selectedPlayniteId.value = '';
-  }
-});
 watch(
   () => displaySelection.value,
   (selection, prev) => {
@@ -3068,53 +3269,18 @@ onBeforeUnmount(() => {
   ro = null;
 });
 
-// Update name options while user searches
-function onNameSearch(q: string) {
-  nameSearchQuery.value = q || '';
-  const query = String(q || '')
-    .trim()
-    .toLowerCase();
-  const list: { label: string; value: string }[] = [];
-  if (query.length) {
-    list.push({ label: t('apps.source_custom_named', { name: q }), value: `__custom__:${q}` });
-  } else {
-    const cur = String(form.value.name || '').trim();
-    if (cur)
-      list.push({ label: t('apps.source_custom_named', { name: cur }), value: `__custom__:${cur}` });
-  }
-  if (playniteOptions.value.length) {
-    const filtered = (
-      query
-        ? playniteOptions.value.filter((o) => o.label.toLowerCase().includes(query))
-        : playniteOptions.value.slice(0, 100)
-    ).slice(0, 100);
-    list.push(...filtered);
-  }
-  nameOptions.value = list;
+function onNameSearch(query: string) {
+  nameSearchQuery.value = query || '';
 }
-
-// Handle picking either a Playnite game or a custom name
-function onNamePicked(val: string | null) {
-  const v = String(val || '');
-  if (!v) {
-    nameSelectValue.value = '';
-    form.value.name = '';
-    form.value.playniteId = undefined;
-    form.value.playniteManaged = undefined;
-    return;
-  }
-  if (v.startsWith('__custom__:')) {
-    const name = v.substring('__custom__:'.length).trim();
-    form.value.name = name;
-    form.value.playniteId = undefined;
-    form.value.playniteManaged = undefined;
-    return;
-  }
-  const opt = playniteOptions.value.find((o) => o.value === v);
-  if (opt) {
-    form.value.name = opt.label;
-    form.value.playniteId = v;
-    form.value.playniteManaged = 'manual';
+function onNamePicked(value: string | null) {
+  if (value?.startsWith('__library__:')) {
+    const group = groupLibraryGames(libraryEntries.value).find(
+      (group) => group.key === value.slice('__library__:'.length),
+    );
+    if (group?.entries[0]) selectLibraryEntry(group.entries[0]);
+  } else {
+    clearLibraryLinks();
+    form.value.name = value?.startsWith('__custom__:') ? value.slice('__custom__:'.length) : '';
   }
 }
 
@@ -3122,25 +3288,7 @@ function onNamePicked(val: string | null) {
 async function save() {
   saving.value = true;
   try {
-    // If on Windows and name exactly matches a Playnite game, auto-link it
-    try {
-      if (
-        isWindows.value &&
-        !form.value.playniteId &&
-        Array.isArray(playniteOptions.value) &&
-        playniteOptions.value.length &&
-        typeof form.value.name === 'string'
-      ) {
-        const target = String(form.value.name || '')
-          .trim()
-          .toLowerCase();
-        const exact = playniteOptions.value.find((o) => o.label.trim().toLowerCase() === target);
-        if (exact) {
-          form.value.playniteId = exact.value;
-          form.value.playniteManaged = 'manual';
-        }
-      }
-    } catch (_) {}
+    await selectedSteamCoverRequest;
     const payload = toServerPayload(form.value);
     const response = await http.post('./api/apps', payload, {
       headers: { 'Content-Type': 'application/json' },
@@ -3218,9 +3366,7 @@ async function del() {
           configStore.updateOption('playnite_fullscreen_entry_enabled', false);
         } catch {}
         try {
-          message?.info(
-            t('playnite.fullscreen_entry_removed'),
-          );
+          message?.info(t('playnite.fullscreen_entry_removed'));
         } catch {}
       }
     } catch {}

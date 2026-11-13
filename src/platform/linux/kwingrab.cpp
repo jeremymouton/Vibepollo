@@ -34,6 +34,9 @@
 #include "cuda.h"
 #include "graphics.h"
 #include "pipewire.cpp"
+#include "private_display.h"
+#include "private_display_capture_policy.h"
+#include "wayland_observation.h"
 #include "src/platform/common.h"
 #include "src/video.h"
 
@@ -323,6 +326,20 @@ namespace kwin {
       wl_display_roundtrip(wl_display);
 
       return 0;
+    }
+
+    /** Observe output publication without permission setup or blocking roundtrips. */
+    int init_until(
+      std::chrono::steady_clock::time_point deadline,
+      const std::function<bool()> &allowed
+    ) {
+      wl_display = platf::wayland_observation::connect_until(deadline, allowed);
+      if (!wl_display) return -1;
+      wl_registry = wl_display_get_registry(wl_display);
+      if (!wl_registry) return -1;
+      wl_registry_add_listener(wl_registry, &registry_listener, this);
+      return platf::wayland_observation::roundtrip_until(wl_display, deadline, allowed) &&
+             platf::wayland_observation::roundtrip_until(wl_display, deadline, allowed) ? 0 : -1;
     }
 
     /**
@@ -651,6 +668,7 @@ namespace kwin {
         out_pipewire_node = screencast->out_node_id;
         out_pipewire_objectserial = screencast->out_objectserial;
         // Set/update basic stream parameters on display_t
+        this->input_output_name = screencast->out_params->name;
         this->offset_x = screencast->out_params->pos_x;
         this->offset_y = screencast->out_params->pos_y;
         this->width = screencast->out_params->width;
@@ -683,7 +701,14 @@ namespace platf {
   }
 
   std::vector<std::string> kwin_display_names() {
-    if (has_elevated_privileges(false)) {
+    const bool retain_kms_capability =
+      platf::linux_private_display_capture::retain_kms_capability(
+        config::video.capture.empty() && linux_private_display::kernel_pool_available()
+      );
+    if (platf::linux_private_display_capture::use_dummy_compositor_names(
+          has_elevated_privileges(false),
+          retain_kms_capability
+        )) {
       // We're still in the probing phase of Sunshine startup. Dropping portal security early will break KMS.
       // Just return a dummy screen for now. Display re-enumeration after encoder probing will yield full result.
       std::vector<std::string> display_names;
@@ -691,10 +716,23 @@ namespace platf {
       return display_names;
     }
 
+    // Automatic managed display capture retains permitted CAP_SYS_ADMIN for future KMS use.
+    // Enumerate KWin directly in that case instead of returning dummy names
+    // forever merely because the permitted capability remains available.
+
     const auto screencast = std::make_unique<kwin::screencast_t>();
     if (screencast->init() < 0) {
       return {};
     }
+    return screencast->get_output_names();
+  }
+
+  std::vector<std::string> kwin_display_names_for_restore(
+    std::chrono::steady_clock::time_point deadline,
+    const std::function<bool()> &allowed
+  ) {
+    const auto screencast = std::make_unique<kwin::screencast_t>();
+    if (screencast->init_until(deadline, allowed) < 0) return {};
     return screencast->get_output_names();
   }
 

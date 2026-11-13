@@ -10,9 +10,6 @@
 
   #include <array>
   #include <cstring>
-  #include <filesystem>
-  #include <fstream>
-  #include <sstream>
   #include <string>
 
 namespace {
@@ -29,23 +26,6 @@ namespace {
     0x477a,
     {0x9b, 0x7a, 0x79, 0x45, 0x0b, 0x81, 0x2d, 0x60}
   };
-
-  std::string read_source(const std::filesystem::path &relative_path) {
-    const auto path = std::filesystem::path {SUNSHINE_SOURCE_DIR} / relative_path;
-    std::ifstream file {path, std::ios::binary};
-    if (!file) {
-      ADD_FAILURE() << "Failed to open " << path.string();
-      return {};
-    }
-
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    return buffer.str();
-  }
-
-  void expect_contains(const std::string &content, const std::string &needle) {
-    EXPECT_NE(content.find(needle), std::string::npos) << "missing: " << needle;
-  }
 }  // namespace
 
 TEST(SunshineVirtualDisplay, ClientUuidDisplayIdIsStableAndNonZero) {
@@ -140,65 +120,18 @@ TEST(SunshineVirtualDisplay, EncoderProbeEnsureDisplaySkippedForPerClientVirtual
   EXPECT_FALSE(VDISPLAY::policy::should_ensure_probe_display(true));
 }
 
+TEST(SunshineVirtualDisplay, EncoderProbeNeverCreatesHostOwnedDisplay) {
+  EXPECT_FALSE(VDISPLAY::policy::should_create_host_probe_display());
+}
+
 TEST(SunshineVirtualDisplay, EnsureDisplayAppliesConfiguredRenderAdapterBeforeTemporaryCreation) {
   EXPECT_TRUE(VDISPLAY::policy::adapter_preference_allows_creation(true));
   EXPECT_FALSE(VDISPLAY::policy::adapter_preference_allows_creation(false));
 }
 
-TEST(SunshineVirtualDisplay, ActivePhysicalDisplayDetectionIsScopedToConfiguredAdapter) {
-  // Regression (#265): a display attached to the *other* GPU used to satisfy
-  // has_active_physical_display(), so no virtual display was created and capture — which is pinned
-  // to adapter_name — then failed with "Failed to locate an output device".
-  for (const auto &relative_path : {
-         std::string {"src/platform/windows/virtual_display_sunshine.cpp"},
-         std::string {"src/platform/windows/virtual_display_sudovda.cpp"},
-       }) {
-    const auto source = read_source(relative_path);
-    const auto detection_pos = source.find("has_active_physical_display() {");
-    ASSERT_NE(detection_pos, std::string::npos) << relative_path;
-    const auto detection_end = source.find("should_auto_enable_virtual_display", detection_pos);
-    ASSERT_NE(detection_end, std::string::npos) << relative_path;
-    const auto detection_body = source.substr(detection_pos, detection_end - detection_pos);
-
-    EXPECT_NE(detection_body.find("platf::configured_capture_adapter_has_output(active_physical_displays)"), std::string::npos)
-      << relative_path << " does not scope active display detection to the configured adapter";
-  }
-
-  const auto misc_source = read_source("src/platform/windows/misc.cpp");
-  expect_contains(misc_source, "bool configured_capture_adapter_has_output(");
-  expect_contains(misc_source, "adapter_output_match_e adapter_drives_any_output(");
-  // Hosts without a configured adapter must keep the legacy adapter-agnostic answer.
-  expect_contains(misc_source, "if (config::video.adapter_name.empty()) {");
-}
-
-TEST(SunshineVirtualDisplay, ConfiguredRenderAdapterIsNeverSilentlyReplaced) {
-  for (const auto &relative_path : {
-         std::string {"src/platform/windows/virtual_display_sunshine.cpp"},
-         std::string {"src/platform/windows/virtual_display_sudovda.cpp"},
-       }) {
-    const auto source = read_source(relative_path);
-    expect_contains(source, "return VDISPLAY::applyConfiguredRenderAdapterPreference(context);");
-  }
-
-  // The driver-specific wrappers delegate to the shared policy, which reports
-  // an unusable preference and never substitutes a highest-VRAM adapter.
-  const auto shared_source = read_source("src/platform/windows/virtual_display.cpp");
-  const auto preference_pos = shared_source.find("bool applyConfiguredRenderAdapterPreference(");
-  ASSERT_NE(preference_pos, std::string::npos);
-  const auto preference_end = shared_source.find("bool configuredRenderAdapterMatchesVirtualDisplay(", preference_pos);
-  ASSERT_NE(preference_end, std::string::npos);
-  const auto preference_body = shared_source.substr(preference_pos, preference_end - preference_pos);
-  expect_contains(preference_body, "BOOST_LOG(error)");
-  expect_contains(preference_body, "No fallback adapter will be used.");
-  EXPECT_EQ(preference_body.find("setRenderAdapterWithMostDedicatedMemory"), std::string::npos);
-
-  // The capture path must name the exact reason a pinned adapter could not be honored.
-  const auto display_base_source = read_source("src/platform/windows/display_base.cpp");
-  expect_contains(display_base_source, "bool configured_adapter_present = false;");
-  expect_contains(display_base_source, "bool configured_adapter_has_output = false;");
-  expect_contains(display_base_source, "does not match any GPU.");
-  expect_contains(display_base_source, "has no display attached to the desktop.");
-}
+// Adapter boundary behavior is covered by the portable harness
+// tests/unit/platform/windows/test_configured_adapter_boundary.py, which compiles
+// the production decision functions with deterministic Windows/API boundary stubs.
 
 TEST(SunshineVirtualDisplay, ResumeRequiresExactVirtualDisplayMatch) {
   EXPECT_FALSE(VDISPLAY::policy::allow_generic_resume_fallback());
@@ -207,6 +140,13 @@ TEST(SunshineVirtualDisplay, ResumeRequiresExactVirtualDisplayMatch) {
 TEST(SunshineVirtualDisplay, ActiveRtspJoinSkipsVirtualDisplayPreparation) {
   EXPECT_FALSE(VDISPLAY::policy::should_prepare_display_for_new_session(false));
   EXPECT_TRUE(VDISPLAY::policy::should_prepare_display_for_new_session(true));
+}
+
+TEST(SunshineVirtualDisplay, PeerPreservingCreateCannotTeardownOrRestartSharedAdapter) {
+  EXPECT_FALSE(VDISPLAY::policy::should_teardown_conflicting_virtual_displays(true));
+  EXPECT_FALSE(VDISPLAY::policy::may_restart_adapter_after_create_failure(true));
+  EXPECT_TRUE(VDISPLAY::policy::should_teardown_conflicting_virtual_displays(false));
+  EXPECT_TRUE(VDISPLAY::policy::may_restart_adapter_after_create_failure(false));
 }
 
 TEST(SunshineVirtualDisplay, StableIdentityResolverUsesEdidBeforeFriendlyName) {
@@ -225,6 +165,23 @@ TEST(SunshineVirtualDisplay, StreamStartRemovesRetainedProbeDisplayRegardlessOfS
 TEST(SunshineVirtualDisplay, StreamReadinessAllowsHelperToActivateEnumeratedDisplay) {
   EXPECT_FALSE(VDISPLAY::policy::accept_enumerated_target(std::chrono::milliseconds {499}));
   EXPECT_TRUE(VDISPLAY::policy::accept_enumerated_target(std::chrono::milliseconds {500}));
+}
+
+TEST(SunshineVirtualDisplay, StableEdidMatchSelectsCandidateWithoutHints) {
+  // A wedged per-client identity enumerates nameless and inactive, so no
+  // dynamic hint can ever match it; the stable EDID match alone must make it
+  // the exact target so the display helper is handed the identity to activate.
+  EXPECT_TRUE(VDISPLAY::policy::readiness_candidate_is_exact_target(false, true));
+  EXPECT_TRUE(VDISPLAY::policy::readiness_candidate_is_exact_target(true, false));
+  EXPECT_TRUE(VDISPLAY::policy::readiness_candidate_is_exact_target(true, true));
+  EXPECT_FALSE(VDISPLAY::policy::readiness_candidate_is_exact_target(false, false));
+}
+
+TEST(SunshineVirtualDisplay, UnidentifiedReadinessCandidatesStayDeferred) {
+  EXPECT_TRUE(VDISPLAY::policy::defer_unidentified_readiness_candidate(false, false));
+  EXPECT_FALSE(VDISPLAY::policy::defer_unidentified_readiness_candidate(true, false));
+  EXPECT_FALSE(VDISPLAY::policy::defer_unidentified_readiness_candidate(true, true));
+  EXPECT_FALSE(VDISPLAY::policy::defer_unidentified_readiness_candidate(false, true));
 }
 
 TEST(SunshineVirtualDisplay, InactiveRetainedDisplayReusesAdvertisedSessionMode) {
@@ -320,6 +277,11 @@ TEST(SunshineVirtualDisplay, SdrRequestResetsPersistedHdrStateBeforeTheHelperRun
   EXPECT_TRUE(VDISPLAY::policy::should_reset_hdr_state_for_stream(false, true));
   EXPECT_FALSE(VDISPLAY::policy::should_reset_hdr_state_for_stream(false, false));
   EXPECT_FALSE(VDISPLAY::policy::should_reset_hdr_state_for_stream(true, true));
+}
+
+TEST(SunshineVirtualDisplay, UnmanagedHdrPreservesBothWindowsStates) {
+  EXPECT_FALSE(VDISPLAY::policy::should_reset_hdr_state_for_stream(std::nullopt, true));
+  EXPECT_FALSE(VDISPLAY::policy::should_reset_hdr_state_for_stream(std::nullopt, false));
 }
 
 TEST(SunshineVirtualDisplay, AvailabilityChecksStayPassive) {

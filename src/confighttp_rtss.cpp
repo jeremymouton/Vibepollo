@@ -112,6 +112,7 @@ namespace confighttp {
     out["resolved_path"] = rtss.resolved_path;
     out["path_exists"] = rtss.path_exists;
     out["hooks_found"] = rtss.hooks_found;
+    out["trust_valid"] = rtss.trust_valid;
     out["profile_found"] = rtss.profile_found;
     out["can_bootstrap_profile"] = rtss.can_bootstrap_profile;
     out["process_running"] = rtss.process_running;
@@ -157,7 +158,7 @@ namespace confighttp {
 
     const std::string configured_id = provider_to_string(fl.configured_provider);
     const bool prefer_rtss = fl.configured_provider == platf::frame_limiter_provider::rtss || fl.configured_provider == platf::frame_limiter_provider::auto_detect;
-    const bool rtss_ready = rtss.path_exists && rtss.hooks_found;
+    const bool rtss_ready = rtss.path_exists && rtss.hooks_found && rtss.trust_valid;
     const bool rtss_bootstrap_pending = rtss_ready && !rtss.profile_found && rtss.can_bootstrap_profile;
 
     std::string provider_message;
@@ -180,6 +181,8 @@ namespace confighttp {
             add_segment(provider_message, "RTSS not found at the resolved path. Install RTSS for the smoothest streaming experience.");
           } else if (!rtss.hooks_found) {
             add_segment(provider_message, "RTSSHooks DLL not found. Reinstall RTSS to restore frame limiter support.");
+          } else if (!rtss.trust_valid) {
+            add_segment(provider_message, "RTSS is outside a protected Program Files installation, is user-writable, or failed signature validation. Reinstall RTSS under Program Files.");
           } else {
             add_segment(provider_message, std::string("Frame limiter configured for ") + describe_provider(configured_id) + "; awaiting next stream.");
             if (!rtss.process_running) {
@@ -224,6 +227,10 @@ namespace confighttp {
     out["message"] = message;
 
     send_response(response, out);
+  }
+
+  void getFrameLimiterStatus(resp_https_t response, req_https_t request) {
+    getRtssStatus(std::move(response), std::move(request));
   }
 
   void getLosslessScalingStatus(resp_https_t response, req_https_t request) try {
@@ -344,3 +351,63 @@ namespace confighttp {
 }  // namespace confighttp
 
 #endif  // _WIN32
+
+#ifdef __linux__
+
+  #include <boost/process/v1/search_path.hpp>
+  #include <nlohmann/json.hpp>
+  #include <Simple-Web-Server/server_https.hpp>
+
+  #include "confighttp.h"
+  #include "src/config.h"
+  #include "src/platform/linux/mangohud_policy.h"
+
+namespace confighttp {
+
+  using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
+  using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
+
+  bool authenticate(resp_https_t response, req_https_t request);
+  void print_req(const req_https_t &request);
+  void send_response(resp_https_t response, const nlohmann::json &output_tree);
+
+  void getFrameLimiterStatus(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    const auto path = boost::process::v1::search_path("mangohud");
+    const bool available = !path.empty();
+    const bool selected = platf::mangohud::provider_selected(config::frame_limiter.provider);
+    const bool proton_selected = platf::mangohud::proton_provider_selected(config::frame_limiter.provider);
+    const bool proton_overlay_selected =
+      platf::mangohud::proton_overlay_provider_selected(config::frame_limiter.provider);
+    const bool active = config::frame_limiter.enable && ((selected && available) || proton_selected);
+    send_response(response, {
+      {"enabled", config::frame_limiter.enable},
+      {"configured_provider", config::frame_limiter.provider.empty() ? "auto" : config::frame_limiter.provider},
+      {"active_provider", active ?
+                            (proton_overlay_selected && available ?
+                               "mangohud-proton" : proton_selected ? "proton" : "mangohud") :
+                            "none"},
+      {"fps_limit", static_cast<double>(config::frame_limiter.fps_limit_millihz) / 1000.0},
+      {"fps_limit_millihz", config::frame_limiter.fps_limit_millihz},
+      {"overlay_preset", config::frame_limiter.mangohud_preset},
+      {"always_show_graph", config::frame_limiter.mangohud_always_show_graph},
+      {"limiter_method", config::frame_limiter.mangohud_limiter_method},
+      {"mangohud_available", available},
+      {"resolved_path", path.string()},
+      {"message", proton_overlay_selected ?
+                    (available ?
+                       "The MangoHUD overlay and Proton DXVK/VKD3D limiter are available for managed Steam games and supported external Proton launches during a stream." :
+                       "The Proton DXVK/VKD3D limiter is ready, but MangoHUD was not found in PATH; the overlay will be unavailable.") : proton_selected ?
+                    "The Proton DXVK/VKD3D frame limiter is selected for managed Steam games and supported external Proton D3D9-12 launches during a stream." : available ?
+                    "MangoHUD is installed and ready for launched games." :
+                    "MangoHUD was not found in PATH; install it to enable Linux frame limiting."}
+    });
+  }
+
+}  // namespace confighttp
+
+#endif  // __linux__

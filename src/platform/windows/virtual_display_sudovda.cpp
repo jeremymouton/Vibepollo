@@ -1,4 +1,6 @@
-﻿#include "virtual_display.h"
+#include "src/platform/windows/display_helper_borrow_native.h"
+#include "virtual_display.h"
+#include "src/platform/windows/virtual_display_refresh_policy.h"
 
 #include "virtual_display_recovery_registry.h"
 
@@ -111,14 +113,17 @@ namespace VDISPLAY_SUDOVDA {
     uint32_t base_fps_millihz = 0,
     bool framegen_refresh_active = false,
     int framegen_refresh_multiplier = 1,
-    bool hdr_requested = false,
-    bool replace_existing = true
+    std::optional<bool> hdr_requested = std::nullopt,
+    bool allow_pending_enumeration = false,
+    bool replace_existing = true,
+    bool preserve_peer_displays = false
   );
   bool removeVirtualDisplay(const GUID &guid);
   static bool remove_virtual_display_impl(
     const GUID &guid,
     bool cancel_recovery_monitor,
-    std::stop_token stop_token = {}
+    std::stop_token stop_token = {},
+    bool allow_driver_recovery = true
   );
   bool removeAllVirtualDisplays();
   std::optional<std::string> resolveVirtualDisplayDeviceId(const std::wstring &display_name);
@@ -158,7 +163,14 @@ namespace VDISPLAY_SUDOVDA {
     std::stop_token stop_token = {},
     bool allow_reinstall = true
   );
-  static DRIVER_STATUS open_vdisplay_device_impl(std::stop_token stop_token, bool allow_reinstall = true);
+  static DRIVER_STATUS open_vdisplay_device_impl(
+    std::stop_token stop_token,
+    bool allow_reinstall = true,
+    bool allow_driver_recovery = true);
+  static DRIVER_STATUS open_vdisplay_device_with_status(
+    std::stop_token stop_token,
+    bool allow_reinstall = true,
+    bool allow_driver_recovery = true);
   static bool start_ping_thread_impl(std::function<void()> fail_cb, std::stop_token stop_token);
   static std::optional<VirtualDisplayCreationResult> create_virtual_display_with_stop(
     const char *s_client_uid,
@@ -171,8 +183,10 @@ namespace VDISPLAY_SUDOVDA {
     uint32_t base_fps_millihz,
     bool framegen_refresh_active,
     int framegen_refresh_multiplier,
-    bool hdr_requested,
+    std::optional<bool> hdr_requested,
+    bool allow_pending_enumeration,
     bool replace_existing,
+    bool preserve_peer_displays,
     bool allow_reinstall,
     std::stop_token stop_token
   );
@@ -391,6 +405,8 @@ namespace VDISPLAY_SUDOVDA {
                 clear_pending();
                 return;
               }
+              auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(true, [&] { return stop_token.stop_requested(); });
+              if (!borrowed_output_mutation) { clear_pending(); return; }
               try {
                 if (*fail_cb) {
                   (*fail_cb)();
@@ -482,94 +498,6 @@ namespace VDISPLAY_SUDOVDA {
       }
 
       return false;
-    }
-
-    std::string trim_copy(std::string_view value) {
-      const auto start = value.find_first_not_of(" \t\r\n");
-      if (start == std::string_view::npos) {
-        return {};
-      }
-      const auto end = value.find_last_not_of(" \t\r\n");
-      return std::string(value.substr(start, end - start + 1));
-    }
-
-    std::optional<uint32_t> parse_refresh_hz(std::string_view value) {
-      const auto trimmed = trim_copy(value);
-      if (trimmed.empty()) {
-        return std::nullopt;
-      }
-      try {
-        const double hz = std::stod(trimmed);
-        if (!std::isfinite(hz) || hz <= 0.0) {
-          return std::nullopt;
-        }
-        const double clamped = std::min(hz, static_cast<double>(std::numeric_limits<uint32_t>::max()));
-        const auto rounded = static_cast<uint32_t>(std::lround(clamped));
-        if (rounded == 0) {
-          return std::nullopt;
-        }
-        return rounded;
-      } catch (...) {
-        return std::nullopt;
-      }
-    }
-
-    uint32_t highest_requested_refresh_hz() {
-      using dd_t = config::video_t::dd_t;
-      uint32_t max_hz = 0;
-
-      if (config::video.dd.refresh_rate_option == dd_t::refresh_rate_option_e::manual) {
-        if (auto manual = parse_refresh_hz(config::video.dd.manual_refresh_rate)) {
-          max_hz = std::max(max_hz, *manual);
-        }
-      }
-
-      const auto process_entries = [&](const auto &entries) {
-        for (const auto &entry : entries) {
-          if (auto parsed = parse_refresh_hz(entry.final_refresh_rate)) {
-            max_hz = std::max(max_hz, *parsed);
-          }
-        }
-      };
-
-      process_entries(config::video.dd.mode_remapping.mixed);
-      process_entries(config::video.dd.mode_remapping.refresh_rate_only);
-      process_entries(config::video.dd.mode_remapping.resolution_only);
-
-      return max_hz;
-    }
-
-    uint32_t apply_refresh_overrides(uint32_t fps_millihz, uint32_t base_fps_millihz = 0u, int framegen_refresh_multiplier = 1) {
-      constexpr uint64_t scale = 1000ull;
-      using dd_t = config::video_t::dd_t;
-      // Manual refresh rate override takes priority over everything, including the multiplied virtual refresh.
-      if (config::video.dd.refresh_rate_option == dd_t::refresh_rate_option_e::manual) {
-        if (auto manual = parse_refresh_hz(config::video.dd.manual_refresh_rate)) {
-          const uint64_t forced = static_cast<uint64_t>(*manual) * scale;
-          return static_cast<uint32_t>(
-            std::min<uint64_t>(forced, std::numeric_limits<uint32_t>::max())
-          );
-        }
-      }
-      const int refresh_multiplier = std::max(1, framegen_refresh_multiplier);
-      if (refresh_multiplier > 1 && base_fps_millihz > 0) {
-        const uint64_t minimum_millihz = static_cast<uint64_t>(base_fps_millihz) * static_cast<uint64_t>(refresh_multiplier);
-        const uint32_t safe_minimum = static_cast<uint32_t>(std::min<uint64_t>(minimum_millihz, std::numeric_limits<uint32_t>::max()));
-        // Ensure we're at least at the minimum, but never lower if already higher
-        if (fps_millihz < safe_minimum) {
-          fps_millihz = safe_minimum;
-        }
-      }
-      const uint32_t max_hz = highest_requested_refresh_hz();
-      if (max_hz == 0) {
-        return fps_millihz;
-      }
-      uint64_t required = static_cast<uint64_t>(max_hz) * scale;
-      if (required <= fps_millihz) {
-        return fps_millihz;
-      }
-      required = std::min<uint64_t>(required, std::numeric_limits<uint32_t>::max());
-      return static_cast<uint32_t>(required);
     }
 
     class DevInfoHandle {
@@ -825,6 +753,8 @@ namespace VDISPLAY_SUDOVDA {
     }
 
     bool apply_device_state_change(HDEVINFO info_set, SP_DEVINFO_DATA &data, DWORD state_change) {
+      auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+      if (!borrowed_output_mutation) return false;
       SP_PROPCHANGE_PARAMS params {};
       params.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
       params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
@@ -1139,13 +1069,20 @@ namespace VDISPLAY_SUDOVDA {
 
     bool track_virtual_display_created(
       const uuid_util::uuid_t &guid,
-      const VirtualDisplayCreationResult &result
+      const VirtualDisplayCreationResult &result,
+      const bool allow_pending_identity = false
     ) {
       std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
       if (!render_adapter_request_provenance_matches(guid, "SudoVDA virtual display publication")) {
         return false;
       }
       if (!result.device_id || result.device_id->empty()) {
+        if (allow_pending_identity) {
+          BOOST_LOG(info) << "Publishing driver-owned SudoVDA encoder-probe display before desktop identity resolution (guid="
+                          << guid.string() << ").";
+          active_virtual_display_tracker().add(guid);
+          return true;
+        }
         BOOST_LOG(error) << "Cannot publish SudoVDA virtual display ownership for guid="
                          << guid.string() << " because no exact device identity was resolved.";
         return false;
@@ -1510,6 +1447,8 @@ namespace VDISPLAY_SUDOVDA {
 
     // Clear the color profile association from registry for a display
     bool clear_color_profile_from_registry(const std::wstring &device_path, color_profile_scope_e scope) {
+      auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+      if (!borrowed_output_mutation) return false;
       auto profile_path = get_color_profile_registry_path(device_path);
       if (!profile_path) {
         return false;
@@ -1547,6 +1486,8 @@ namespace VDISPLAY_SUDOVDA {
       color_profile_scope_e scope,
       LSTATUS *out_status = nullptr
     ) {
+      auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+      if (!borrowed_output_mutation) return false;
       auto profile_assoc_path = get_color_profile_registry_path(device_path);
       if (!profile_assoc_path) {
         if (out_status) {
@@ -1617,6 +1558,8 @@ namespace VDISPLAY_SUDOVDA {
       const std::optional<std::wstring> &profile_name,
       const color_profile_scope_e scope
     ) {
+      auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+      if (!borrowed_output_mutation) return false;
       bool api_success = false;
       if (profile_name && !profile_name->empty()) {
         const auto result = VDISPLAY::remove_advanced_color_profile(
@@ -1640,36 +1583,17 @@ namespace VDISPLAY_SUDOVDA {
       const color_profile_scope_e scope,
       LSTATUS *out_status = nullptr
     ) {
-      // Keep the legacy value populated first. Besides supporting older Windows builds,
-      // this preserves the existing scope-selection state before the modern API activates it.
-      LSTATUS registry_status = ERROR_SUCCESS;
-      const bool registry_success = write_color_profile_to_registry(
+      auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+      if (!borrowed_output_mutation) return false;
+      return VDISPLAY::associate_hdr_profile(
         device_path,
         profile_filename,
-        scope,
-        &registry_status
+        is_system_wide_profile_scope(scope),
+        [&](LSTATUS *status) {
+          return write_color_profile_to_registry(device_path, profile_filename, scope, status);
+        },
+        out_status
       );
-      const auto result = VDISPLAY::set_advanced_color_profile(
-        device_path,
-        profile_filename,
-        is_system_wide_profile_scope(scope)
-      );
-      if (out_status) {
-        *out_status = registry_status;
-      }
-      if (result.success) {
-        return true;
-      }
-      if (result.attempted) {
-        BOOST_LOG(warning) << "HDR profile: Advanced Color activation failed (add=0x"
-                           << std::hex << static_cast<unsigned long>(result.association_status)
-                           << ", default=0x" << static_cast<unsigned long>(result.default_status) << std::dec
-                           << ", scope=" << color_profile_scope_label(scope) << "); retained registry association only.";
-      } else if (result.api_available && !result.target_found) {
-        BOOST_LOG(warning) << "HDR profile: active DisplayConfig target was unavailable; retained registry association only"
-                           << " (scope=" << color_profile_scope_label(scope) << ").";
-      }
-      return result.api_available ? false : registry_success;
     }
 
     void apply_hdr_profile_if_available(
@@ -1722,6 +1646,9 @@ namespace VDISPLAY_SUDOVDA {
                                  device_id,
                                  should_clear_mismatched,
                                  allow_active_virtual_display_fallback](std::stop_token work_stop_token) {
+        auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(true, [&] { return work_stop_token.stop_requested(); });
+        if (!borrowed_output_mutation) return;
+
         if (work_stop_token.stop_requested()) {
           return;
         }
@@ -1844,7 +1771,11 @@ namespace VDISPLAY_SUDOVDA {
               _wcsicmp(fs::path(*existing).filename().c_str(), profile_filename.c_str()) == 0;
 
             if (desired_already_associated) {
-              already_associated = true;
+              const auto active = VDISPLAY::get_advanced_color_profile(*device_name_w, is_system_wide_profile_scope(scope));
+              if (active && _wcsicmp(fs::path(*active).filename().c_str(), profile_filename.c_str()) == 0) {
+                already_associated = true;
+                return {true, false};
+              }
             }
 
             BOOST_LOG(debug) << "HDR profile: applying '" << profile_path->filename().string() << "' for client '" << client_name << "'.";
@@ -2006,6 +1937,8 @@ namespace VDISPLAY_SUDOVDA {
     }
 
     bool apply_virtual_display_dpi_value(uint32_t value) {
+      auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+      if (!borrowed_output_mutation) return false;
       HKEY root = nullptr;
       if (RegOpenKeyExW(
             HKEY_CURRENT_USER,
@@ -2783,6 +2716,10 @@ namespace VDISPLAY_SUDOVDA {
       if (!lock_recovery_operation(operation_lock, state, stop_token)) {
         return false;
       }
+      proc::setVDisplayDriverStatus(
+        DRIVER_STATUS::UNKNOWN,
+        VDISPLAY::DRIVER_SELECTION::UNKNOWN
+      );
       if (!ensure_driver_is_ready_impl(RestartCooldownBehavior::skip, stop_token, false)) {
         BOOST_LOG(warning) << "Virtual display recovery: driver not ready for " << state.describe_target();
         return false;
@@ -2791,7 +2728,7 @@ namespace VDISPLAY_SUDOVDA {
         return false;
       }
 
-      proc::vDisplayDriverStatus.store(open_vdisplay_device_impl(stop_token, false), std::memory_order_release);
+      open_vdisplay_device_with_status(stop_token, false);
       const auto driver_status = proc::vDisplayDriverStatus.load(std::memory_order_acquire);
       if (driver_status != DRIVER_STATUS::OK) {
         BOOST_LOG(warning) << "Virtual display recovery: failed to reopen driver (status="
@@ -2829,7 +2766,9 @@ namespace VDISPLAY_SUDOVDA {
         state.params.framegen_refresh_active,
         state.params.framegen_refresh_multiplier,
         state.params.hdr_requested,
+        false,
         true,
+        false,
         false,
         stop_token
       );
@@ -3040,7 +2979,48 @@ namespace VDISPLAY_SUDOVDA {
     }
   }  // namespace
 
+  std::vector<VDISPLAY::TrackedDisplayCleanupTarget> tracked_display_cleanup_targets() {
+    std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
+    std::vector<VDISPLAY::TrackedDisplayCleanupTarget> result;
+    for (const auto &guid_uuid : active_virtual_display_tracker().all()) {
+      const auto identity = g_owned_display_identities.find(guid_uuid.string());
+      if (identity == g_owned_display_identities.end() || identity->second.device_id.empty()) continue;
+      VDISPLAY::TrackedDisplayCleanupTarget target;
+      static_assert(sizeof(GUID) == target.guid_bytes.size());
+      std::memcpy(target.guid_bytes.data(), guid_uuid.b8, target.guid_bytes.size());
+      target.device_id = identity->second.device_id;
+      target.backend = VDISPLAY::ensure_display_backend_e::sudovda;
+      result.push_back(std::move(target));
+    }
+    return result;
+  }
+
+  bool tracked_display_cleanup_target_matches(
+    const std::array<std::uint8_t, 16> &guid_bytes,
+    const std::string &device_id) {
+    if (device_id.empty()) return false;
+    uuid_util::uuid_t guid_uuid {};
+    std::memcpy(guid_uuid.b8, guid_bytes.data(), guid_bytes.size());
+    std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
+    if (!active_virtual_display_tracker().contains(guid_uuid)) return false;
+    const auto identity = g_owned_display_identities.find(guid_uuid.string());
+    return identity != g_owned_display_identities.end() &&
+           boost::iequals(identity->second.device_id, device_id);
+  }
+
+  bool remove_tracked_display_cleanup_target(const VDISPLAY::TrackedDisplayCleanupTarget &target) {
+    if (target.backend != VDISPLAY::ensure_display_backend_e::sudovda || target.device_id.empty()) return false;
+    std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
+    if (!tracked_display_cleanup_target_matches(target.guid_bytes, target.device_id)) return false;
+    GUID guid {};
+    static_assert(sizeof(guid) == sizeof(target.guid_bytes));
+    std::memcpy(&guid, target.guid_bytes.data(), sizeof(guid));
+    return remove_virtual_display_impl(guid, true, {}, false);
+  }
+
   void applyHdrProfileToOutput(const char *s_client_name, const char *s_hdr_profile, const char *s_device_id) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return ;
     // Only apply HDR profiles when explicitly selected by the user.
     if (!s_hdr_profile || std::strlen(s_hdr_profile) == 0) {
       return;
@@ -3065,6 +3045,8 @@ namespace VDISPLAY_SUDOVDA {
   }
 
   void restorePhysicalHdrProfiles() {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return ;
     std::unordered_map<std::wstring, std::optional<std::wstring>> to_restore;
     {
       std::lock_guard<std::mutex> lock(g_physical_hdr_profile_restore_mutex);
@@ -3075,6 +3057,9 @@ namespace VDISPLAY_SUDOVDA {
     }
 
     std::thread([entries = std::move(to_restore)]() mutable {
+      auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(true);
+      if (!borrowed_output_mutation) return;
+
       auto restore_profiles = [&]() {
         for (const auto &[monitor_path, previous] : entries) {
           if (monitor_path.empty()) {
@@ -3174,6 +3159,10 @@ namespace VDISPLAY_SUDOVDA {
     abort_all_recovery_monitors();
   }
 
+  void cancel_virtual_display_recovery_monitor(const GUID &guid) {
+    abort_recovery_monitor(guid_to_uuid(guid));
+  }
+
   void request_virtual_display_recovery_shutdown() {
     recovery_monitors().request_shutdown();
     watchdog_failure_callbacks().request_shutdown();
@@ -3191,7 +3180,19 @@ namespace VDISPLAY_SUDOVDA {
 
   HANDLE SUDOVDA_DRIVER_HANDLE = INVALID_HANDLE_VALUE;
 
+  std::optional<std::shared_ptr<void>> retain_borrow_native_resources() {
+    std::lock_guard<std::recursive_mutex> lock(g_virtual_display_operation_mutex);
+    if (SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE || SUDOVDA_DRIVER_HANDLE == nullptr) return std::shared_ptr<void> {};
+    HANDLE duplicate = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), SUDOVDA_DRIVER_HANDLE, GetCurrentProcess(),
+                         &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS) || !duplicate || duplicate == INVALID_HANDLE_VALUE)
+      return std::nullopt;
+    return std::shared_ptr<void>(duplicate, [](void *handle) { CloseHandle(static_cast<HANDLE>(handle)); });
+  }
+
   void closeVDisplayDevice() {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return ;
     std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
     g_watchdog_stop_requested.store(true, std::memory_order_release);
     stop_watchdog_thread();
@@ -3209,6 +3210,8 @@ namespace VDISPLAY_SUDOVDA {
   }
 
   void ensureVirtualDisplayRegistryDefaults() {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return ;
     constexpr const wchar_t *REG_PATH = L"SOFTWARE\\SudoMaker\\SudoVDA";
     HKEY key = nullptr;
     REGSAM access = KEY_WRITE;
@@ -3255,7 +3258,10 @@ namespace VDISPLAY_SUDOVDA {
     RegCloseKey(key);
   }
 
-  static DRIVER_STATUS open_vdisplay_device_impl(std::stop_token stop_token, bool allow_reinstall) {
+  static DRIVER_STATUS open_vdisplay_device_impl(
+    std::stop_token stop_token,
+    bool allow_reinstall,
+    bool allow_driver_recovery) {
     std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
     if (stop_token.stop_requested()) {
       return DRIVER_STATUS::FAILED;
@@ -3286,7 +3292,8 @@ namespace VDISPLAY_SUDOVDA {
         if (retryInterval > 320) {
           if (!attempted_recovery) {
             attempted_recovery = true;
-            if (ensure_driver_is_ready_impl(RestartCooldownBehavior::wait, stop_token, allow_reinstall)) {
+            if (allow_driver_recovery &&
+                ensure_driver_is_ready_impl(RestartCooldownBehavior::wait, stop_token, allow_reinstall)) {
               retryInterval = 20;
               continue;
             }
@@ -3321,8 +3328,22 @@ namespace VDISPLAY_SUDOVDA {
     return DRIVER_STATUS::OK;
   }
 
+  static DRIVER_STATUS open_vdisplay_device_with_status(
+    std::stop_token stop_token,
+    bool allow_reinstall,
+    bool allow_driver_recovery) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return DRIVER_STATUS::FAILED;
+    proc::setVDisplayDriverStatus(DRIVER_STATUS::UNKNOWN, VDISPLAY::DRIVER_SELECTION::UNKNOWN);
+    const auto status = open_vdisplay_device_impl(stop_token, allow_reinstall, allow_driver_recovery);
+    proc::setVDisplayDriverStatus(status, VDISPLAY::DRIVER_SELECTION::SUDOVDA);
+    return status;
+  }
+
   DRIVER_STATUS openVDisplayDevice() {
-    return open_vdisplay_device_impl({});
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return DRIVER_STATUS::FAILED;
+    return open_vdisplay_device_with_status({});
   }
 
   static bool ensure_driver_is_ready_impl(
@@ -3330,6 +3351,8 @@ namespace VDISPLAY_SUDOVDA {
     std::stop_token stop_token,
     bool allow_reinstall
   ) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return false;
     std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
     if (stop_token.stop_requested()) {
       return false;
@@ -3450,10 +3473,14 @@ namespace VDISPLAY_SUDOVDA {
   }
 
   bool ensure_driver_is_ready() {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return false;
     return ensure_driver_is_ready_impl(RestartCooldownBehavior::skip);
   }
 
   static bool start_ping_thread_impl(std::function<void()> failCb, std::stop_token stop_token) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return false;
     std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
     if (stop_token.stop_requested()) {
       return false;
@@ -3594,6 +3621,8 @@ namespace VDISPLAY_SUDOVDA {
   }
 
   void setWatchdogFeedingEnabled(bool enable) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return ;
     if (enable) {
       const auto deadline = std::chrono::steady_clock::now() + WATCHDOG_INIT_GRACE;
       g_watchdog_grace_deadline_ns.store(steady_ticks_from_time(deadline), std::memory_order_release);
@@ -3607,6 +3636,8 @@ namespace VDISPLAY_SUDOVDA {
     const std::uint64_t dedicated_video_memory,
     const std::uint64_t shared_system_memory
   ) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return false;
     std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
     if (SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE) {
       return false;
@@ -3642,6 +3673,8 @@ namespace VDISPLAY_SUDOVDA {
   }
 
   bool setRenderAdapterByName(const std::wstring &adapterName) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return false;
     std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
     if (SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE) {
       return false;
@@ -3688,6 +3721,8 @@ namespace VDISPLAY_SUDOVDA {
   }
 
   bool setRenderAdapterWithMostDedicatedMemory() {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return false;
     std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
     if (SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE) {
       return false;
@@ -4083,7 +4118,9 @@ namespace VDISPLAY_SUDOVDA {
       uint32_t base_fps_millihz,
       bool framegen_refresh_active,
       int framegen_refresh_multiplier,
+      bool allow_pending_enumeration,
       bool replace_existing,
+      bool preserve_peer_displays,
       std::stop_token stop_token
     ) {
       if (stop_token.stop_requested() || SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE) {
@@ -4102,10 +4139,15 @@ namespace VDISPLAY_SUDOVDA {
                        << "' width=" << width << " height=" << height << " fps=" << fps
                        << " guid=" << requested_uuid.string();
 
-      if (!teardown_conflicting_virtual_displays(requested_uuid, stop_token)) {
+      if (VDISPLAY::policy::should_teardown_conflicting_virtual_displays(preserve_peer_displays) &&
+          !teardown_conflicting_virtual_displays(requested_uuid, stop_token)) {
         return std::nullopt;
       }
-      BOOST_LOG(debug) << "teardown_conflicting_virtual_displays completed for guid=" << requested_uuid.string();
+      if (preserve_peer_displays) {
+        BOOST_LOG(debug) << "Preserving peer virtual displays while creating guid=" << requested_uuid.string();
+      } else {
+        BOOST_LOG(debug) << "teardown_conflicting_virtual_displays completed for guid=" << requested_uuid.string();
+      }
       if (!enforce_teardown_cooldown_if_needed(stop_token)) {
         return std::nullopt;
       }
@@ -4127,7 +4169,12 @@ namespace VDISPLAY_SUDOVDA {
         return std::nullopt;
       }
 
-      const uint32_t requested_fps = apply_refresh_overrides(fps, base_fps_millihz, framegen_refresh_active ? framegen_refresh_multiplier : 1);
+      static const auto windows_build = platf::query_windows_version().build_number;
+      const auto refresh = VDISPLAY::policy::resolve_creation_refresh(
+        fps, base_fps_millihz, framegen_refresh_active ? framegen_refresh_multiplier : 1,
+        height, windows_build
+      );
+      const uint32_t requested_fps = refresh.requested_millihz;
       VIRTUAL_DISPLAY_ADD_OUT output {};
       BOOST_LOG(debug) << "Calling AddVirtualDisplay (driver handle present).";
       if (!AddVirtualDisplay(SUDOVDA_DRIVER_HANDLE, width, height, requested_fps, guid, s_client_name, s_client_uid, output)) {
@@ -4180,6 +4227,17 @@ namespace VDISPLAY_SUDOVDA {
             BOOST_LOG(error) << "Failed to remove the incomplete or stale-provenance SudoVDA virtual display.";
           }
           return std::nullopt;
+        }
+
+        if (allow_pending_enumeration) {
+          VirtualDisplayCreationResult result;
+          if (s_client_name && std::strlen(s_client_name) > 0) {
+            result.client_name = std::string(s_client_name);
+          }
+          result.reused_existing = true;
+          BOOST_LOG(info) << "Reusing driver-owned SudoVDA encoder-probe display before desktop identity resolution (guid="
+                          << requested_uuid.string() << ").";
+          return result;
         }
 
         std::optional<owned_display_identity_t> owned_identity;
@@ -4291,6 +4349,17 @@ namespace VDISPLAY_SUDOVDA {
         return std::nullopt;
       }
 
+      if (allow_pending_enumeration) {
+        VirtualDisplayCreationResult result;
+        if (s_client_name && std::strlen(s_client_name) > 0) {
+          result.client_name = std::string(s_client_name);
+        }
+        result.reused_existing = false;
+        BOOST_LOG(info) << "SudoVDA encoder-probe display accepted by the driver; continuing before desktop identity resolution (guid="
+                        << requested_uuid.string() << ").";
+        return result;
+      }
+
       const auto exact_identity =
         wait_for_added_display_identity(
           output,
@@ -4364,11 +4433,15 @@ namespace VDISPLAY_SUDOVDA {
     uint32_t base_fps_millihz,
     bool framegen_refresh_active,
     int framegen_refresh_multiplier,
-    bool hdr_requested,
+    std::optional<bool> hdr_requested,
+    bool allow_pending_enumeration,
     bool replace_existing,
+    bool preserve_peer_displays,
     bool allow_reinstall,
     std::stop_token stop_token
   ) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return std::nullopt;
     std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
     if (stop_token.stop_requested()) {
       return std::nullopt;
@@ -4382,7 +4455,7 @@ namespace VDISPLAY_SUDOVDA {
         return std::nullopt;
       }
       if (SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE) {
-        if (open_vdisplay_device_impl(stop_token, allow_reinstall) != DRIVER_STATUS::OK) {
+        if (open_vdisplay_device_with_status(stop_token, allow_reinstall) != DRIVER_STATUS::OK) {
           BOOST_LOG(warning) << "Unable to open SudoVDA driver handle for virtual display creation.";
           return std::nullopt;
         }
@@ -4399,7 +4472,9 @@ namespace VDISPLAY_SUDOVDA {
         base_fps_millihz,
         framegen_refresh_active,
         framegen_refresh_multiplier,
+        allow_pending_enumeration,
         replace_existing,
+        preserve_peer_displays,
         stop_token
       );
       if (!result) {
@@ -4408,6 +4483,11 @@ namespace VDISPLAY_SUDOVDA {
         }
         BOOST_LOG(warning) << "Virtual display creation attempt " << attempt << '/' << kMaxInitializationAttempts
                            << " failed.";
+
+        if (!VDISPLAY::policy::may_restart_adapter_after_create_failure(preserve_peer_displays)) {
+          BOOST_LOG(warning) << "Peer-preserving virtual display creation failed closed without restarting the adapter.";
+          return std::nullopt;
+        }
 
         if (attempt == kMaxInitializationAttempts) {
           BOOST_LOG(error) << "Virtual display could not be created after " << kMaxInitializationAttempts << " attempts.";
@@ -4421,7 +4501,7 @@ namespace VDISPLAY_SUDOVDA {
           return std::nullopt;
         }
 
-        if (open_vdisplay_device_impl(stop_token, allow_reinstall) != DRIVER_STATUS::OK) {
+        if (open_vdisplay_device_with_status(stop_token, allow_reinstall) != DRIVER_STATUS::OK) {
           BOOST_LOG(warning) << "Failed to re-open SudoVDA driver after recovery.";
           return std::nullopt;
         }
@@ -4429,6 +4509,16 @@ namespace VDISPLAY_SUDOVDA {
         BOOST_LOG(info) << "Retrying SudoVDA virtual display initialization (attempt "
                         << (attempt + 1) << '/' << kMaxInitializationAttempts << ").";
         continue;
+      }
+
+      if (allow_pending_enumeration) {
+        write_guid_to_state_locked(requested_uuid);
+        if (!track_virtual_display_created(requested_uuid, *result, true)) {
+          BOOST_LOG(error) << "SudoVDA encoder-probe display ownership could not be published.";
+          (void) remove_virtual_display_impl(guid, false, stop_token);
+          return std::nullopt;
+        }
+        return result;
       }
 
       if (confirm_virtual_display_persistence(*result, width, height, stop_token)) {
@@ -4522,7 +4612,7 @@ namespace VDISPLAY_SUDOVDA {
         return std::nullopt;
       }
 
-      if (open_vdisplay_device_impl(stop_token, allow_reinstall) != DRIVER_STATUS::OK) {
+      if (open_vdisplay_device_with_status(stop_token, allow_reinstall) != DRIVER_STATUS::OK) {
         BOOST_LOG(warning) << "Failed to re-open SudoVDA driver after recovery.";
         return std::nullopt;
       }
@@ -4546,9 +4636,13 @@ namespace VDISPLAY_SUDOVDA {
     uint32_t base_fps_millihz,
     bool framegen_refresh_active,
     int framegen_refresh_multiplier,
-    bool hdr_requested,
-    bool replace_existing
+    std::optional<bool> hdr_requested,
+    bool allow_pending_enumeration,
+    bool replace_existing,
+    bool preserve_peer_displays
   ) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return {};
     if (!release_retained_ensure_display_for_stream(s_client_uid)) {
       return std::nullopt;
     }
@@ -4564,13 +4658,17 @@ namespace VDISPLAY_SUDOVDA {
       framegen_refresh_active,
       framegen_refresh_multiplier,
       hdr_requested,
+      allow_pending_enumeration,
       replace_existing,
+      preserve_peer_displays,
       true,
       {}
     );
   }
 
   bool removeAllVirtualDisplays() {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return false;
     abort_all_recovery_monitors();
     std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
     auto all_guids = active_virtual_display_tracker().all();
@@ -4605,8 +4703,11 @@ namespace VDISPLAY_SUDOVDA {
   static bool remove_virtual_display_impl(
     const GUID &guid,
     bool cancel_recovery_monitor,
-    std::stop_token stop_token
+    std::stop_token stop_token,
+    bool allow_driver_recovery
   ) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return false;
     const auto guid_uuid = guid_to_uuid(guid);
     // A recovery-owned rollback must complete removal even after its monitor
     // has been stopped. If the device handle went stale at that instant,
@@ -4624,10 +4725,26 @@ namespace VDISPLAY_SUDOVDA {
       abort_recovery_monitor(guid_uuid);
     }
     std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
-    auto cached_display_name = resolve_virtual_display_name_from_devices();
+    // Resolve only this GUID's published identity. A driver-owned probe may
+    // not have one yet; falling back to another virtual display would make
+    // cleanup wait on an unrelated desktop target.
+    std::optional<std::wstring> cached_display_name;
+    if (const auto owned = g_owned_display_identities.find(guid_uuid.string());
+        owned != g_owned_display_identities.end() && !owned->second.device_id.empty()) {
+      if (const auto devices = platf::display_helper::Coordinator::instance().enumerate_devices(
+            display_device::DeviceEnumerationDetail::Minimal
+          )) {
+        for (const auto &device : *devices) {
+          if (equals_ci(device.m_device_id, owned->second.device_id) && !device.m_display_name.empty()) {
+            cached_display_name = platf::from_utf8(device.m_display_name);
+            break;
+          }
+        }
+      }
+    }
 
     const bool initial_handle_invalid = (SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE);
-    const bool allow_reinstall = !stop_token.stop_possible();
+    const bool allow_reinstall = allow_driver_recovery && !stop_token.stop_possible();
     bool opened_handle = false;
 
     auto ensure_handle = [&]() -> bool {
@@ -4635,7 +4752,7 @@ namespace VDISPLAY_SUDOVDA {
         return true;
       }
       if ((cancel_recovery_monitor && stop_token.stop_requested()) ||
-          open_vdisplay_device_impl(reopen_stop_token, allow_reinstall) != DRIVER_STATUS::OK) {
+          open_vdisplay_device_with_status(reopen_stop_token, allow_reinstall, allow_driver_recovery) != DRIVER_STATUS::OK) {
         printf("[SUDOVDA] Failed to open driver while removing virtual display.\n");
         return false;
       }
@@ -4665,7 +4782,7 @@ namespace VDISPLAY_SUDOVDA {
       printf("[SUDOVDA] Driver handle became invalid while removing virtual display; retrying.\n");
       closeVDisplayDevice();
       if ((!cancel_recovery_monitor || !stop_token.stop_requested()) &&
-          open_vdisplay_device_impl(reopen_stop_token, allow_reinstall) == DRIVER_STATUS::OK) {
+          open_vdisplay_device_with_status(reopen_stop_token, allow_reinstall, allow_driver_recovery) == DRIVER_STATUS::OK) {
         opened_handle = true;
         auto retry_result = perform_remove();
         removed = retry_result.first;
@@ -4703,10 +4820,14 @@ namespace VDISPLAY_SUDOVDA {
   }
 
   bool removeVirtualDisplay(const GUID &guid) {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return false;
     return remove_virtual_display_impl(guid, true, {});
   }
 
   static bool is_sudovda_driver_installed_passive() {
+    auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
+    if (!borrowed_output_mutation) return false;
     // Status/enumeration paths must not repair a missing device node. Users can
     // remove SudoVDA when they do not use virtual displays; reinstall only from
     // explicit driver initialization/recovery.
@@ -4996,30 +5117,30 @@ namespace VDISPLAY_SUDOVDA {
     return std::nullopt;
   }
 
-  bool is_virtual_display_output(const std::string &output_identifier) {
-    if (output_identifier.empty()) {
-      return false;
-    }
-
+  std::optional<bool> classify_virtual_display_output(const std::string &output_identifier) {
+    if (output_identifier.empty()) return std::nullopt;
     const auto devices = platf::display_helper::Coordinator::instance().enumerate_devices(display_device::DeviceEnumerationDetail::Minimal);
     if (!devices) {
-      return false;
+      return std::nullopt;
     }
 
+    bool matched = false;
     for (const auto &device : *devices) {
-      if (!is_virtual_display_device(device)) {
-        continue;
-      }
-
-      if (!device.m_device_id.empty() && equals_ci(device.m_device_id, output_identifier)) {
-        return true;
-      }
-      if (!device.m_display_name.empty() && equals_ci(device.m_display_name, output_identifier)) {
-        return true;
+      const bool same_device_id = !device.m_device_id.empty() && equals_ci(device.m_device_id, output_identifier);
+      const bool same_display_name = !device.m_display_name.empty() && equals_ci(device.m_display_name, output_identifier);
+      if (!same_device_id && !same_display_name) continue;
+      matched = true;
+      if (is_virtual_display_device(device)) return true;
+      // Missing identity fields cannot establish that this is a physical output.
+      if (device.m_monitor_device_path.empty() || device.m_friendly_name.empty() || !device.m_edid) {
+        return std::nullopt;
       }
     }
+    return matched ? std::optional<bool>(false) : std::nullopt;
+  }
 
-    return false;
+  bool is_virtual_display_output(const std::string &output_identifier) {
+    return classify_virtual_display_output(output_identifier).value_or(false);
   }
 
   bool is_virtual_display_selection(const std::string &output_identifier) {
@@ -5119,32 +5240,48 @@ namespace VDISPLAY_SUDOVDA {
   // END ISOLATED DISPLAY METHODS
 }  // namespace VDISPLAY_SUDOVDA
 
-bool VDISPLAY_SUDOVDA::has_active_physical_display() {
-  auto devices = platf::display_helper::Coordinator::instance().enumerate_devices(display_device::DeviceEnumerationDetail::Minimal);
-  BOOST_LOG(debug) << "Enumerated devices count: " << (devices ? devices->size() : 0);
-  if (!devices) {
-    BOOST_LOG(warning) << "Physical display enumeration is unavailable; preserving fail-open physical-display detection.";
-    return true;
-  }
+namespace VDISPLAY_SUDOVDA {
+  namespace {
+    struct active_physical_snapshot_t {
+      bool enumeration_available {};
+      std::vector<std::string> display_names;
+    };
 
-  std::vector<std::string> active_physical_displays;
-  for (const auto &device : *devices) {
-    bool is_virtual = is_virtual_display_device(device);
-    if (!is_virtual) {
-      bool is_active = !device.m_display_name.empty();
-      BOOST_LOG(debug) << "Physical device: " << device.m_display_name << ", is_active: " << is_active;
-      if (is_active) {
-        active_physical_displays.push_back(device.m_display_name);
+    active_physical_snapshot_t active_physical_displays() {
+      auto devices = platf::display_helper::Coordinator::instance().enumerate_devices(display_device::DeviceEnumerationDetail::Minimal);
+      BOOST_LOG(debug) << "Enumerated devices count: " << (devices ? devices->size() : 0);
+      if (!devices) {
+        BOOST_LOG(warning) << "Physical display enumeration is unavailable; preserving fail-open physical-display detection.";
+        return {};
       }
+
+      active_physical_snapshot_t snapshot {.enumeration_available = true};
+      for (const auto &device : *devices) {
+        bool is_virtual = is_virtual_display_device(device);
+        if (!is_virtual) {
+          bool is_active = !device.m_display_name.empty();
+          BOOST_LOG(debug) << "Physical device: " << device.m_display_name << ", is_active: " << is_active;
+          if (is_active) {
+            snapshot.display_names.push_back(device.m_display_name);
+          }
+        }
+      }
+
+      return snapshot;
     }
   }
+}  // namespace VDISPLAY_SUDOVDA
 
-  if (active_physical_displays.empty()) {
+bool VDISPLAY_SUDOVDA::has_active_physical_display() {
+  const auto physical = active_physical_displays();
+  if (!physical.enumeration_available) return true;
+
+  if (physical.display_names.empty()) {
     BOOST_LOG(debug) << "No active physical display found, returning false";
     return false;
   }
 
-  return platf::configured_capture_adapter_has_output(active_physical_displays);
+  return platf::configured_capture_adapter_has_output(physical.display_names);
 }
 
 bool VDISPLAY_SUDOVDA::should_auto_enable_virtual_display() {
@@ -5166,43 +5303,30 @@ uuid_util::uuid_t VDISPLAY_SUDOVDA::persistentVirtualDisplayUuid() {
 }
 
 namespace {
-  void wait_for_sudovda_ensure_target(
-    VDISPLAY::ensure_display_result &result,
-    std::chrono::steady_clock::duration timeout
-  ) {
+  void refresh_sudovda_ensure_target(VDISPLAY::ensure_display_result &result) {
     result.readiness = VDISPLAY::ensure_display_readiness_e::request_retained;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto device_id =
+      VDISPLAY_SUDOVDA::resolveActiveVirtualDisplayDeviceIdForStableId(
+        "sunshine-ensure",
+        {},
+        "Sunshine Temporary",
+        false
+      );
+    result.device_id = device_id.value_or(std::string {});
+    result.display_name.clear();
 
-    while (true) {
-      const auto device_id =
-        VDISPLAY_SUDOVDA::resolveActiveVirtualDisplayDeviceIdForStableId(
-          "sunshine-ensure",
-          {},
-          "Sunshine Temporary",
-          false
-        );
-      result.device_id = device_id.value_or(std::string {});
-      result.display_name.clear();
-
-      if (device_id) {
-        const auto display_name = VDISPLAY::resolveUsableDisplayName(*device_id);
-        if (display_name && !display_name->empty()) {
-          result.display_name = *display_name;
-          result.readiness = VDISPLAY::ensure_display_readiness_e::target_enumerated;
-          const auto dxgi_names = platf::display_names(platf::mem_type_e::dxgi);
-          if (std::any_of(dxgi_names.begin(), dxgi_names.end(), [&](const std::string &name) {
-                return !name.empty() && boost::iequals(name, *display_name);
-              })) {
-            result.readiness = VDISPLAY::ensure_display_readiness_e::target_ready;
-            return;
-          }
+    if (device_id) {
+      const auto display_name = VDISPLAY::resolveUsableDisplayName(*device_id);
+      if (display_name && !display_name->empty()) {
+        result.display_name = *display_name;
+        result.readiness = VDISPLAY::ensure_display_readiness_e::target_enumerated;
+        const auto dxgi_names = platf::display_names(platf::mem_type_e::dxgi);
+        if (std::any_of(dxgi_names.begin(), dxgi_names.end(), [&](const std::string &name) {
+              return !name.empty() && boost::iequals(name, *display_name);
+            })) {
+          result.readiness = VDISPLAY::ensure_display_readiness_e::target_ready;
         }
       }
-
-      if (std::chrono::steady_clock::now() >= deadline) {
-        return;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
 }  // namespace
@@ -5213,8 +5337,19 @@ VDISPLAY_SUDOVDA::ensure_display_result VDISPLAY_SUDOVDA::ensure_display(
   std::lock_guard<std::mutex> acquire_lock(g_ensure_display_acquire_mutex);
   ensure_display_result result;
 
-  if (!required_adapter_luid && has_active_physical_display()) {
-    result.readiness = ensure_display_readiness_e::existing_display;
+  const auto physical = active_physical_displays();
+  if (!physical.enumeration_available || !physical.display_names.empty()) {
+    if (!physical.enumeration_available || !required_adapter_luid ||
+        platf::adapter_drives_any_output(*required_adapter_luid, physical.display_names) != platf::adapter_output_match_e::no_match) {
+      result.readiness = ensure_display_readiness_e::existing_display;
+    } else {
+      BOOST_LOG(info)
+        << "Encoder probe deferred: the requested adapter has no active physical output, and host-owned probe displays are disabled while a physical desktop exists.";
+    }
+    return result;
+  }
+  if (!VDISPLAY::policy::should_create_host_probe_display()) {
+    BOOST_LOG(info) << "Encoder probe deferred until a requesting client owns a usable display.";
     return result;
   }
 
@@ -5271,7 +5406,7 @@ VDISPLAY_SUDOVDA::ensure_display_result VDISPLAY_SUDOVDA::ensure_display(
         result.temporary_guid,
         "retained SudoVDA encoder-probe display"
       )) {
-    wait_for_sudovda_ensure_target(result, std::chrono::seconds(3));
+    refresh_sudovda_ensure_target(result);
     BOOST_LOG(info) << "Reusing temporary virtual display for the active encoder probe (readiness="
                     << static_cast<int>(result.readiness)
                     << ", display_name='"
@@ -5318,6 +5453,8 @@ VDISPLAY_SUDOVDA::ensure_display_result VDISPLAY_SUDOVDA::ensure_display(
     false,
     1,
     false,
+    true,
+    false,
     false
   );
   if (!display_info) {
@@ -5345,14 +5482,14 @@ VDISPLAY_SUDOVDA::ensure_display_result VDISPLAY_SUDOVDA::ensure_display(
     return result;
   }
 
-  // Require the exact retained target to have a non-empty GDI name and appear
-  // in DXGI. An unrelated output must not satisfy readiness on its behalf.
-  wait_for_sudovda_ensure_target(result, std::chrono::seconds(3));
-  if (result.ready_for_probe()) {
+  // Encoder probing is synthetic. Sample publication once for diagnostics,
+  // but do not add another GDI/DXGI wait after the legacy driver create.
+  refresh_sudovda_ensure_target(result);
+  if (result.ready_for_capture()) {
     BOOST_LOG(info) << "Temporary virtual display ready at " << result.display_name << '.';
   } else {
-    BOOST_LOG(warning)
-      << "Temporary virtual display remains pending; refusing to probe another output"
+    BOOST_LOG(info)
+      << "Temporary virtual display remains unpublished; continuing with synthetic encoder surfaces"
       << " (readiness=" << static_cast<int>(result.readiness)
       << ", device_id='" << (result.device_id.empty() ? std::string("<pending>") : result.device_id)
       << "', display_name='" << (result.display_name.empty() ? std::string("<pending>") : result.display_name)

@@ -10,7 +10,10 @@
     "test:v2-parity": "node --experimental-strip-types scripts/v2-parity.test.ts",
     "preview": "vite preview",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "test:unit": "node --experimental-strip-types --test scripts/*.test.ts",
+    "test:e2e": "playwright test",
+    "test:app-display": "playwright test --config playwright.app-display.config.ts"
   },
   "dependencies": {
     "pinia": "^2.1.8",
@@ -19,6 +22,7 @@
     "vue-router": "4.4.5"
   },
   "devDependencies": {
+    "@playwright/test": "^1.55.0",
     "@types/node": "^24.3.0",
     "@vitejs/plugin-vue": "5.2.4",
     "prettier": "^3.6.2",

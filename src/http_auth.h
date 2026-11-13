@@ -469,6 +469,7 @@ namespace confighttp {
   AuthResult check_setup(const std::string &remote_address);
   AuthResult check_password(const std::string &remote_address, const std::string &username, const std::string &password);
   std::recursive_mutex &credentials_mutex();
+  AuthResult check_remote_access(const std::string &remote_address);
   /**
    * @brief Extract session token from Cookie headers.
    * @param headers Case-insensitive header multimap.

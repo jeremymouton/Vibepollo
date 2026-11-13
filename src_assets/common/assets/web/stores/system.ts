@@ -9,6 +9,7 @@ import {
   refreshSessionToken,
   setSessionLostHandler,
 } from '@/api/client';
+import { hostReadiness, type ReadinessMetadata } from '@/utils/hostReadiness';
 import type { SessionStatus } from '@/types/sessions';
 
 export interface AuthStatus {
@@ -17,8 +18,19 @@ export interface AuthStatus {
   login_required: boolean;
 }
 
-export interface HostMetadata {
+export interface HostMetadata extends ReadinessMetadata {
+  gpus?: Array<{
+    description?: string;
+    pnp_id?: string;
+    vendor_id?: number | string;
+    dedicated_video_memory?: number | string;
+  }>;
+  prerelease?: string;
+  rtx_hdr_supported?: boolean;
+  windows_build_number?: number;
+  windows_major_version?: number;
   platform?: string;
+  architecture?: string;
   status?: boolean;
   version?: string;
   commit?: string;
@@ -58,18 +70,15 @@ export const useSystemStore = defineStore('system', () => {
   const lastUpdatedAt = ref<number | null>(null);
 
   const needsSetup = computed(() => !auth.value.credentials_configured);
-  const needsLogin = computed(
-    () => auth.value.credentials_configured && auth.value.login_required,
-  );
+  const needsLogin = computed(() => auth.value.credentials_configured && auth.value.login_required);
   const canUseApp = computed(() => !needsSetup.value && !needsLogin.value);
-  const isStreaming = computed(
-    () => Boolean(session.value?.appRunning || (session.value?.activeSessions ?? 0) > 0),
+  const isStreaming = computed(() =>
+    Boolean(session.value?.appRunning || (session.value?.activeSessions ?? 0) > 0),
   );
-  const health = computed<'healthy' | 'streaming' | 'warning'>(() => {
-    if (error.value) return 'warning';
-    if (isStreaming.value) return 'streaming';
-    return 'healthy';
-  });
+  const restartRequired = ref(false);
+  const health = computed(() =>
+    hostReadiness(metadata.value, isStreaming.value, Boolean(error.value)),
+  );
 
   function applyTheme(): void {
     const resolved =
@@ -80,7 +89,10 @@ export const useSystemStore = defineStore('system', () => {
         : theme.value;
     document.documentElement.dataset.theme = resolved;
     const themeMeta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
-    themeMeta?.setAttribute('content', resolved === 'dark' ? '#060a18' : '#fff8ee');
+    themeMeta?.setAttribute(
+      'content',
+      getComputedStyle(document.documentElement).getPropertyValue('--vs-color-bg-canvas').trim(),
+    );
   }
 
   function setTheme(value: ThemePreference): void {
@@ -121,8 +133,8 @@ export const useSystemStore = defineStore('system', () => {
     loadingHost.value = true;
     try {
       const [metadataResult, sessionResult] = await Promise.allSettled([
-        apiGet<HostMetadata>('/api/metadata'),
-        apiGet<SessionStatus>('/api/session/status'),
+        apiGet<HostMetadata>('/api/metadata', { signal: AbortSignal.timeout(5000) }),
+        apiGet<SessionStatus>('/api/session/status', { signal: AbortSignal.timeout(5000) }),
       ]);
       if (metadataResult.status === 'fulfilled') metadata.value = metadataResult.value;
       if (sessionResult.status === 'fulfilled') session.value = sessionResult.value;
@@ -157,7 +169,9 @@ export const useSystemStore = defineStore('system', () => {
       if (needsLogin.value && (await refreshSessionToken())) {
         await fetchAuthStatus();
       }
-      await refreshHost();
+      // Display capability discovery can wait on the driver during pause or
+      // topology changes. Authentication is sufficient to open the UI.
+      void refreshHost();
     } catch {
       error.value = 'ui.system.unreachable';
     } finally {
@@ -173,7 +187,7 @@ export const useSystemStore = defineStore('system', () => {
     });
     clearCsrfToken();
     await fetchAuthStatus();
-    await refreshHost();
+    void refreshHost();
   }
 
   async function createCredentials(
@@ -229,6 +243,7 @@ export const useSystemStore = defineStore('system', () => {
     needsLogin,
     needsSetup,
     refreshHost,
+    restartRequired,
     session,
     setTheme,
     theme,

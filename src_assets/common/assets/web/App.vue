@@ -11,6 +11,7 @@ import { useSystemStore } from '@/stores/system';
 
 const system = useSystemStore();
 const route = useRoute();
+const baseUrl = import.meta.env.BASE_URL;
 const { t } = useI18n();
 
 onMounted(() => {
@@ -20,7 +21,7 @@ onMounted(() => {
 
 <template>
   <div v-if="system.booting" class="boot-screen" role="status" aria-live="polite">
-    <img src="/images/logo-apollo-45.png" alt="" width="45" height="45" />
+    <img :src="`${baseUrl}images/logo-apollo-45.png`" alt="" width="45" height="45" />
     <div>
       <strong>Vibepollo</strong>
       <span>{{ t('ui.app.connecting') }}</span>

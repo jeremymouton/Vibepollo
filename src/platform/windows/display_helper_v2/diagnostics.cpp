@@ -11,7 +11,9 @@ namespace display_helper::v2::diagnostics {
     };
 
     SinkState &sink_state() {
-      // The Boost adapter registers from another translation unit's constructor.
+      // The Boost adapter registers from another translation unit's static
+      // initializer. Construct the storage on first use so a later global
+      // initializer cannot overwrite the already registered sink.
       static SinkState state;
       return state;
     }

@@ -1,6 +1,6 @@
 /**
  * @file src/display_helper_integration.h
- * @brief Cross-platform wrapper for display helper integration. On Windows, routes to the IPC helper; on other platforms, no-ops.
+ * @brief Cross-platform display helper integration, including Linux session-helper restoration.
  */
 #pragma once
 
@@ -24,6 +24,54 @@ namespace display_helper_integration {
   // Enumerate display devices as a JSON string suitable for API responses.
   // Implemented in the Windows backend.
   std::string enumerate_devices_json(display_device::DeviceEnumerationDetail detail);
+}  // namespace display_helper_integration
+
+#elif defined(__linux__)
+
+  #include "src/platform/linux/display_backend.h"
+
+namespace display_helper_integration {
+  inline bool apply(const DisplayApplyRequest &request) {
+    if (request.action == DisplayApplyAction::Revert) {
+      return platf::linux_display::backend().revert();
+    }
+    if (!request.session) {
+      return request.action == DisplayApplyAction::Skip;
+    }
+    // Linux applies and verifies synchronously, then publishes the verified
+    // HDR/readiness state back into the live launch session.
+    return request.mutable_session &&
+           platf::linux_display::backend().apply_session(*request.mutable_session);
+  }
+
+  inline bool revert(bool = false) {
+    // Match Windows: success means the helper restore request was accepted.
+    return platf::linux_display::backend().revert();
+  }
+
+  inline bool export_golden_restore() {
+    return false;
+  }
+
+  inline bool reset_persistence() {
+    return platf::linux_display::backend().reset_persistence();
+  }
+
+  inline bool suppress_fallback() {
+    return true;
+  }
+
+  inline std::string enumerate_devices_json(
+    display_device::DeviceEnumerationDetail detail = display_device::DeviceEnumerationDetail::Minimal
+  ) {
+    return platf::linux_display::backend().enumerate_devices_json(detail);
+  }
+
+  inline std::optional<display_device::EnumeratedDeviceList> enumerate_devices(
+    display_device::DeviceEnumerationDetail detail = display_device::DeviceEnumerationDetail::Minimal
+  ) {
+    return platf::linux_display::backend().enumerate_devices(detail);
+  }
 }  // namespace display_helper_integration
 
 #else

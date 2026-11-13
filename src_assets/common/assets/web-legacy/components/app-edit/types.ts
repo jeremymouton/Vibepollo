@@ -56,6 +56,7 @@ export interface AppForm {
   index: number;
   uuid?: string;
   name: string;
+  commandOutput: string;
   output: string;
   cmd: string;
   workingDir: string;
@@ -65,6 +66,7 @@ export interface AppForm {
   excludeGlobalStateCmd: boolean;
   configOverrides: Record<string, unknown>;
   elevated: boolean;
+  dualsenseHaptics: boolean;
   autoDetach: boolean;
   waitAll: boolean;
   terminateOnPause: boolean;
@@ -79,6 +81,7 @@ export interface AppForm {
   stateCmd: PrepCmd[];
   detached: string[];
   virtualScreen: boolean;
+  prefer10BitSdr: boolean | null;
   virtualDisplayMode: AppVirtualDisplayMode | null;
   virtualDisplayLayout: AppVirtualDisplayLayout | null;
   frameGenerationProvider: FrameGenerationProvider;
@@ -97,6 +100,7 @@ export interface AppForm {
   rtxHdrMiddleGray: number;
   rtxHdrContrast: number;
   rtxHdrSaturation: number;
+  providerFields?: Record<string, unknown>;
   playniteId?: string | undefined;
   playniteManaged?: 'manual' | string | undefined;
   ddConfigurationOption?:
@@ -120,6 +124,7 @@ export interface ServerApp {
   'exclude-global-prep-cmd'?: boolean;
   'config-overrides'?: Record<string, unknown>;
   elevated?: boolean;
+  'dualsense-haptics'?: boolean;
   'auto-detach'?: boolean;
   'wait-all'?: boolean;
   'exclude-global-state-cmd'?: boolean;
@@ -136,8 +141,10 @@ export interface ServerApp {
   'prep-cmd'?: Array<{ do?: string; undo?: string; elevated?: boolean }>;
   detached?: string[];
   'virtual-screen'?: boolean;
+  'prefer-10bit-sdr'?: boolean;
   'playnite-id'?: string | undefined;
   'playnite-managed'?: 'manual' | string | undefined;
+  'playnite-fullscreen'?: boolean | undefined;
   'gen1-framegen-fix'?: boolean;
   'gen2-framegen-fix'?: boolean;
   'dlss-framegen-capture-fix'?: boolean;

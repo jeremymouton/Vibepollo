@@ -163,16 +163,41 @@ namespace display_helper::v2 {
 
   class DebouncedTrigger {
   public:
+    struct Ticket {
+      std::uint64_t generation = 0;
+      std::uint64_t connection_epoch = 0;
+      DisplayEvent event = DisplayEvent::DisplayChange;
+    };
+
     explicit DebouncedTrigger(std::chrono::milliseconds delay)
       : delay_(delay) {}
 
-    void notify(std::chrono::steady_clock::time_point now, std::uint64_t generation = 0) {
+    void notify(
+      std::chrono::steady_clock::time_point now,
+      std::uint64_t generation = 0,
+      std::uint64_t connection_epoch = 0,
+      DisplayEvent event = DisplayEvent::DisplayChange) {
+      const auto is_device_identity_event = [](DisplayEvent candidate) {
+        return candidate == DisplayEvent::DeviceArrival || candidate == DisplayEvent::DeviceRemoval;
+      };
+      // Preserve a device-identity signal if a generic WM_DISPLAYCHANGE or
+      // power notification lands later in the same owner's quiet-window burst.
+      // A retired owner must not suppress a newer owner's generic evidence.
+      const bool preserve_existing_device_event = pending_ &&
+                                                  ticket_.generation == generation &&
+                                                  ticket_.connection_epoch == connection_epoch &&
+                                                  is_device_identity_event(ticket_.event) &&
+                                                  !is_device_identity_event(event);
+      if (!preserve_existing_device_event) {
+        ticket_.event = event;
+        ticket_.generation = generation;
+        ticket_.connection_epoch = connection_epoch;
+      }
       pending_ = true;
       deadline_ = now + delay_;
-      generation_ = generation;
     }
 
-    std::optional<std::uint64_t> take_if_due(std::chrono::steady_clock::time_point now) {
+    std::optional<Ticket> take_if_due(std::chrono::steady_clock::time_point now) {
       if (!pending_) {
         return std::nullopt;
       }
@@ -180,7 +205,7 @@ namespace display_helper::v2 {
         return std::nullopt;
       }
       pending_ = false;
-      return generation_;
+      return ticket_;
     }
 
     bool should_fire(std::chrono::steady_clock::time_point now) {
@@ -193,14 +218,14 @@ namespace display_helper::v2 {
 
     void reset() {
       pending_ = false;
-      generation_ = 0;
+      ticket_ = {};
     }
 
   private:
     std::chrono::milliseconds delay_;
     bool pending_ = false;
     std::chrono::steady_clock::time_point deadline_ {};
-    std::uint64_t generation_ = 0;
+    Ticket ticket_ {};
   };
 
   class DisconnectGrace {
@@ -399,6 +424,16 @@ namespace display_helper::v2 {
       // A reconnect during the v1 recovery grace window is healthy again; do
       // not allow an old missed-ping deadline to restore a live session.
       recovery_deadline_.reset();
+    }
+
+    /// Refresh transport liveness without cancelling a restore deadline that
+    /// was already armed after a missed heartbeat.
+    void record_liveness_ping() {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!armed_) {
+        return;
+      }
+      last_ping_ = clock_.now();
     }
 
     bool check_timeout() {

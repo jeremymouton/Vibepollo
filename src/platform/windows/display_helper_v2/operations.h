@@ -13,11 +13,6 @@
 #include <vector>
 
 namespace display_helper::v2 {
-  enum class TopologyValidationMode {
-    StrictApply,
-    StructuralRestore,
-  };
-
   struct TopologyTransitionOutcome {
     ApplyStatus status = ApplyStatus::Fatal;
     std::optional<ActiveTopology> applied_topology;
@@ -30,7 +25,7 @@ namespace display_helper::v2 {
   };
 
   /**
-   * @brief Staged Windows topology transition shared by APPLY and REVERT.
+   * @brief Bounded Windows topology transition used only by snapshot restore.
    *
    * Windows may return from SetDisplayConfig before newly activated paths are
    * usable by the mode/HDR APIs. This component owns the bounded validation,
@@ -44,21 +39,15 @@ namespace display_helper::v2 {
 
     TopologyTransitionOutcome run(
       const ActiveTopology &topology,
-      TopologyValidationMode validation_mode,
-      const TopologyActivationTarget &activation_target,
       const CancellationToken &token,
       const MutationBoundary &mutation_boundary = {}
     );
 
   private:
     std::optional<ActiveTopology> topology_ready(
-      const ActiveTopology &requested_topology,
-      const TopologyActivationTarget &activation_target,
-      bool allow_os_adjustment);
+      const ActiveTopology &requested_topology);
     std::optional<ActiveTopology> wait_until_ready(
       const ActiveTopology &requested_topology,
-      const TopologyActivationTarget &activation_target,
-      bool allow_os_adjustment,
       const CancellationToken &token);
     bool recover_and_settle(const CancellationToken &token);
     bool wait_with_cancel(std::chrono::milliseconds duration, const CancellationToken &token);
@@ -74,9 +63,8 @@ namespace display_helper::v2 {
 
   struct ApplyOutcome {
     ApplyStatus status = ApplyStatus::Fatal;
-    std::optional<ActiveTopology> expected_topology;
-    /// Target/group context derived from the topology Windows ultimately
-    /// accepted. It deliberately does not rewrite the public configuration.
+    /// Target/group context derived from the single non-mutating preflight.
+    /// It deliberately does not rewrite the public configuration.
     std::optional<ResolvedConfigurationTarget> resolved_target;
     bool virtual_display_requested = false;
     /// A topology/display-stack operation or later settings stage may have
@@ -85,10 +73,16 @@ namespace display_helper::v2 {
     /// Durable recovery was armed synchronously at the first mutation
     /// boundary, before SettingsManager/mode/HDR work can continue.
     bool durable_recovery_armed = false;
-    /// True once the backend captured the provisional session baseline used
-    /// for consecutive APPLY operations. A terminal no-mutation failure must
-    /// discard this provisional state before an unrelated later session.
+    /// The worker already attempted the durable boundary. A failed attempt is
+    /// not retried synchronously by the state machine or a settings-only
+    /// repair, matching v1's single best-effort task registration.
+    bool durable_recovery_attempted = false;
+    /// True once SettingsManager may have retained transaction state. Recovery
+    /// or an explicit RESET must discard it before an unrelated later session.
     bool staged_state_prepared = false;
+    /// Original topology retained for Exclusive rollback after apply or gate failure.
+    std::optional<ActiveTopology> exclusive_pre_apply_topology;
+    bool exclusive_rollback_only = false;
   };
 
   struct RecoveryOutcome {
@@ -114,6 +108,9 @@ namespace display_helper::v2 {
     std::atomic<bool> always_restore_from_golden {false};
     std::atomic<bool> prefer_golden_if_current_missing {true};
     std::atomic<bool> restore_on_disconnect {true};
+    /// Boot recovery must not replay a stale session baseline that disables
+    /// the primary of an already restored, entirely physical desktop.
+    std::atomic<bool> preserve_active_physical_primary {false};
 
     /// True after a restore attempt that has not been confirmed yet; DISARM and
     /// SNAPSHOT_CURRENT from later stream-start probes must not cancel or
@@ -123,7 +120,8 @@ namespace display_helper::v2 {
     /// Consecutive confirmed session fallbacks while golden remains pending.
     std::atomic<std::size_t> golden_pending_session_fallbacks {0};
 
-    /// Guard: if a session restore succeeded recently, suppress golden for a cooldown.
+    /// Guard: a recent session-first restore suppresses passive golden fallback.
+    /// Explicit golden-first recovery keeps its authoritative baseline pending.
     std::atomic<long long> last_session_restore_success_ms {0};
 
     void set_exclusions(std::vector<std::string> exclusions) {
@@ -151,16 +149,11 @@ namespace display_helper::v2 {
     explicit ApplyPolicy(IClock &clock);
 
     PolicyDecision maybe_reset_virtual_display(ApplyStatus status, bool virtual_display_requested);
-    std::chrono::milliseconds retry_delay(int attempt) const;
-    bool should_skip_tier(ApplyStatus status) const;
-    bool can_retry_apply(int attempt) const;
 
   private:
     IClock &clock_;
     std::chrono::steady_clock::time_point last_reset_ {};
     std::chrono::milliseconds reset_cooldown_ {std::chrono::seconds(30)};
-    static constexpr std::chrono::milliseconds kRetryBaseDelay {500};
-    static constexpr int kMaxApplyAttempts = 3;
   };
 
   class ApplyOperation {
@@ -175,8 +168,9 @@ namespace display_helper::v2 {
     ApplyOutcome run(
       const ApplyRequest &request,
       const CancellationToken &token,
-      bool durable_recovery_already_armed = false);
-    /// Arms the same durable recovery boundary used by staged topology/settings
+      bool durable_recovery_already_armed = false,
+      bool durable_recovery_already_attempted = false);
+    /// Arms the same durable recovery boundary used by topology/settings
     /// work. AsyncDispatcher uses this before a virtual-display reset, which
     /// can change the desktop before ApplyOperation::run begins.
     bool arm_durable_recovery_boundary();
@@ -186,12 +180,10 @@ namespace display_helper::v2 {
   private:
     void apply_monitor_positions(const ApplyRequest &request, const CancellationToken &token);
     void apply_refresh_rate_overrides(const ApplyRequest &request, const CancellationToken &token);
-    bool restore_baseline_after_failed_apply(const Snapshot &baseline, const CancellationToken &token);
 
     IDisplaySettings &display_;
     IClock &clock_;
     MutationBoundary mutation_boundary_;
-    TopologyTransition topology_transition_;
   };
 
   class VerificationOperation {
@@ -211,15 +203,13 @@ namespace display_helper::v2 {
 
   /**
    * @brief One restore attempt over the snapshot chain, ported from the legacy
-   *        helper's try_restore_once_if_valid: golden-first strategy with bounded
+   *        helper's try_restore_once_if_valid: golden-first strategy with usable
    *        session fallbacks, prefer-golden-when-current-missing, stable-read +
    *        quiet-period confirmation, and current->previous promotion on success.
    *        Returns success only when the restore was CONFIRMED on screen.
    */
   class RecoveryOperation {
   public:
-    static constexpr std::size_t kGoldenFallbackCompletionThreshold = 3;
-
     RecoveryOperation(
       IDisplaySettings &display,
       ISnapshotStorage &storage,
@@ -231,6 +221,7 @@ namespace display_helper::v2 {
 
   private:
     std::optional<codec::ParsedSnapshot> load_filtered(SnapshotTier tier, const char *label);
+    std::optional<Snapshot> live_desktop_to_preserve(const Snapshot &baseline);
     bool read_stable_snapshot(Snapshot &out, std::chrono::milliseconds deadline, std::chrono::milliseconds interval, const CancellationToken &token);
     bool quiet_period(std::chrono::milliseconds duration, std::chrono::milliseconds interval, const CancellationToken &token);
     bool wait_with_cancel(std::chrono::milliseconds duration, const CancellationToken &token);

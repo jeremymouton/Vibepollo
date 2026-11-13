@@ -69,6 +69,15 @@ See below for details on token endpoints and usage examples.
 ## POST /api/clients/unpair-all
 @copydoc confighttp::unpairAll()
 
+## POST /api/clients/update
+@copydoc confighttp::updateClient()
+
+A partial `{"uuid":"<uuid>","enabled":false}` request revokes only that client's
+access without changing its permissions or preferences. Setting `enabled` to
+`true` restores access subject to the retained permission mask. A zero mask
+continues to deny access. The response reports `status` and `enabled_updated`;
+failed saves are reported, and a failed disable remains denied in memory.
+
 ## GET /api/config
 @copydoc confighttp::getConfig()
 
@@ -176,3 +185,24 @@ All session metadata is stored hashed and persisted in the same state file as AP
   <summary></summary>
   [TOC]
 </details>
+
+### Host readiness metadata
+
+`GET /api/metadata` includes optional status fields for the v2 interface. Existing fields
+and configuration write formats remain compatible.
+
+- `encoder_status`: `state` (`ready`, `failed`, or `unknown`) and `h264`, `hevc`, `av1`
+  support from the current encoder-probe cache. Reading metadata never initiates a probe.
+- Provider actions are shown only when the corresponding `providers` capability is explicitly
+  true. Missing Steam, Lutris, MangoHUD, and Playnite-toggle capabilities mean unavailable.
+- Linux `linux.session_role`: `desktop`, `greeter`, or `unknown`.
+- Linux `virtual_display.reason`: empty when ready; otherwise
+  `driver_or_outputs_unavailable` or `session_or_output_unavailable`.
+- Linux `capture_status`: `configured_backend`, `virtual_display_configured`,
+  `observed_backend`, and `managed_event_driven`. An observed `kms` backend with
+  `managed_event_driven: true` means a managed presentation-event capture loop is currently
+  running. Outside that capture lifetime the observed backend is `unknown`. This does not
+  claim that another backend is unavailable or that a configured capture path was verified.
+
+Clients must tolerate absent status fields from older hosts and distinguish unknown status
+from verified readiness. Virtual-display readiness is not required for physical capture.

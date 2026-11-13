@@ -5,7 +5,9 @@
 // standard includes
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <csignal>
 #include <filesystem>
 #include <iomanip>
@@ -16,6 +18,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <string>
 #include <vector>
 
 // lib includes
@@ -47,8 +50,12 @@
 #define NTDDI_VERSION NTDDI_WIN10
 #include <Shlwapi.h>
 
+// lib includes
+#include <libvirtualgamepad/client.h>
+
 // local includes
 #include "misc.h"
+#include "src/screen_saver_state.h"
 #include "src/platform/common_services.h"
 #include "nvprefs/nvprefs_interface.h"
 #include "src/boost_process_shim.h"
@@ -60,6 +67,7 @@
 #include "src/platform/common.h"
 #include "src/process.h"
 #include "src/utility.h"
+#include "udp_send_retry.h"
 #include "utf_utils.h"
 
 // UDP_SEND_MSG_SIZE was added in the Windows 10 20H1 SDK
@@ -86,28 +94,125 @@ extern "C" {
 
 namespace {
 
-  std::atomic<bool> used_nt_set_timer_resolution = false;
-  std::mutex screen_saver_state_mutex;
-  std::optional<bool> screen_saver_active_before_app;
+  struct screen_saver_context_t {
+    std::mutex mutex;
+    platf::screen_saver_state_t state;
+  };
+  const auto screen_saver_context = std::make_shared<screen_saver_context_t>();
 
-  bool nt_set_timer_resolution_max() {
+  using namespace std::literals;
+
+  // Scheduling setup is process-wide. Keep it until the final streaming
+  // owner leaves, and retain failed cleanup obligations for a later stop/cycle.
+  std::mutex streaming_scheduling_mutex;
+  std::size_t streaming_scheduling_users = 0;
+  std::optional<ULONG> owned_nt_timer_resolution;
+  bool owned_time_period = false;
+  std::optional<DWORD> previous_priority_class;
+
+  bool nt_set_timer_resolution_max(ULONG &requested_resolution) {
     ULONG maximum;
     ULONG minimum;
     if (ULONG current; !NT_SUCCESS(NtQueryTimerResolution(&minimum, &maximum, &current)) ||
                        !NT_SUCCESS(NtSetTimerResolution(maximum, TRUE, &current))) {
       return false;
     }
+    requested_resolution = maximum;
     return true;
   }
 
-  bool nt_set_timer_resolution_min() {
-    ULONG maximum;
-    ULONG minimum;
-    if (ULONG current; !NT_SUCCESS(NtQueryTimerResolution(&minimum, &maximum, &current)) ||
-                       !NT_SUCCESS(NtSetTimerResolution(minimum, TRUE, &current))) {
-      return false;
+  void acquire_streaming_scheduling() {
+    const auto lock = std::lock_guard(streaming_scheduling_mutex);
+    if (streaming_scheduling_users++ > 0) {
+      return;
     }
-    return true;
+
+    // Reuse an outstanding request if the preceding stream's release failed.
+    if (!owned_nt_timer_resolution && !owned_time_period) {
+      ULONG requested_resolution;
+      if (nt_set_timer_resolution_max(requested_resolution)) {
+        owned_nt_timer_resolution = requested_resolution;
+        BOOST_LOG(info) << "Stream scheduling acquired native timer resolution request "sv << requested_resolution << " (100-ns units)"sv;
+      } else {
+        BOOST_LOG(error) << "NtSetTimerResolution() failed, falling back to timeBeginPeriod()";
+        const auto result = timeBeginPeriod(1);
+        owned_time_period = result == TIMERR_NOERROR;
+        if (owned_time_period) {
+          BOOST_LOG(info) << "Stream scheduling acquired WinMM 1 ms timer period"sv;
+        } else {
+          BOOST_LOG(warning) << "Unable to begin timer period: "sv << result;
+        }
+      }
+    }
+
+    // Only change priority when we can restore the class that we replaced.
+    if (!previous_priority_class) {
+      const auto priority = GetPriorityClass(GetCurrentProcess());
+      if (!priority) {
+        const auto winerr = GetLastError();
+        BOOST_LOG(warning) << "Unable to get process priority class: "sv << winerr;
+      } else if (priority != HIGH_PRIORITY_CLASS) {
+        if (SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)) {
+          previous_priority_class = priority;
+          BOOST_LOG(info) << "Stream scheduling raised process priority from "sv << priority << " to HIGH_PRIORITY_CLASS"sv;
+        } else {
+          const auto winerr = GetLastError();
+          BOOST_LOG(warning) << "Unable to raise process priority class: "sv << winerr;
+        }
+      } else {
+        BOOST_LOG(info) << "Stream scheduling kept the preexisting HIGH_PRIORITY_CLASS unchanged"sv;
+      }
+    }
+  }
+
+  void release_streaming_scheduling() {
+    const auto lock = std::lock_guard(streaming_scheduling_mutex);
+    if (streaming_scheduling_users > 0 && --streaming_scheduling_users > 0) {
+      return;
+    }
+
+    // Preserve a later external priority change. On failure, keep the original
+    // snapshot so another stop or streaming cycle can retry restoration.
+    if (previous_priority_class) {
+      const auto priority = GetPriorityClass(GetCurrentProcess());
+      if (!priority) {
+        const auto winerr = GetLastError();
+        BOOST_LOG(warning) << "Unable to get process priority class for restoration: "sv << winerr;
+      } else if (priority != HIGH_PRIORITY_CLASS) {
+        previous_priority_class.reset();
+        BOOST_LOG(info) << "Stream scheduling preserved externally changed process priority class "sv << priority;
+      } else if (SetPriorityClass(GetCurrentProcess(), *previous_priority_class)) {
+        const auto restored_priority = *previous_priority_class;
+        previous_priority_class.reset();
+        BOOST_LOG(info) << "Stream scheduling restored process priority class "sv << restored_priority;
+      } else {
+        const auto winerr = GetLastError();
+        BOOST_LOG(warning) << "Unable to restore process priority class: "sv << winerr;
+      }
+    }
+
+    // Release the exact request we acquired, never request a new resolution on
+    // teardown or end a WinMM period that did not successfully begin.
+    if (owned_nt_timer_resolution) {
+      ULONG current;
+      const auto released_resolution = *owned_nt_timer_resolution;
+      const auto status = NtSetTimerResolution(*owned_nt_timer_resolution, FALSE, &current);
+      if (NT_SUCCESS(status)) {
+        owned_nt_timer_resolution.reset();
+        BOOST_LOG(info) << "Stream scheduling released native timer resolution request "sv << released_resolution;
+      } else {
+        BOOST_LOG(error) << "Unable to release native timer resolution: "sv << status;
+      }
+    }
+    if (owned_time_period) {
+      const auto result = timeEndPeriod(1);
+      if (result == TIMERR_NOERROR) {
+        owned_time_period = false;
+        BOOST_LOG(info) << "Stream scheduling released WinMM 1 ms timer period"sv;
+      } else {
+        BOOST_LOG(warning) << "Unable to end timer period: "sv << result;
+      }
+    }
   }
 
 }  // namespace
@@ -123,6 +228,7 @@ using namespace std::literals;
 namespace platf {
   using adapteraddrs_t = util::c_ptr<IP_ADAPTER_ADDRESSES>;
 
+  std::mutex mouse_keys_mutex;
   bool enabled_mouse_keys = false;
   MOUSEKEYS previous_mouse_keys_state;
 
@@ -174,39 +280,53 @@ namespace platf {
   }  // namespace
 
   void cache_screen_saver_state() {
-    auto lock = std::lock_guard(screen_saver_state_mutex);
-    if (screen_saver_active_before_app) {
-      return;
-    }
+    const auto context = screen_saver_context;
+    auto lock = std::lock_guard(context->mutex);
+    context->state.begin([]() -> std::optional<bool> {
+      BOOL active = FALSE;
+      DWORD winerr = ERROR_SUCCESS;
+      if (!update_screen_saver_state(SPI_GETSCREENSAVEACTIVE, 0, &active, winerr)) {
+        BOOST_LOG(warning) << "Unable to cache the screen saver state before app launch: " << winerr;
+        return std::nullopt;
+      }
+      BOOST_LOG(debug) << "Cached screen saver state before app launch: " << (active ? "enabled" : "disabled");
+      return active != FALSE;
+    });
+  }
 
-    BOOL screen_saver_active = FALSE;
+  static bool apply_screen_saver_state(bool previous_state) {
     DWORD winerr = ERROR_SUCCESS;
-    if (!update_screen_saver_state(SPI_GETSCREENSAVEACTIVE, 0, &screen_saver_active, winerr)) {
-      BOOST_LOG(warning) << "Unable to cache the screen saver state before app launch: "sv << winerr;
-      return;
+    if (!update_screen_saver_state(SPI_SETSCREENSAVEACTIVE, previous_state ? TRUE : FALSE, nullptr, winerr)) {
+      BOOST_LOG(warning) << "Unable to restore the screen saver state after app/session teardown: " << winerr;
+      return false;
     }
+    BOOST_LOG(info) << "Restored screen saver state after app/session teardown: " << (previous_state ? "enabled" : "disabled");
+    return true;
+  }
 
-    screen_saver_active_before_app = screen_saver_active != FALSE;
-    BOOST_LOG(debug) << "Cached screen saver state before app launch: "
-                     << (*screen_saver_active_before_app ? "enabled" : "disabled");
+  std::function<void()> deferred_screen_saver_restore() {
+    const auto context = screen_saver_context;
+    auto lock = std::lock_guard(context->mutex);
+    const auto token = context->state.defer();
+    auto release_on_failure = util::fail_guard([&] {
+      context->state.finish(token, apply_screen_saver_state);
+    });
+    std::function<void()> completion = [weak_context = std::weak_ptr {context}, token] {
+      // Pause commands may outlive normal host teardown. Do not dereference
+      // destroyed globals; an in-flight completion retains its own context.
+      if (const auto retained_context = weak_context.lock()) {
+        auto state_lock = std::lock_guard(retained_context->mutex);
+        retained_context->state.finish(token, apply_screen_saver_state);
+      }
+    };
+    release_on_failure.disable();
+    return completion;
   }
 
   void restore_screen_saver_state() {
-    auto lock = std::lock_guard(screen_saver_state_mutex);
-    if (!screen_saver_active_before_app) {
-      return;
-    }
-
-    DWORD winerr = ERROR_SUCCESS;
-    const auto previous_state = *screen_saver_active_before_app;
-    if (!update_screen_saver_state(SPI_SETSCREENSAVEACTIVE, previous_state ? TRUE : FALSE, nullptr, winerr)) {
-      BOOST_LOG(warning) << "Unable to restore the screen saver state after app/session teardown: "sv << winerr;
-      return;
-    }
-
-    screen_saver_active_before_app.reset();
-    BOOST_LOG(info) << "Restored screen saver state after app/session teardown: "
-                    << (previous_state ? "enabled" : "disabled");
+    const auto context = screen_saver_context;
+    auto lock = std::lock_guard(context->mutex);
+    context->state.restore(apply_screen_saver_state);
   }
 
   std::filesystem::path appdata() {
@@ -331,6 +451,17 @@ namespace platf {
     return local_ip;
   }
 
+  bool is_virtual_gamepad_driver_available() {
+    // Opening the control interface is the only honest test: the driver package
+    // can be staged while the source device is not started, and a stream would
+    // fail in exactly that case.
+    lvg::client probe;
+    if (probe.connect() != ERROR_SUCCESS) {
+      return false;
+    }
+    return probe.available_profiles() != 0;
+  }
+
   bool is_vigem_installed(std::string *version_out) {
     // Check for ViGEmBus.sys presence in System32\\drivers
     WCHAR sys_dir[MAX_PATH] = {0};
@@ -357,49 +488,64 @@ namespace platf {
   namespace {
     constexpr wchar_t kVulkanImplicitLayersSubKey[] = L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers";
     constexpr wchar_t kVulkanHdrLayerManifestName[] = L"VkLayer_sunshine_hdr.json";
-    // Resolve the shipped manifest path: <sunshine.exe dir>\drivers\sunshine\vulkan-layer\VkLayer_sunshine_hdr.json
-    std::filesystem::path vulkan_hdr_layer_manifest_path() {
+    constexpr wchar_t kVulkanHdrLayerX86ManifestName[] = L"VkLayer_sunshine_hdr_x86.json";
+
+    struct vulkan_hdr_layer_t {
+      REGSAM view;
+      const wchar_t *manifest_name;
+      const wchar_t *library_name;
+    };
+
+    constexpr vulkan_hdr_layer_t kVulkanHdrLayers[] = {
+      {KEY_WOW64_64KEY, kVulkanHdrLayerManifestName, L"VkLayer_sunshine_hdr.dll"},
+      {KEY_WOW64_32KEY, kVulkanHdrLayerX86ManifestName, L"VkLayer_sunshine_hdr_x86.dll"},
+    };
+
+    std::filesystem::path vulkan_hdr_layer_manifest_path(const vulkan_hdr_layer_t &layer) {
       wchar_t module_path[MAX_PATH] = {};
-      if (GetModuleFileNameW(nullptr, module_path, _countof(module_path)) == 0) {
+      const DWORD length = GetModuleFileNameW(nullptr, module_path, _countof(module_path));
+      if (length == 0 || length >= _countof(module_path)) {
         return {};
       }
-      return std::filesystem::path {module_path}.parent_path() / L"drivers" / L"sunshine" / L"vulkan-layer" / kVulkanHdrLayerManifestName;
+      return std::filesystem::path {module_path}.parent_path() / L"drivers" / L"sunshine" / L"vulkan-layer" / layer.manifest_name;
     }
 
-    // The registry value name is a full manifest path; match on its (ASCII, case-insensitive) leaf.
+    bool vulkan_hdr_layer_payload_exists(const vulkan_hdr_layer_t &layer) {
+      const auto manifest = vulkan_hdr_layer_manifest_path(layer);
+      std::error_code ec;
+      return !manifest.empty() && std::filesystem::is_regular_file(manifest, ec) &&
+             std::filesystem::is_regular_file(manifest.parent_path() / layer.library_name, ec);
+    }
+
+    // Match only our two manifest leaves, including registrations at old install
+    // paths. Other implicit layers share this key and must remain untouched.
     bool value_name_is_our_manifest(const std::wstring &value_name) {
-      const std::wstring leaf = std::filesystem::path {value_name}.filename().wstring();
-      const std::wstring target = kVulkanHdrLayerManifestName;
-      if (leaf.size() != target.size()) {
+      const auto leaf = std::filesystem::path {value_name}.filename().wstring();
+      return _wcsicmp(leaf.c_str(), kVulkanHdrLayerManifestName) == 0 ||
+             _wcsicmp(leaf.c_str(), kVulkanHdrLayerX86ManifestName) == 0;
+    }
+
+    bool unregister_vulkan_hdr_layer_view(REGSAM view) {
+      HKEY key = nullptr;
+      const LONG opened = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kVulkanImplicitLayersSubKey, 0, KEY_QUERY_VALUE | KEY_SET_VALUE | view, &key);
+      if (opened == ERROR_FILE_NOT_FOUND) {
+        return true;
+      }
+      if (opened != ERROR_SUCCESS) {
         return false;
       }
-      const auto ascii_lower = [](wchar_t c) -> wchar_t {
-        return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c - L'A' + L'a') : c;
-      };
-      for (size_t i = 0; i < leaf.size(); ++i) {
-        if (ascii_lower(leaf[i]) != ascii_lower(target[i])) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    // Remove any of our manifest registrations from a single registry view.
-    void unregister_vulkan_hdr_layer_view(REGSAM view) {
-      HKEY key = nullptr;
-      if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kVulkanImplicitLayersSubKey, 0, KEY_QUERY_VALUE | KEY_SET_VALUE | view, &key) != ERROR_SUCCESS) {
-        return;
-      }
       std::vector<std::wstring> to_delete;
+      bool ok = true;
       for (DWORD index = 0;; ++index) {
-        wchar_t value_name[2048];
+        wchar_t value_name[32768];
         DWORD name_len = _countof(value_name);
         const LONG r = RegEnumValueW(key, index, value_name, &name_len, nullptr, nullptr, nullptr, nullptr);
-        if (r == ERROR_MORE_DATA) {
-          continue;  // value name longer than our buffer; not ours, skip
+        if (r == ERROR_NO_MORE_ITEMS) {
+          break;
         }
         if (r != ERROR_SUCCESS) {
-          break;  // ERROR_NO_MORE_ITEMS or a hard error
+          ok = false;
+          break;
         }
         std::wstring name {value_name, name_len};
         if (value_name_is_our_manifest(name)) {
@@ -407,102 +553,122 @@ namespace platf {
         }
       }
       for (const auto &name : to_delete) {
-        RegDeleteValueW(key, name.c_str());
+        if (RegDeleteValueW(key, name.c_str()) != ERROR_SUCCESS) {
+          ok = false;
+        }
       }
       RegCloseKey(key);
+      return ok;
+    }
+
+    bool vulkan_hdr_layer_view_registered(const vulkan_hdr_layer_t &layer) {
+      if (!vulkan_hdr_layer_payload_exists(layer)) {
+        return false;
+      }
+      HKEY key = nullptr;
+      if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kVulkanImplicitLayersSubKey, 0, KEY_QUERY_VALUE | layer.view, &key) != ERROR_SUCCESS) {
+        return false;
+      }
+      DWORD type = 0;
+      DWORD value = 1;
+      DWORD size = sizeof(value);
+      const auto manifest = vulkan_hdr_layer_manifest_path(layer).wstring();
+      const LONG r = RegQueryValueExW(key, manifest.c_str(), nullptr, &type, reinterpret_cast<BYTE *>(&value), &size);
+      RegCloseKey(key);
+      return r == ERROR_SUCCESS && type == REG_DWORD && size == sizeof(value) && value == 0;
     }
 
     bool register_vulkan_hdr_layer() {
-      const std::filesystem::path manifest = vulkan_hdr_layer_manifest_path();
-      std::error_code ec;
-      if (manifest.empty() || !std::filesystem::exists(manifest, ec)) {
-        BOOST_LOG(warning) << "Vulkan HDR layer manifest not found; cannot register: "sv << manifest.string();
-        return false;
+      // Validate both architectures before removing a working old registration.
+      for (const auto &layer : kVulkanHdrLayers) {
+        if (!vulkan_hdr_layer_payload_exists(layer)) {
+          BOOST_LOG(warning) << "Vulkan HDR layer payload missing; cannot register: "sv << vulkan_hdr_layer_manifest_path(layer).string();
+          return false;
+        }
       }
-      // Clear stale registrations (including ones pointing at old install paths) before adding ours.
-      unregister_vulkan_hdr_layer_view(KEY_WOW64_64KEY);
-      unregister_vulkan_hdr_layer_view(KEY_WOW64_32KEY);
-
-      HKEY key = nullptr;
-      LONG r = RegCreateKeyExW(HKEY_LOCAL_MACHINE, kVulkanImplicitLayersSubKey, 0, nullptr, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key, nullptr);
-      if (r != ERROR_SUCCESS) {
-        BOOST_LOG(warning) << "Failed to open Vulkan ImplicitLayers key for write [0x"sv << util::hex(r).to_string_view() << ']';
-        return false;
+      bool ok = true;
+      for (const auto &layer : kVulkanHdrLayers) {
+        if (!unregister_vulkan_hdr_layer_view(layer.view)) {
+          ok = false;
+          continue;
+        }
+        HKEY key = nullptr;
+        LONG r = RegCreateKeyExW(HKEY_LOCAL_MACHINE, kVulkanImplicitLayersSubKey, 0, nullptr, 0, KEY_SET_VALUE | layer.view, nullptr, &key, nullptr);
+        if (r == ERROR_SUCCESS) {
+          const auto manifest = vulkan_hdr_layer_manifest_path(layer).wstring();
+          const DWORD enabled_value = 0;  // Vulkan loader: DWORD 0 enables the layer.
+          r = RegSetValueExW(key, manifest.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE *>(&enabled_value), sizeof(enabled_value));
+          RegCloseKey(key);
+        }
+        if (r != ERROR_SUCCESS) {
+          BOOST_LOG(warning) << "Failed to register Vulkan HDR layer "sv << vulkan_hdr_layer_manifest_path(layer).string() << " [0x"sv << util::hex(r).to_string_view() << ']';
+          ok = false;
+        }
       }
-      const std::wstring manifest_w = manifest.wstring();
-      DWORD enabled_value = 0;  // 0 = layer enabled, per the Vulkan loader convention
-      r = RegSetValueExW(key, manifest_w.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE *>(&enabled_value), sizeof(enabled_value));
-      RegCloseKey(key);
-      if (r != ERROR_SUCCESS) {
-        BOOST_LOG(warning) << "Failed to register Vulkan HDR layer [0x"sv << util::hex(r).to_string_view() << ']';
-        return false;
-      }
-      BOOST_LOG(info) << "Vulkan HDR implicit layer registered: "sv << manifest.string();
-      return true;
+      return ok;
     }
-
   }  // namespace
 
   bool is_vulkan_hdr_layer_registered() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kVulkanImplicitLayersSubKey, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
-      return false;
-    }
-    bool found = false;
-    for (DWORD index = 0;; ++index) {
-      wchar_t value_name[2048];
-      DWORD name_len = _countof(value_name);
-      const LONG r = RegEnumValueW(key, index, value_name, &name_len, nullptr, nullptr, nullptr, nullptr);
-      if (r == ERROR_MORE_DATA) {
-        continue;
-      }
-      if (r != ERROR_SUCCESS) {
-        break;
-      }
-      const std::wstring name {value_name, name_len};
-      if (value_name_is_our_manifest(name)) {
-        std::error_code ec;
-        if (std::filesystem::exists(std::filesystem::path {name}, ec)) {
-          found = true;
-          break;
-        }
-      }
-    }
-    RegCloseKey(key);
-    return found;
+    return std::all_of(std::begin(kVulkanHdrLayers), std::end(kVulkanHdrLayers), vulkan_hdr_layer_view_registered);
   }
 
   bool set_vulkan_hdr_layer_enabled(bool enabled) {
-    const bool currently = is_vulkan_hdr_layer_registered();
-    if (enabled == currently) {
-      return true;  // already in the desired state; avoid needless registry churn / log spam
-    }
     if (enabled) {
-      return register_vulkan_hdr_layer();
+      return is_vulkan_hdr_layer_registered() || register_vulkan_hdr_layer();
     }
-    unregister_vulkan_hdr_layer_view(KEY_WOW64_64KEY);
-    unregister_vulkan_hdr_layer_view(KEY_WOW64_32KEY);
-    BOOST_LOG(info) << "Vulkan HDR implicit layer unregistered."sv;
-    return true;
+    // Partial installation is unhealthy, but can still contain one enabled
+    // architecture. Always remove both views when the preference is disabled.
+    const bool removed64 = unregister_vulkan_hdr_layer_view(KEY_WOW64_64KEY);
+    const bool removed32 = unregister_vulkan_hdr_layer_view(KEY_WOW64_32KEY);
+    return removed64 && removed32;
   }
 
-  HDESK syncThreadDesktop() {
+  bool syncThreadDesktop() {
+    struct desktop_binding_t {
+      // GetThreadDesktop returns a borrowed handle; never close it. Keep the
+      // opened handle alive while this thread uses it, then switch away before
+      // releasing it (CloseDesktop rejects a handle still assigned to a thread).
+      HDESK initial {GetThreadDesktop(GetCurrentThreadId())};
+      HDESK owned {nullptr};
+
+      ~desktop_binding_t() {
+        if (owned && initial && SetThreadDesktop(initial)) {
+          CloseDesktop(owned);
+        }
+      }
+    };
+    thread_local desktop_binding_t binding;
+
     auto hDesk = OpenInputDesktop(DF_ALLOWOTHERACCOUNTHOOK, FALSE, GENERIC_ALL);
     if (!hDesk) {
       auto err = GetLastError();
       BOOST_LOG(error) << "Failed to Open Input Desktop [0x"sv << util::hex(err).to_string_view() << ']';
-
-      return nullptr;
+      return false;
     }
 
     if (!SetThreadDesktop(hDesk)) {
       auto err = GetLastError();
       BOOST_LOG(error) << "Failed to sync desktop to thread [0x"sv << util::hex(err).to_string_view() << ']';
+      CloseDesktop(hDesk);
+      return false;
     }
 
-    CloseDesktop(hDesk);
+    // Selecting the already-current desktop may keep its existing handle.
+    // Release the redundant OpenInputDesktop handle instead of mistaking the
+    // successful no-op for a new thread-owned binding.
+    const auto assigned = GetThreadDesktop(GetCurrentThreadId());
+    if (assigned && assigned != hDesk) {
+      CloseDesktop(hDesk);
+      return true;
+    }
 
-    return hDesk;
+    const auto previous = binding.owned;
+    binding.owned = hDesk;
+    if (previous) {
+      CloseDesktop(previous);
+    }
+    return true;
   }
 
   void print_status(const std::string_view &prefix, HRESULT status) {
@@ -699,23 +865,6 @@ namespace platf {
 
     CloseDesktop(hDesk);
     return locked;
-  }
-
-  bool is_default_input_desktop_active() {
-    HDESK hDesk = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
-    if (!hDesk) {
-      return false;
-    }
-
-    bool is_default = false;
-    wchar_t name[256] {};
-    DWORD needed = 0;
-    if (GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
-      is_default = (_wcsicmp(name, L"Default") == 0);
-    }
-
-    CloseDesktop(hDesk);
-    return is_default;
   }
 
   // Note: This does NOT append a null terminator
@@ -1535,17 +1684,7 @@ namespace platf {
     // Enable MMCSS scheduling for DWM
     DwmEnableMMCSS(true);
 
-    // Reduce timer period to 0.5ms
-    if (nt_set_timer_resolution_max()) {
-      used_nt_set_timer_resolution = true;
-    } else {
-      BOOST_LOG(error) << "NtSetTimerResolution() failed, falling back to timeBeginPeriod()";
-      timeBeginPeriod(1);
-      used_nt_set_timer_resolution = false;
-    }
-
-    // Promote ourselves to high priority class
-    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    acquire_streaming_scheduling();
 
     // Start display helper watchdog to self-heal helper crashes during active stream
     display_helper_integration::start_watchdog();
@@ -1594,6 +1733,14 @@ namespace platf {
   }
 
   void enable_mouse_keys() {
+    // Capture threads check every frame, including concurrent streams. Keep the
+    // original snapshot until restoration succeeds instead of saving our own
+    // temporary settings on the next check.
+    const auto lock = std::lock_guard(mouse_keys_mutex);
+    if (enabled_mouse_keys) {
+      return;
+    }
+
     // If there is no mouse connected, enable Mouse Keys to force the cursor to appear
     if (!GetSystemMetrics(SM_MOUSEPRESENT)) {
       BOOST_LOG(info) << "A mouse was not detected. Sunshine will enable Mouse Keys while streaming to force the mouse cursor to appear.";
@@ -1632,18 +1779,7 @@ namespace platf {
     } else {
       BOOST_LOG(debug) << "Display helper: keeping watchdog alive while session is paused (awaiting /resume).";
     }
-    // Demote ourselves back to normal priority class
-    SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-
-    // End our 0.5ms timer request
-    if (used_nt_set_timer_resolution) {
-      used_nt_set_timer_resolution = false;
-      if (!nt_set_timer_resolution_min()) {
-        BOOST_LOG(error) << "nt_set_timer_resolution_min() failed even though nt_set_timer_resolution_max() succeeded";
-      }
-    } else {
-      timeEndPeriod(1);
-    }
+    release_streaming_scheduling();
 
     // Disable MMCSS scheduling for DWM
     DwmEnableMMCSS(false);
@@ -1655,11 +1791,13 @@ namespace platf {
     }
 
     // Restore Mouse Keys back to the previous settings if we turned it on
+    const auto lock = std::lock_guard(mouse_keys_mutex);
     if (enabled_mouse_keys) {
-      enabled_mouse_keys = false;
       if (!SystemParametersInfoW(SPI_SETMOUSEKEYS, 0, &previous_mouse_keys_state, 0)) {
         auto winerr = GetLastError();
         BOOST_LOG(warning) << "Unable to restore original state of Mouse Keys: "sv << winerr;
+      } else {
+        enabled_mouse_keys = false;
       }
     }
   }
@@ -1875,9 +2013,94 @@ namespace platf {
     return saddr_v6;
   }
 
+  std::uint64_t routed_link_bps(const boost::asio::ip::address &source, const boost::asio::ip::address &target, routed_link_info_t *info) {
+    auto socket_address = [](const boost::asio::ip::address &address) {
+      SOCKADDR_INET result {};
+      if (address.is_v6() && !address.to_v6().is_v4_mapped()) {
+        result.Ipv6 = to_sockaddr(address.to_v6(), 0);
+      } else {
+        const auto ipv4 = address.is_v4() ? address.to_v4() :
+                                          boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, address.to_v6());
+        result.Ipv4 = to_sockaddr(ipv4, 0);
+      }
+      return result;
+    };
+    const auto destination = socket_address(target);
+    const auto local = socket_address(source);
+    if (local.si_family != destination.si_family) {
+      return 0;
+    }
+    MIB_IPFORWARD_ROW2 route {};
+    SOCKADDR_INET selected_source {};
+    if (GetBestRoute2(nullptr, 0, source.is_unspecified() ? nullptr : &local,
+                      &destination, 0, &route, &selected_source) != NO_ERROR) {
+      return 0;
+    }
+    MIB_IF_ROW2 interface_row {};
+    interface_row.InterfaceLuid = route.InterfaceLuid;
+    const auto entry_status = GetIfEntry2(&interface_row);
+    if (info) {
+      info->luid = route.InterfaceLuid.Value;
+      if (entry_status == NO_ERROR) {
+        info->alias = to_utf8(interface_row.Alias);
+        info->if_type = interface_row.Type;
+        info->transmit_bps = interface_row.TransmitLinkSpeed;
+      }
+    }
+    if (entry_status != NO_ERROR || interface_row.OperStatus != IfOperStatusUp ||
+        interface_row.TransmitLinkSpeed == std::numeric_limits<std::uint64_t>::max()) {
+      return 0;
+    }
+    // Tunnel and Wi-Fi link rates are not usable estimates of packet throughput.
+    return interface_row.Type == IF_TYPE_ETHERNET_CSMACD ? interface_row.TransmitLinkSpeed : 0;
+  }
+
+  namespace {
+    int send_udp_message(SOCKET socket, WSAMSG &msg, const std::function<bool()> &send_cancelled) {
+      const auto result = udp_send_retry::send(
+        [&]() {
+          DWORD bytes_sent;
+          return WSASendMsg(socket, &msg, 0, &bytes_sent, nullptr, nullptr) == SOCKET_ERROR ? WSAGetLastError() : 0;
+        },
+        [&](int error, std::chrono::steady_clock::duration remaining) {
+          const auto deadline = std::chrono::steady_clock::now() + remaining;
+          fd_set writable;
+          FD_ZERO(&writable);
+          FD_SET(socket, &writable);
+          const auto wait_us = std::max<std::int64_t>(1, std::min<std::int64_t>(1000,
+            std::chrono::duration_cast<std::chrono::microseconds>(remaining).count()));
+          timeval timeout {0, static_cast<long>(wait_us)};
+          const auto ready = select(0, nullptr, &writable, nullptr, &timeout);
+          if (ready == SOCKET_ERROR) {
+            return WSAGetLastError();
+          }
+          // ENOBUFS can leave the socket writable despite exhausted system/NIC
+          // resources. Only this error needs backoff after readiness;
+          // WSAEWOULDBLOCK retries as soon as the socket accepts another message.
+          if (ready > 0 && error == WSAENOBUFS) {
+            thread_local auto timer = create_high_precision_timer();
+            if (!timer || !*timer) {
+              return WSAENOBUFS;
+            }
+            const auto remaining_after_poll = deadline - std::chrono::steady_clock::now();
+            if (remaining_after_poll > std::chrono::steady_clock::duration::zero()) {
+              timer->sleep_for(std::min(std::chrono::nanoseconds {100'000},
+                std::chrono::duration_cast<std::chrono::nanoseconds>(remaining_after_poll)));
+            }
+          }
+          return 0;
+        },
+        [&]() { return send_cancelled && send_cancelled(); },
+        []() { return std::chrono::steady_clock::now(); }
+      );
+      return result.error;
+    }
+  }  // namespace
+
   // Use UDP segmentation offload if it is supported by the OS. If the NIC is capable, this will use
   // hardware acceleration to reduce CPU usage. Support for USO was introduced in Windows 10 20H1.
   bool send_batch(batched_send_info_t &send_info) {
+    send_info.allow_fallback = false;
     WSAMSG msg;
 
     // Convert the target address into a SOCKADDR
@@ -1895,11 +2118,12 @@ namespace platf {
       msg.namelen = sizeof(taddr_v4);
     }
 
-    auto const max_bufs_per_msg = send_info.payload_buffers.size() + (send_info.headers ? 1 : 0);
+    const bool has_headers = send_info.headers && send_info.header_size != 0;
+    auto const max_bufs_per_msg = send_info.payload_buffers.size() + (has_headers ? 1 : 0);
 
-    std::vector<WSABUF> bufs((send_info.headers ? send_info.block_count : 1) * max_bufs_per_msg);
+    std::vector<WSABUF> bufs((has_headers ? send_info.block_count : 1) * max_bufs_per_msg);
     DWORD bufcount = 0;
-    if (send_info.headers) {
+    if (has_headers) {
       // Interleave buffers for headers and payloads
       for (auto i = 0; i < send_info.block_count; i++) {
         bufs[bufcount].buf = (char *) &send_info.headers[(send_info.block_offset + i) * send_info.header_size];
@@ -1975,9 +2199,34 @@ namespace platf {
 
     msg.Control.len = cmbuflen;
 
-    // If USO is not supported, this will fail and the caller will fall back to unbatched sends.
-    DWORD bytes_sent;
-    return WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) != SOCKET_ERROR;
+    const auto winerr = send_udp_message((SOCKET) send_info.native_socket, msg, send_info.send_cancelled);
+    if (winerr == 0) {
+      return true;
+    }
+
+    send_info.allow_fallback = udp_send_retry::offload_fallback_error(
+      winerr, send_info.block_count > 1, send_info.header_size + send_info.payload_size, send_info.target_address.is_v6()
+    );
+    if (winerr == WSAEINTR) {
+      return false;
+    }
+    // A rejected batch otherwise turns into dozens of individual sends with
+    // no explanation at normal log levels. Bound reporting so an unsupported
+    // offload path cannot spend its send budget flooding the log.
+    thread_local std::chrono::steady_clock::time_point next_failure_log {};
+    thread_local std::uint64_t failed_batches = 0;
+    ++failed_batches;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_failure_log) {
+      BOOST_LOG(send_info.allow_fallback ? debug : warning) << "WSASendMsg() batch failed: "sv << winerr
+                         << "; packets="sv << send_info.block_count
+                         << "; bytes="sv << send_info.block_count * (send_info.header_size + send_info.payload_size)
+                         << "; failed batches since previous report="sv << failed_batches
+                         << (send_info.allow_fallback ? "; falling back to individual sends"sv : "; batch was not sent"sv);
+      failed_batches = 0;
+      next_failure_log = now + 5s;
+    }
+    return false;
   }
 
   bool send(send_info_t &send_info) {
@@ -2050,10 +2299,27 @@ namespace platf {
 
     msg.Control.len = cmbuflen;
 
-    DWORD bytes_sent;
-    if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) == SOCKET_ERROR) {
-      auto winerr = WSAGetLastError();
-      BOOST_LOG(warning) << "WSASendMsg() failed: "sv << winerr;
+    const auto winerr = send_udp_message((SOCKET) send_info.native_socket, msg, send_info.send_cancelled);
+    if (winerr == WSAEINTR) {
+      return false;
+    }
+    if (winerr != 0) {
+      // A session stuck in a bad state fails every FEC shard of every frame,
+      // which used to flood the log with thousands of identical lines and
+      // drown out the actual failure. Log the first occurrence, then a
+      // suppressed-count summary at most once per 5 seconds.
+      static std::atomic<std::int64_t> last_log_tick {std::numeric_limits<std::int64_t>::min()};
+      static std::atomic<std::uint64_t> suppressed_count {0};
+      const auto now_tick = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      auto last = last_log_tick.load(std::memory_order_relaxed);
+      if ((last == std::numeric_limits<std::int64_t>::min() || now_tick - last >= 5) &&
+          last_log_tick.compare_exchange_strong(last, now_tick, std::memory_order_relaxed)) {
+        const auto suppressed = suppressed_count.exchange(0, std::memory_order_relaxed);
+        BOOST_LOG(warning) << "WSASendMsg() failed: "sv << winerr
+                           << (suppressed ? " (" + std::to_string(suppressed) + " similar failures suppressed)" : std::string {});
+      } else {
+        suppressed_count.fetch_add(1, std::memory_order_relaxed);
+      }
       return false;
     }
 
@@ -2437,6 +2703,7 @@ namespace platf {
         .luid = adapter.desc.AdapterLuid,
         .description = to_utf8(adapter.desc.Description),
         .pnp_id = adapter.pnp_id.value_or(std::string {}),
+        .vendor_id = adapter.desc.VendorId,
         .dedicated_video_memory = adapter.desc.DedicatedVideoMemory,
         .shared_system_memory = adapter.desc.SharedSystemMemory,
       };
@@ -2593,6 +2860,7 @@ namespace platf {
           .luid = adapter_desc.AdapterLuid,
           .description = to_utf8(adapter_desc.Description),
           .pnp_id = query_adapter_pnp_id(adapter_desc.AdapterLuid).value_or(std::string {}),
+          .vendor_id = adapter_desc.VendorId,
           .dedicated_video_memory = adapter_desc.DedicatedVideoMemory,
           .shared_system_memory = adapter_desc.SharedSystemMemory,
         };
@@ -2917,11 +3185,29 @@ namespace platf {
         BOOST_LOG(error) << "Attempting high_precision_timer::sleep_for() with unexpectedly large duration (>5s)";
         return;
       }
+      if (duration == 0s) {
+        return;
+      }
 
       LARGE_INTEGER due_time;
-      due_time.QuadPart = duration.count() / -100;
-      SetWaitableTimer(timer, &due_time, 0, nullptr, nullptr, false);
-      WaitForSingleObject(timer, INFINITE);
+      due_time.QuadPart = -std::max<std::int64_t>(1, (duration.count() + 99) / 100);
+      if (!SetWaitableTimer(timer, &due_time, 0, nullptr, nullptr, false)) {
+        if (!failure_logged) {
+          failure_logged = true;
+          BOOST_LOG(error) << "Unable to arm high_precision_timer: " << GetLastError();
+        }
+        return;
+      }
+      // A failed timer must not hang a sender or capture thread indefinitely.
+      // Scheduling can overshoot a requested interval; this timeout bounds the
+      // wait operation rather than promising a strict wall-clock wake-up time.
+      const auto timeout_ms = std::chrono::ceil<std::chrono::milliseconds>(duration).count() + 1;
+      if (WaitForSingleObject(timer, static_cast<DWORD>(timeout_ms)) == WAIT_FAILED) {
+        if (!failure_logged) {
+          failure_logged = true;
+          BOOST_LOG(error) << "Unable to wait for high_precision_timer: " << GetLastError();
+        }
+      }
     }
 
     operator bool() override {
@@ -2930,6 +3216,7 @@ namespace platf {
 
   private:
     HANDLE timer = nullptr;
+    bool failure_logged = false;
   };
 
   std::unique_ptr<high_precision_timer> create_high_precision_timer() {
@@ -3066,4 +3353,3 @@ static int setClipboardData(const std::wstring &utf16Str) {
 
   return 0;
 }
-

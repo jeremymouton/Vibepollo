@@ -55,22 +55,28 @@
 #include "crypto.h"
 #include "file_handler.h"
 #include "globals.h"
+#include "host_stats.h"
+#include "hdr_request_policy.h"
 #include "httpcommon.h"
 #include "input.h"
 #include "invites.h"
 #include "logging.h"
 #include "nvhttp.h"
+#include "host_stream_control.h"
 #include "process.h"
 #include "rtsp.h"
+#include "session_display_policy.h"
 #include "session_history.h"
 #include "stream.h"
 #include "utility.h"
 #include "uuid.h"
+#include "webrtc_capture_owner.h"
 #include "video.h"
 #include "video_colorspace.h"
 #include "webrtc_stream.h"
 
 #ifdef _WIN32
+  #include "remote_display_topology.h"
   #include "src/platform/common.h"
   #include "src/platform/windows/display_helper_integration.h"
   #include "src/platform/windows/display_helper_request_policy.h"
@@ -87,6 +93,14 @@
   #if !defined(SUNSHINE_SHADERS_DIR)
     #define SUNSHINE_SHADERS_DIR SUNSHINE_ASSETS_DIR "/shaders/directx"
   #endif
+#elif defined(__linux__)
+  #include "src/platform/linux/frame_limiter.h"
+  #include "src/platform/linux/misc.h"
+  #include "src/display_helper_integration.h"
+  #include "src/platform/linux/private_display.h"
+  #include "src/platform/linux/display_backend.h"
+  #include "src/platform/linux/display_power.h"
+  #include "src/platform/linux/wayland_hdr_compatibility.h"
 #endif
 
 #ifdef __APPLE__
@@ -162,7 +176,7 @@ namespace webrtc_stream {
       std::shared_ptr<std::atomic_uint32_t> inflight;
     };
 
-    void release_shared_encoded_payload(void *user) noexcept {
+    [[maybe_unused]] void release_shared_encoded_payload(void *user) noexcept {
       auto *context = static_cast<SharedEncodedPayloadReleaseContext *>(user);
       if (!context) {
         return;
@@ -249,10 +263,11 @@ namespace webrtc_stream {
       const bool shared_virtual_display_mode =
         requested_virtual_display_mode == config::video_t::virtual_display_mode_e::shared;
       auto shared_virtual_display_uuid = VDISPLAY::persistentVirtualDisplayUuid();
-      if (shared_virtual_display_mode && !http::shared_virtual_display_guid.empty()) {
+      const auto shared_guid_snapshot=http::shared_virtual_display_guid_snapshot();
+      if (shared_virtual_display_mode && !shared_guid_snapshot.empty()) {
         try {
           shared_virtual_display_uuid =
-            uuid_util::uuid_t::parse(http::shared_virtual_display_guid);
+            uuid_util::uuid_t::parse(shared_guid_snapshot);
         } catch (...) {
           // Creation uses the same persistent fallback and repairs the stored value.
         }
@@ -285,6 +300,7 @@ namespace webrtc_stream {
           .auto_capture_uses_wgc = platf::dxgi::should_use_wgc_default(),
           .auto_virtual_framegen_limiter = config::frame_limiter.virtual_display_limiter_enabled(),
           .virtual_display_refresh_multiplier = config::frame_limiter.fixed_virtual_display_refresh_multiplier(),
+          .virtual_display_fixed_refresh_millihz = config::frame_limiter.fixed_virtual_display_refresh_millihz(session->client_vrr_requested),
         });
       };
       const auto requested_display_framegen_policy =
@@ -300,6 +316,10 @@ namespace webrtc_stream {
         session->framegen_refresh_rate = framegen_policy.framegen_refresh_rate;
         session->framegen_refresh_millihz = framegen_policy.framegen_refresh_millihz;
         session->framegen_refresh_multiplier = framegen_policy.refresh_multiplier;
+        session->framegen_fixed_refresh = framegen_policy.fixed_refresh;
+        if (uses_virtual_display) {
+          display_helper_integration::helpers::resolve_virtual_display_refresh(config::video, *session);
+        }
       };
       BOOST_LOG(debug) << "Display helper: WebRTC session prep client='" << session->client_name
                        << "' allow_display_changes=" << allow_display_changes
@@ -372,6 +392,7 @@ namespace webrtc_stream {
         session->framegen_refresh_rate.reset();
         session->framegen_refresh_millihz.reset();
         session->framegen_refresh_multiplier = 1;
+        session->framegen_fixed_refresh = false;
         if (app_output_override) {
           publish_output_override(*app_output_override);
           BOOST_LOG(info) << "Display helper: pinning WebRTC capture to app output override: "
@@ -402,6 +423,7 @@ namespace webrtc_stream {
         session->framegen_refresh_rate.reset();
         session->framegen_refresh_millihz.reset();
         session->framegen_refresh_multiplier = 1;
+        session->framegen_fixed_refresh = false;
         return;
       }
       apply_framegen_refresh_policy(true);
@@ -434,11 +456,11 @@ namespace webrtc_stream {
 
       uuid_util::uuid_t session_uuid;
       if (shared_mode) {
-        if (auto parsed = parse_uuid(http::shared_virtual_display_guid)) {
+        if (auto parsed = parse_uuid(http::shared_virtual_display_guid_snapshot())) {
           session_uuid = *parsed;
         } else {
           session_uuid = VDISPLAY::persistentVirtualDisplayUuid();
-          http::shared_virtual_display_guid = session_uuid.string();
+          http::set_shared_virtual_display_guid(session_uuid.string());
         }
       } else if (auto parsed = parse_uuid(session->unique_id)) {
         session_uuid = *parsed;
@@ -498,7 +520,7 @@ namespace webrtc_stream {
       uint32_t vd_height = session->height > 0 ? static_cast<uint32_t>(session->height) : 1080u;
       // Virtual-display creation may eagerly enable HDR. Default to no state change so
       // "Do not change HDR" preserves the retained Windows setting.
-      bool virtual_display_hdr_requested = false;
+      std::optional<bool> virtual_display_hdr_requested;
       display_helper_integration::helpers::SessionDisplayConfigurationHelper initial_display_helper(config::video, *session, true);
       if (auto initial_configuration = initial_display_helper.initial_virtual_display_configuration()) {
         if (initial_configuration->m_resolution &&
@@ -519,11 +541,18 @@ namespace webrtc_stream {
           virtual_display_hdr_requested = source_hdr_requested;
         }
       }
-      const uint32_t base_vd_fps_millihz = session->client_display_refresh_millihz > 0 ?
-                                                 session->client_display_refresh_millihz :
-                                                 (session->fps > 0 ?
-                                                    framegen::saturating_refresh_millihz(static_cast<uint32_t>(session->fps), 1000) :
-                                                    0u);
+      // A fixed-refresh (VRR) virtual display is described at that rate so the driver
+      // advertises it; multiplier modes describe the client rate and add its multiples.
+      const bool fixed_vd_refresh = session->framegen_fixed_refresh &&
+                                    session->framegen_refresh_millihz &&
+                                    *session->framegen_refresh_millihz > 0;
+      const uint32_t base_vd_fps_millihz = fixed_vd_refresh ?
+                                             *session->framegen_refresh_millihz :
+                                           session->client_display_refresh_millihz > 0 ?
+                                             session->client_display_refresh_millihz :
+                                             (session->fps > 0 ?
+                                                framegen::saturating_refresh_millihz(static_cast<uint32_t>(session->fps), 1000) :
+                                                0u);
       uint32_t vd_fps = rtsp_stream::effective_display_refresh_millihz(*session);
       if (vd_fps == 0) {
         vd_fps = 60000u;
@@ -558,10 +587,11 @@ namespace webrtc_stream {
         base_vd_fps_millihz,
         framegen_refresh_active,
         refresh_multiplier,
-        virtual_display_hdr_requested,
-        false,
-        !shared_mode
-      );
+          virtual_display_hdr_requested,
+          false,
+          !shared_mode,
+          !remote_display_topology::instance().protected_remote_monitor_client_ids().empty()
+        );
 
       if (display_info) {
         session->virtual_display = true;
@@ -736,6 +766,7 @@ namespace webrtc_stream {
       session->framegen_refresh_rate.reset();
       session->framegen_refresh_millihz.reset();
       session->framegen_refresh_multiplier = 1;
+      session->framegen_fixed_refresh = false;
     }
 #endif
 
@@ -831,7 +862,7 @@ namespace webrtc_stream {
       }
     }
 
-    bool starts_with_annexb(const std::vector<std::uint8_t> &data) {
+    [[maybe_unused]] bool starts_with_annexb(const std::vector<std::uint8_t> &data) {
       if (data.size() < 3) {
         return false;
       }
@@ -841,7 +872,7 @@ namespace webrtc_stream {
       return data.size() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1;
     }
 
-    std::string hex_prefix(const std::vector<std::uint8_t> &data, std::size_t max_bytes = 8) {
+    [[maybe_unused]] std::string hex_prefix(const std::vector<std::uint8_t> &data, std::size_t max_bytes = 8) {
       std::ostringstream oss;
       const std::size_t count = std::min(data.size(), max_bytes);
       for (std::size_t i = 0; i < count; ++i) {
@@ -864,21 +895,22 @@ namespace webrtc_stream {
       std::string frame_generation_provider = "lossless-scaling";
       bool uses_virtual_display = false;
       bool smooth_motion = false;
+      bool hdr = false;
+      bool prefer_sdr_10bit = false;
     };
 
-    struct WebRtcCaptureState {
+    struct WebRtcCaptureState: CaptureThreadOwner {
       std::mutex mutex;
       std::condition_variable teardown_cv;
       std::atomic_bool active {false};
       std::atomic_size_t pending_session_creations {0};
       std::atomic_bool teardown_in_progress {false};
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
       std::optional<config::runtime_output_override_lease_t> output_override_lease;
 #endif
       std::shared_ptr<safe::mail_raw_t> mail;
       std::shared_ptr<rtsp_stream::launch_session_t> launch_session;
-      std::thread video_thread;
-      std::thread audio_thread;
+      std::shared_ptr<void> normal_display_capture;
       std::thread feedback_thread;
       safe::mail_raw_t::queue_t<platf::gamepad_feedback_msg_t> feedback_queue;
       std::atomic_bool feedback_shutdown {false};
@@ -1022,9 +1054,22 @@ namespace webrtc_stream {
       return *pool;
     }
 
+    struct BrowserInput {
+      std::shared_ptr<safe::mail_raw_t> mail;
+      std::shared_ptr<input::input_t> context;
+    };
+    struct BrowserInputRegistration {
+      input::guide_button_config_t guide_button;
+      std::shared_ptr<BrowserInput> state;
+    };
     std::mutex input_mutex;
-    std::shared_ptr<safe::mail_raw_t> input_mail;
-    std::shared_ptr<input::input_t> input_context;
+    // Entries are registered with sessions; a late callback cannot recreate a
+    // disconnected session's input context.
+    std::unordered_map<std::string, BrowserInputRegistration> browser_inputs;
+    std::unordered_set<std::string> suspended_browser_inputs;
+    // Controller numbers are host-wide even though each session has its own input
+    // context: gamepad feedback arrives tagged with the number alone, and it is the
+    // only way to route it back to the one session driving that pad.
     std::mutex gamepad_mutex;
     std::bitset<16> webrtc_gamepads;
 
@@ -1032,43 +1077,84 @@ namespace webrtc_stream {
     /// Dimensions of the running capture, if one is running.
     std::optional<std::pair<int, int>> active_capture_dimensions();
 
-    std::shared_ptr<input::input_t> current_input_context() {
+    void register_session_input(const std::string &session_id, input::guide_button_config_t guide_button) {
+      std::lock_guard lg {input_mutex};
+      browser_inputs.emplace(session_id, BrowserInputRegistration {guide_button, {}});
+    }
+
+    input::guide_button_config_t guide_button_config_for_client(const SessionOptions &options) {
+      const int requested_app_id = options.app_id.value_or(0);
+      const int app_id = requested_app_id > 0 ? requested_app_id : proc::proc.current_app_id();
+      const auto app = proc::proc.resolve_app(app_id);
+      return config::guide_button_config_for_session(
+        app ? app->config_overrides : std::unordered_map<std::string, std::string> {},
+        options.client_uuid ? nvhttp::get_client_config_overrides(*options.client_uuid) : std::unordered_map<std::string, std::string> {}
+      );
+    }
+
+    std::shared_ptr<BrowserInput> current_input_context(std::string_view session_id) {
       auto capture_mail = current_capture_mail();
       std::lock_guard lg {input_mutex};
-      if (capture_mail && input_mail != capture_mail) {
-        if (input_context) {
-          input::reset(input_context);
-        }
-        input_context.reset();
-        input_mail.reset();
-        {
-          std::lock_guard lg {gamepad_mutex};
-          webrtc_gamepads.reset();
-        }
+      auto it = browser_inputs.find(std::string {session_id});
+      if (it == browser_inputs.end() || suspended_browser_inputs.contains(it->first)) {
+        return {};
       }
-      if (!input_context) {
-        input_mail = capture_mail ? capture_mail : std::make_shared<safe::mail_raw_t>();
-        input_context = input::alloc(input_mail);
+      auto &state = it->second.state;
+      if (state && capture_mail && state->mail != capture_mail) {
+        input::reset(state->context);
+        state.reset();
+      }
+      if (!state) {
+        state = std::make_shared<BrowserInput>();
+        state->mail = capture_mail ? capture_mail : std::make_shared<safe::mail_raw_t>();
+        state->context = input::alloc(state->mail, it->second.guide_button);
       }
 
       // Re-seed the touch port when it is missing or its dimensions have drifted from
       // the active capture. The first absolute mouse packet must find a port in the
       // mail or `client_to_touchport` returns nullopt and the cursor never moves. The
       // drift check (a struct compare) keeps the steady-state cost trivial.
-      input::ensure_touch_port(input_context, active_capture_dimensions());
-      return input_context;
+      input::ensure_touch_port(state->context, active_capture_dimensions());
+      return state;
     }
 
-    void reset_input_context() {
+    void reset_session_input(std::string_view session_id) {
       std::lock_guard lg {input_mutex};
-      if (input_context) {
-        input::reset(input_context);
+      auto it = browser_inputs.find(std::string {session_id});
+      if (it != browser_inputs.end()) {
+        if (it->second.state) {
+          input::reset(it->second.state->context);
+        }
+        suspended_browser_inputs.erase(it->first);
+        browser_inputs.erase(it);
       }
-      input_context.reset();
-      input_mail.reset();
-      {
-        std::lock_guard gamepad_lock {gamepad_mutex};
-        webrtc_gamepads.reset();
+    }
+
+    [[maybe_unused]] void suspend_session_input(std::string_view session_id) {
+      std::lock_guard lg {input_mutex};
+      auto it = browser_inputs.find(std::string {session_id});
+      if (it == browser_inputs.end()) {
+        return;
+      }
+      suspended_browser_inputs.insert(it->first);
+      if (it->second.state) {
+        input::reset(it->second.state->context);
+        it->second.state.reset();
+      }
+    }
+
+    [[maybe_unused]] void resume_session_input(std::string_view session_id) {
+      std::lock_guard lg {input_mutex};
+      suspended_browser_inputs.erase(std::string {session_id});
+    }
+
+    [[maybe_unused]] void reset_input_context() {
+      std::lock_guard lg {input_mutex};
+      for (auto &[id, registration] : browser_inputs) {
+        if (registration.state) {
+          input::reset(registration.state->context);
+          registration.state.reset();
+        }
       }
     }
 
@@ -1498,7 +1584,7 @@ namespace webrtc_stream {
     void forget_gamepad_slot(std::string_view session_id, int local_index);
     std::uint16_t session_gamepad_mask(std::string_view session_id);
 
-    void handle_input_message(std::string_view payload, std::string_view session_id = {}) {
+    [[maybe_unused]] void handle_input_message(std::string_view payload, std::string_view session_id = {}) {
       if (payload.empty()) {
         return;
       }
@@ -1526,10 +1612,11 @@ namespace webrtc_stream {
         return;
       }
 
-      auto input_ctx = current_input_context();
-      if (!input_ctx) {
+      auto input_state = current_input_context(session_id);
+      if (!input_state) {
         return;
       }
+      auto input_ctx = input_state->context;
       // This was hardcoded to _all_inputs, so every WebRTC client got
       // keyboard and mouse no matter what it had been granted. Vibepollo
       // already has a granular PERM enum and input::passthrough already
@@ -1736,17 +1823,131 @@ namespace webrtc_stream {
       std::atomic<bool> active {true};
     };
 
+    // Own the C wrapper and its raw callback contexts through synchronous
+    // control calls and the SDP continuation. Retirement rejects new call_t
+    // guards; work admitted before retirement may finish, including its next
+    // SDP SDK stage. The last admitted call performs Close without holding
+    // either the session mutex or the retirement mutex.
+    struct SessionPeerLifetime {
+      std::mutex mutex;
+      std::mutex setup_mutex;
+      bool retired = false;
+      bool closed = false;
+      unsigned calls = 0;
+      lwrtc_peer_t *peer = nullptr;
+      std::shared_ptr<lwrtc_factory_t> factory;
+      std::shared_ptr<SessionIceContext> ice_context;
+      std::shared_ptr<SessionDataChannelContext> data_channel_context;
+      std::shared_ptr<SessionKeyframeContext> keyframe_context;
+      std::shared_ptr<SessionRateContext> rate_context;
+      std::shared_ptr<lwrtc_audio_source_t> audio_source;
+      std::shared_ptr<lwrtc_video_source_t> video_source;
+      std::shared_ptr<lwrtc_encoded_video_source_t> encoded_video_source;
+      lwrtc_audio_track_t *audio_track = nullptr;
+      lwrtc_video_track_t *video_track = nullptr;
+      std::shared_ptr<lwrtc_data_channel_t> input_channel;
+
+      // Never hold the session or retirement mutex across an SDK call. An SDK
+      // may synchronously dispatch its completion on another thread and wait.
+      class call_t {
+        std::shared_ptr<SessionPeerLifetime> lifetime;
+      public:
+        explicit call_t(const std::shared_ptr<SessionPeerLifetime> &owner) {
+          std::lock_guard lock {owner->mutex};
+          if (owner->retired) return;
+          ++owner->calls;
+          lifetime = owner;
+        }
+        call_t(const call_t &) = delete;
+        explicit operator bool() const { return static_cast<bool>(lifetime); }
+        ~call_t() { if (lifetime) lifetime->finish_call(); }
+      };
+
+      void finish_call() {
+        bool close = false;
+        {
+          std::lock_guard lock {mutex};
+          close = --calls == 0 && retired && !std::exchange(closed, true);
+        }
+        if (close) close_native();
+      }
+
+      void retire() {
+        bool close = false;
+        {
+          std::lock_guard lock {mutex};
+          retired = true;
+          close = calls == 0 && !std::exchange(closed, true);
+        }
+        if (close) close_native();
+      }
+
+      void close_native() {
+        if (ice_context) ice_context->active.store(false, std::memory_order_release);
+        if (data_channel_context) data_channel_context->active.store(false, std::memory_order_release);
+        if (keyframe_context) keyframe_context->active.store(false, std::memory_order_release);
+        if (rate_context) rate_context->active.store(false, std::memory_order_release);
+        if (encoded_video_source) {
+          lwrtc_encoded_video_source_set_keyframe_callback(encoded_video_source.get(), nullptr, nullptr);
+          lwrtc_encoded_video_source_set_rate_callback(encoded_video_source.get(), nullptr, nullptr);
+        }
+        if (peer) lwrtc_peer_close(peer);
+        if (input_channel) {
+          lwrtc_data_channel_unregister_observer(input_channel.get());
+          lwrtc_data_channel_close(input_channel.get());
+        }
+      }
+
+      ~SessionPeerLifetime() {
+        retire();
+        if (peer) lwrtc_peer_release(peer);
+        input_channel.reset();
+        if (audio_track) lwrtc_audio_track_release(audio_track);
+        if (video_track) lwrtc_video_track_release(video_track);
+        encoded_video_source.reset();
+        video_source.reset();
+        audio_source.reset();
+        factory.reset();
+      }
+    };
+
     struct SessionPeerContext {
       std::string session_id;
-      lwrtc_peer_t *peer = nullptr;
+      // Destroy peer/resources before releasing the counted callback tail.
+      host_stream_control::callback_guard_t operation;
+      std::shared_ptr<SessionPeerLifetime> lifetime;
       int audio_channels = 2;
     };
 
     struct LocalDescriptionContext {
       std::string session_id;
-      lwrtc_peer_t *peer = nullptr;
+      // Destroy peer/resources before releasing the counted callback tail.
+      host_stream_control::callback_guard_t operation;
+      std::shared_ptr<SessionPeerLifetime> lifetime;
       std::string sdp;
       std::string type;
+    };
+
+    // A completion can transfer its context to an SDK call that completes
+    // inline and deletes that context before the enclosing SDK call returns.
+    // Retain another shared owner of the existing counted reservation for
+    // the whole entered callback scope.
+    // Reverse member destruction finishes the native call, drops every peer
+    // and context owner, then releases admission, including retired Close and
+    // final wrapper/resource release. No session or retirement mutex spans
+    // an SDK call.
+    template<class Context>
+    struct SessionSdpCallbackScope {
+      host_stream_control::callback_guard_t operation;
+      std::unique_ptr<Context> context;
+      std::shared_ptr<SessionPeerLifetime> lifetime;
+      SessionPeerLifetime::call_t peer_call;
+
+      explicit SessionSdpCallbackScope(Context *incoming):
+          operation(incoming->operation),
+          context(incoming),
+          lifetime(incoming->lifetime),
+          peer_call(lifetime) {}
     };
 
     lwrtc_constraints_t *create_constraints();
@@ -1844,7 +2045,8 @@ namespace webrtc_stream {
       std::shared_ptr<lwrtc_factory_t> factory;
       std::optional<Av1FmtpParams> av1_fmtp;
       std::optional<std::string> hevc_fmtp;
-      lwrtc_peer_t *peer = nullptr;
+      lwrtc_peer_t *peer = nullptr;  // Alias owned by peer_lifetime.
+      std::shared_ptr<SessionPeerLifetime> peer_lifetime = std::make_shared<SessionPeerLifetime>();
       std::shared_ptr<SessionIceContext> ice_context;
       std::shared_ptr<lwrtc_audio_source_t> audio_source;
       std::shared_ptr<lwrtc_video_source_t> video_source;
@@ -2152,6 +2354,8 @@ namespace webrtc_stream {
       uint32_t bitrate_bps,
       uint32_t /*framerate_fps*/
     ) {
+      host_stream_control::activity_guard_t activity;
+      if (!activity) return;
       auto *context = static_cast<SessionRateContext *>(user);
       if (!context || !context->active.load(std::memory_order_acquire) || bitrate_bps == 0) {
         return;
@@ -2218,7 +2422,7 @@ namespace webrtc_stream {
     /// The feedback event as the browser expects it, minus which pad it is for.
     /// The host names the pad by its GLOBAL slot; a browser knows only its own
     /// indices, so send_gamepad_feedback() fills in `id` per session.
-    std::optional<nlohmann::json> build_gamepad_feedback_payload(const platf::gamepad_feedback_msg_t &msg) {
+    [[maybe_unused]] std::optional<nlohmann::json> build_gamepad_feedback_payload(const platf::gamepad_feedback_msg_t &msg) {
       nlohmann::json payload;
       payload["type"] = "gamepad_feedback";
       switch (msg.type) {
@@ -2255,32 +2459,43 @@ namespace webrtc_stream {
     /// most one holder (claim_free_gamepad_slot_locked hands out only free bits),
     /// so the first match is the only one.
     void send_gamepad_feedback(int slot, nlohmann::json payload) {
-      std::lock_guard lg {session_mutex};
-      for (auto &[_, session] : sessions) {
-        int local_index = -1;
-        for (const auto &[index, held] : session.gamepad_slots) {
-          if (held == slot) {
-            local_index = index;
-            break;
+      host_stream_control::activity_guard_t activity;
+      if (!activity) return;
+      std::shared_ptr<SessionPeerLifetime> lifetime;
+      std::shared_ptr<lwrtc_data_channel_t> channel;
+      {
+        std::lock_guard lg {session_mutex};
+        for (auto &[_, session] : sessions) {
+          int local_index = -1;
+          for (const auto &[index, held] : session.gamepad_slots) {
+            if (held == slot) {
+              local_index = index;
+              break;
+            }
           }
+          if (local_index < 0) {
+            continue;
+          }
+          if (!session.peer_lifetime->input_channel) {
+            return;
+          }
+          lifetime = session.peer_lifetime;
+          channel = session.peer_lifetime->input_channel;
+          payload["id"] = local_index;
+          break;
         }
-        if (local_index < 0) {
-          continue;
-        }
-        if (!session.input_channel || lwrtc_data_channel_state(session.input_channel) != LWRTC_DATA_CHANNEL_OPEN) {
-          return;
-        }
-        payload["id"] = local_index;
-        const std::string text = payload.dump();
-        lwrtc_data_channel_send(
-          session.input_channel,
-          reinterpret_cast<const uint8_t *>(text.data()),
-          text.size(),
-          0
-        );
+      }
+      if (!channel) {
         return;
       }
+      SessionPeerLifetime::call_t peer_call {lifetime};
+      if (!peer_call || lwrtc_data_channel_state(channel.get()) != LWRTC_DATA_CHANNEL_OPEN) {
+        return;
+      }
+      const std::string text = payload.dump();
+      lwrtc_data_channel_send(channel.get(), reinterpret_cast<const uint8_t *>(text.data()), text.size(), 0);
     }
+
 #endif
 
     #ifdef SUNSHINE_ENABLE_WEBRTC
@@ -2517,7 +2732,7 @@ namespace webrtc_stream {
       std::optional<Av1FmtpParams> fmtp;
     };
 
-    Av1OfferInfo parse_av1_offer(std::string_view sdp) {
+    [[maybe_unused]] Av1OfferInfo parse_av1_offer(std::string_view sdp) {
       std::unordered_map<int, Av1FmtpParams> fmtp_params;
       std::vector<int> av1_payloads;
       bool in_video = false;
@@ -2617,7 +2832,7 @@ namespace webrtc_stream {
       std::vector<std::string> fmtp_candidates;
     };
 
-    HevcOfferInfo parse_hevc_offer(std::string_view sdp) {
+    [[maybe_unused]] HevcOfferInfo parse_hevc_offer(std::string_view sdp) {
       std::unordered_map<int, std::string> fmtp_params;
       std::vector<int> h265_payloads;
 
@@ -2682,7 +2897,7 @@ namespace webrtc_stream {
       return info;
     }
 
-    bool hevc_offer_supports_main10(std::string_view fmtp) {
+    [[maybe_unused]] bool hevc_offer_supports_main10(std::string_view fmtp) {
       std::optional<unsigned int> profile_id;
       std::optional<unsigned int> profile_space;
       std::size_t start = 0;
@@ -2736,7 +2951,7 @@ namespace webrtc_stream {
      * @param channels Number of audio channels (2 for stereo, 6 for 5.1, 8 for 7.1)
      * @return Modified SDP string
      */
-    std::string apply_opus_audio_params(std::string_view sdp, int channels) {
+    [[maybe_unused]] std::string apply_opus_audio_params(std::string_view sdp, int channels) {
       // Determine bitrate based on channel count (matching audio.cpp stream_configs)
       // Using HIGH_QUALITY bitrates since WebRTC config sets HIGH_QUALITY = true
       int bitrate = 512000;  // stereo high quality
@@ -2901,7 +3116,13 @@ namespace webrtc_stream {
 #endif
 
     bool resolve_prefer_10bit_sdr(const SessionOptions &options) {
-      return options.client_uuid && nvhttp::get_client_prefer_10bit_sdr(*options.client_uuid);
+      const int requested_app_id = options.app_id.value_or(0);
+      const int app_id = requested_app_id > 0 ? requested_app_id : proc::proc.current_app_id();
+      const auto app = app_id > 0 ? proc::proc.resolve_app(app_id) : std::optional<proc::ctx_t> {};
+      return rtsp_stream::hdr_request_policy::resolve_prefer_10bit_sdr(
+        options.client_uuid && nvhttp::get_client_prefer_10bit_sdr(*options.client_uuid),
+        app ? app->prefer_10bit_sdr : std::nullopt
+      );
     }
 
     video::config_t build_video_config(const SessionOptions &options, std::optional<bool> resolved_prefer_10bit_sdr = std::nullopt) {
@@ -3213,6 +3434,7 @@ namespace webrtc_stream {
       launch_session->framegen_refresh_rate.reset();
       launch_session->framegen_refresh_millihz.reset();
       launch_session->framegen_refresh_multiplier = 1;
+      launch_session->framegen_fixed_refresh = false;
       launch_session->frame_generation_enabled = false;
       launch_session->lossless_scaling_framegen = false;
       launch_session->lossless_scaling_target_fps.reset();
@@ -3244,8 +3466,11 @@ namespace webrtc_stream {
             if (!launch_session->virtual_display_layout_override && app_ctx->virtual_display_layout_override) {
               launch_session->virtual_display_layout_override = app_ctx->virtual_display_layout_override;
             }
-            if (!launch_session->dd_config_option_override && app_ctx->dd_config_option_override) {
+            if (!launch_session->dd_config_option_override) {
               launch_session->dd_config_option_override = app_ctx->dd_config_option_override;
+              if (!launch_session->dd_config_option_override) {
+                launch_session->dd_config_option_override = proc::display_policy::preparation_override(app_ctx->config_overrides);
+              }
             }
             if (app_ctx->output_name_override) {
               launch_session->output_name_override = *app_ctx->output_name_override;
@@ -3255,6 +3480,17 @@ namespace webrtc_stream {
         } catch (...) {
         }
       }
+
+      // Resolve display preparation after client and application fields.
+      const auto display_preparation = proc::display_policy::resolve_preparation(
+        config::video.dd.configuration_option,
+        launch_session->dd_config_option_override,
+        options.client_uuid ? proc::display_policy::preparation_override(nvhttp::get_client_config_overrides(*options.client_uuid)) : std::nullopt,
+        false,
+        proc::display_policy::virtual_display_override(*launch_session).value_or(false)
+      );
+      launch_session->dd_config_option_override = display_preparation.option;
+      launch_session->virtual_display_preparation_override = display_preparation.virtual_override;
 
       auto key = crypto::rand(16);
       launch_session->gcm_key.assign(key.begin(), key.end());
@@ -3303,7 +3539,7 @@ namespace webrtc_stream {
       return key;
     }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
     void acquire_webrtc_frame_limiter_locked(const WebRtcStreamStartParams &start_params) {
       const auto saturating_millihz = [](int fps) -> int {
         if (fps <= 0) {
@@ -3325,27 +3561,49 @@ namespace webrtc_stream {
         .frame_generation_provider = start_params.frame_generation_provider,
         .uses_virtual_display = start_params.uses_virtual_display,
         .capture_mode = config::video.capture,
+#ifdef _WIN32
         .auto_capture_uses_wgc = platf::dxgi::should_use_wgc_default(),
+#else
+        .auto_capture_uses_wgc = false,
+#endif
         .auto_virtual_framegen_limiter = config::frame_limiter.virtual_display_limiter_enabled(),
         .virtual_display_refresh_multiplier = config::frame_limiter.fixed_virtual_display_refresh_multiplier(),
+        .virtual_display_fixed_refresh_millihz = config::frame_limiter.fixed_virtual_display_refresh_millihz(),
       });
+#ifdef _WIN32
+      platf::frame_limiter_streaming_start(platf::frame_limiter_owner::webrtc, policy);
+#else
+      const auto color_mode = start_params.hdr ? platf::proton_color_mode::hdr :
+                              start_params.prefer_sdr_10bit ? platf::proton_color_mode::sdr10 :
+                                                             platf::proton_color_mode::sdr;
+      const auto wayland_hdr_compatibility = platf::wayland_hdr_compatibility::resolve(
+        config::video.dd.wayland_hdr_compatibility,
+        platf::wayland_hdr_compatibility::selected_session_is_wayland(
+          window_system == window_system_e::WAYLAND
+        ),
+        color_mode == platf::proton_color_mode::hdr
+      );
+      if (config::video.dd.wayland_hdr_compatibility && !wayland_hdr_compatibility.enabled) {
+        if (color_mode == platf::proton_color_mode::sdr10) {
+          BOOST_LOG(debug) << "Wayland HDR compatibility skipped: 10-bit SDR preferred.";
+        } else if (start_params.prefer_sdr_10bit) {
+          BOOST_LOG(debug) << "Wayland HDR compatibility skipped: session resolved to SDR.";
+        } else if (wayland_hdr_compatibility.suppression_reason ==
+                   platf::wayland_hdr_compatibility::suppression_reason_e::not_wayland) {
+          BOOST_LOG(debug) << "Wayland HDR compatibility skipped: the active session is not Wayland.";
+        } else {
+          BOOST_LOG(debug) << "Wayland HDR compatibility skipped: session resolved to SDR.";
+        }
+      }
       platf::frame_limiter_streaming_start(
         platf::frame_limiter_owner::webrtc,
-        policy
+        policy,
+        {.color_mode = color_mode,
+         .wayland_hdr_compatibility = wayland_hdr_compatibility.enabled}
       );
+#endif
     }
 #endif
-
-    struct WebRtcCaptureTeardown {
-      std::thread feedback_thread;
-      std::thread video_thread;
-      std::thread audio_thread;
-#ifdef SUNSHINE_ENABLE_WEBRTC
-      std::thread media_thread;
-#endif
-      bool capture_was_active {false};
-      std::optional<std::array<std::uint8_t, 16>> virtual_display_guid_bytes;
-    };
 
     std::optional<std::string> start_webrtc_capture(const SessionOptions &options) {
       // RTSP launch requests hold the same gate from their first session-state
@@ -3381,6 +3639,9 @@ namespace webrtc_stream {
 
       const int raw_requested_app_id = options.app_id.value_or(0);
       const auto requested_app_ctx = raw_requested_app_id > 0 ? proc::proc.resolve_app(raw_requested_app_id) : std::optional<proc::ctx_t> {};
+      if (requested_app_ctx && requested_app_ctx->remote_monitor_profile) {
+        return std::string {"Remote Monitor profiles require a paired Moonlight client."};
+      }
       const int requested_app_id = requested_app_ctx ? (int) util::from_view(requested_app_ctx->id) : raw_requested_app_id;
       const bool resume_only = options.resume.value_or(false);
 
@@ -3405,6 +3666,13 @@ namespace webrtc_stream {
       // the desktop (0) so the launch session and capture key stay well-formed.
       const int effective_app_id = requested_app_id > 0 ? requested_app_id : std::max(current_app_id, 0);
       const bool capture_already_active = webrtc_capture.active.load(std::memory_order_acquire);
+#if defined(_WIN32) || defined(__linux__)
+      // A fresh desktop capture can inherit RTSP's output after its app exits.
+      // It must not attach to an ended generation while that output drains.
+      if (!capture_already_active && remote_display_topology::instance().normal_game_release_pending()) {
+        return std::string {"The previous app's display is still being released; retry after its capture stops"};
+      }
+#endif
 
       if (options.guest_app_scope) {
         const int scope = *options.guest_app_scope > 0 ? requested_app_id : *options.guest_app_scope;
@@ -3449,6 +3717,8 @@ namespace webrtc_stream {
       // capture or limiter policy: global config, then application, then client.
       // An existing capture owns the process-wide runtime config, so additional
       // WebRTC sessions must reuse it rather than mutating the active stream.
+      // Outlive runtime rollback and pending metadata on every failed start.
+      audio::display_change_hold_t request_audio_hold {[] { return audio::capture_before_display_change(); }};
       bool runtime_overrides_applied = false;
       bool keep_runtime_overrides = false;
       auto runtime_overrides_guard = util::fail_guard([&]() {
@@ -3458,7 +3728,7 @@ namespace webrtc_stream {
         config::clear_runtime_config_overrides();
         if (!rtsp_sessions_active.load(std::memory_order_relaxed) &&
             !webrtc_capture.active.load(std::memory_order_acquire)) {
-          config::apply_config_now();
+          config::apply_config_now(std::ref(request_audio_hold));
         } else {
           config::mark_deferred_reload();
         }
@@ -3467,7 +3737,7 @@ namespace webrtc_stream {
       if (!rtsp_active && !capture_already_active) {
         config::set_runtime_config_overrides(std::move(requested_runtime_overrides));
         runtime_overrides_applied = true;
-        config::apply_config_now();
+        config::apply_config_now(std::ref(request_audio_hold));
       }
 
       auto stream_start_params = compute_stream_start_params(options, effective_app_id);
@@ -3494,6 +3764,13 @@ namespace webrtc_stream {
         audio_config = *webrtc_capture.active_audio_config;
       }
 
+      stream_start_params.hdr = video_config.dynamicRange != 0 &&
+                                !video_config.prefer_sdr_10bit &&
+                                !video_config.force_sdr;
+      stream_start_params.prefer_sdr_10bit = video_config.dynamicRange != 0 &&
+                                             video_config.prefer_sdr_10bit &&
+                                             !video_config.force_sdr;
+
       // Adopting the running key rather than rebuilding one from the guest's request.
       // The key is not derived from the video configuration alone — it also carries
       // the audio channel count, the host-audio flag and which application is being
@@ -3509,7 +3786,7 @@ namespace webrtc_stream {
         webrtc_capture.config_key &&
         *webrtc_capture.config_key == desired_key
       ) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
         acquire_webrtc_frame_limiter_locked(stream_start_params);
 #endif
         webrtc_capture.pending_session_creations.fetch_add(1, std::memory_order_release);
@@ -3528,6 +3805,19 @@ namespace webrtc_stream {
       auto launch_session = build_launch_session(options, effective_app_id, audio_channels, prefer_10bit_sdr);
 
 #ifdef _WIN32
+      request_audio_hold.capture_if_empty_and_attach(launch_session->audio_context_guard);
+#endif
+
+#ifdef __linux__
+      // WebRTC can share capture with RTSP and then outlive it. Own a lease
+      // even when that path skips private-display topology preparation.
+      launch_session->display_power_guard = platf::display_power::acquire();
+      if (!launch_session->display_power_guard) {
+        return std::string {"The desktop display could not be woken for streaming"};
+      }
+#endif
+
+#if defined(_WIN32) || defined(__linux__)
       std::optional<config::runtime_output_override_lease_t> pending_output_override_lease;
       auto output_override_guard = util::fail_guard([&]() {
         if (pending_output_override_lease) {
@@ -3535,13 +3825,28 @@ namespace webrtc_stream {
         }
       });
 #endif
+#ifdef __linux__
+      bool linux_private_display_prepared = false;
+      auto linux_private_display_guard = util::fail_guard([&]() {
+        if (linux_private_display_prepared) {
+          (void) platf::linux_display::backend().revert();
+        }
+      });
+#endif
 
       const bool allow_display_changes = !rtsp_active && !resume_only;
-#ifndef _WIN32
       if (allow_display_changes && launch_session->output_name_override) {
-        config::set_runtime_output_name_override(*launch_session->output_name_override);
-      }
+#ifdef _WIN32
+        if (launch_session->output_name_override->empty() ||
+            !VDISPLAY::is_virtual_display_selection(*launch_session->output_name_override)) {
+          pending_output_override_lease =
+            config::set_runtime_output_name_override_with_lease(*launch_session->output_name_override);
+        }
+#else
+        pending_output_override_lease =
+          config::set_runtime_output_name_override_with_lease(*launch_session->output_name_override);
 #endif
+      }
 
       desired_key = build_capture_config_key(effective_app_id, video_config, options);
 
@@ -3565,6 +3870,10 @@ namespace webrtc_stream {
         if (webrtc_capture.stream_start_params) {
           webrtc_capture.stream_start_params->uses_virtual_display = launch_session->virtual_display;
         }
+        if (launch_session->virtual_display_hdr_enabled == false && !rtsp_stream::rtx_hdr_conversion_requested(*launch_session, config::video)) {
+          video_config.dynamicRange = 0;
+          video_config.force_sdr = true;
+        }
         if (allow_display_changes ||
             launch_session->virtual_display_recreated_on_demand ||
             launch_session->virtual_display_needs_resume_apply) {
@@ -3576,26 +3885,40 @@ namespace webrtc_stream {
                            << " for client '" << launch_session->client_name << "'.";
           (void) display_helper_integration::disarm_pending_restore();
           auto request = display_helper_integration::helpers::build_request_from_session(config::video, *launch_session);
-          bool applied = false;
-          display_helper_integration::ApplyVerificationTicket verification_ticket;
           if (!request) {
-            BOOST_LOG(warning) << "Display helper: failed to build display configuration request; continuing with existing display.";
-          } else if (!(applied = display_helper_integration::apply(*request, &verification_ticket))) {
-            BOOST_LOG(warning) << "Display helper: failed to apply display configuration; continuing with existing display.";
+            BOOST_LOG(warning) << "Display helper: no display configuration request; using the existing display.";
+          } else if (!display_helper_integration::apply(
+                       *request, nullptr, {}, display_helper_integration::ApplyRetryPolicy::StreamStart)) {
+            BOOST_LOG(warning) << "Display helper: display setup did not complete; continuing WebRTC stream startup with the existing display.";
           }
-
-          if (applied) {
-            // Soft gate: wait (bounded) for the helper's apply verification before
-            // probing encoders so the first capture isn't grabbed mid-modeset.
-            const auto verification_status =
-              display_helper_integration::wait_for_apply_verification(
-                verification_ticket,
-                display_helper_integration::kApplyVerificationTimeout);
-            if (verification_status != display_helper_integration::ApplyVerificationStatus::Verified) {
-              BOOST_LOG(warning)
-                << "Display helper validation did not confirm the WebRTC target; continuing with GPU capability probing.";
-            }
-          }
+        }
+#elif defined(__linux__)
+        const auto prepared_display = platf::linux_display::backend().prepare_session(
+          *launch_session,
+          !capture_already_active,
+          allow_display_changes
+        );
+        if (!prepared_display.output_name.empty()) {
+          pending_output_override_lease =
+            config::set_runtime_output_name_override_with_lease(prepared_display.output_name);
+        }
+        if (prepared_display.owns_output) {
+          linux_private_display_prepared = true;
+        } else if (!prepared_display.error.empty()) {
+          return prepared_display.error;
+        }
+        if (webrtc_capture.stream_start_params) {
+          webrtc_capture.stream_start_params->uses_virtual_display = launch_session->virtual_display;
+        }
+        if (launch_session->virtual_display &&
+            (allow_display_changes || launch_session->virtual_display_recreated_on_demand ||
+             launch_session->virtual_display_needs_resume_apply) &&
+            !platf::linux_display::backend().apply_session(*launch_session)) {
+          return std::string {"Failed to activate the Linux private streaming display."};
+        }
+        if (launch_session->virtual_display_hdr_enabled == false && !rtsp_stream::rtx_hdr_conversion_requested(*launch_session, config::video)) {
+          video_config.dynamicRange = 0;
+          video_config.force_sdr = true;
         }
 #endif
 
@@ -3608,14 +3931,15 @@ namespace webrtc_stream {
 
           if (VDISPLAY::policy::should_ensure_probe_display(launch_session->virtual_display)) {
             ensure_result = VDISPLAY::ensure_display();
-            if (!ensure_result.ready_for_probe()) {
-              return std::string {"No usable display is available on the selected capture adapter."};
+            if (!ensure_result.owns_temporary_probe_request() && !ensure_result.ready_for_capture()) {
+              BOOST_LOG(warning)
+                << "WebRTC could not acquire a temporary-display lease; continuing with synthetic encoder validation.";
             }
           }
 
           const bool probe_failed = video::probe_encoders();
           if (probe_failed) {
-            return std::string {"Failed to initialize video capture/encoding. Is a display connected and turned on?"};
+            return std::string {"Failed to initialize a video encoder on the selected adapter."};
           }
         } else {
           BOOST_LOG(debug) << "WebRTC encoder probe skipped (matching selected-GPU cache).";
@@ -3637,12 +3961,24 @@ namespace webrtc_stream {
       video_config = build_video_config(options, prefer_10bit_sdr);
       apply_rtsp_video_overrides(video_config, rtsp_config);
       apply_rtx_hdr_stream_policy(video_config);
+#ifdef __linux__
+      if (launch_session->virtual_display_hdr_enabled == false && !rtsp_stream::rtx_hdr_conversion_requested(*launch_session, config::video)) {
+        video_config.dynamicRange = 0;
+        video_config.force_sdr = true;
+      }
+#endif
       desired_key = build_capture_config_key(effective_app_id, video_config, options);
       launch_session->enable_hdr = video_config.dynamicRange != 0 &&
                                    !video_config.prefer_sdr_10bit &&
                                    !video_config.force_sdr;
       launch_session->prefer_sdr_10bit = video_config.prefer_sdr_10bit;
       launch_session->force_sdr = video_config.force_sdr;
+      if (webrtc_capture.stream_start_params) {
+        webrtc_capture.stream_start_params->hdr = launch_session->enable_hdr;
+        webrtc_capture.stream_start_params->prefer_sdr_10bit =
+          video_config.dynamicRange != 0 && video_config.prefer_sdr_10bit &&
+          !video_config.force_sdr;
+      }
 
       // Do not launch an application until the selected adapter has proven it
       // can satisfy the requested codec and dynamic range. Otherwise a bad
@@ -3662,37 +3998,56 @@ namespace webrtc_stream {
         }
       }
 
-      auto mail = std::make_shared<safe::mail_raw_t>();
-      webrtc_capture.mail = mail;
-      webrtc_capture.launch_session = launch_session;
-      webrtc_capture.app_id = effective_app_id > 0 ? std::optional<int> {effective_app_id} : std::nullopt;
-      webrtc_capture.config_key = desired_key;
-      webrtc_capture.active_video_config = video_config;
-      webrtc_capture.active_audio_config = audio_config;
-      webrtc_capture.published_bitrate_kbps.reset();
-#ifdef _WIN32
-      if (pending_output_override_lease) {
-        webrtc_capture.output_override_lease = pending_output_override_lease;
+      std::shared_ptr<void> normal_display_capture;
+#if defined(_WIN32) || defined(__linux__)
+      const auto app = proc::proc.active_session_guard();
+      if (app.normal_vdd_identity_token != 0) {
+        normal_display_capture = remote_display_topology::instance().retain_normal_game_capture(
+          app.client_uuid,
+          app.normal_vdd_identity_token
+        );
+        if (!normal_display_capture) {
+          return std::string {"The app's display ownership ended before capture could start"};
+        }
       }
-      output_override_guard.disable();
 #endif
-      webrtc_capture.feedback_shutdown.store(false, std::memory_order_release);
+      auto mail = std::make_shared<safe::mail_raw_t>();
+      start_capture_with_audio_hold(webrtc_capture, launch_session->audio_context_guard, [&] {
+        webrtc_capture.normal_display_capture = std::move(normal_display_capture);
+        webrtc_capture.mail = mail;
+        webrtc_capture.launch_session = launch_session;
+        webrtc_capture.app_id = effective_app_id > 0 ? std::optional<int> {effective_app_id} : std::nullopt;
+        webrtc_capture.config_key = desired_key;
+        webrtc_capture.active_video_config = video_config;
+        webrtc_capture.active_audio_config = audio_config;
+        webrtc_capture.published_bitrate_kbps.reset();
+#if defined(_WIN32) || defined(__linux__)
+        if (pending_output_override_lease) {
+          webrtc_capture.output_override_lease = pending_output_override_lease;
+        }
+        output_override_guard.disable();
+#endif
+#ifdef __linux__
+        linux_private_display_guard.disable();
+#endif
+        webrtc_capture.feedback_shutdown.store(false, std::memory_order_release);
 #ifdef SUNSHINE_ENABLE_WEBRTC
-      webrtc_capture.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
-      webrtc_capture.feedback_thread = std::thread([queue = webrtc_capture.feedback_queue]() {
-        feedback_thread_main(queue);
-      });
+        webrtc_capture.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
+        webrtc_capture.feedback_thread = std::thread([queue = webrtc_capture.feedback_queue]() {
+          feedback_thread_main(queue);
+        });
 #endif
-      webrtc_capture.active.store(true, std::memory_order_release);
+        webrtc_capture.active.store(true, std::memory_order_release);
 
-      // No shared video encoder any more — each session starts its own in
-      // start_session_encoder(), over this same display capture. Audio stays shared
-      // because every peer gets the same Opus stream.
-      webrtc_capture.audio_thread = std::thread([mail, audio_config]() mutable {
-        audio::capture(mail, audio_config, nullptr);
+        // No shared video encoder any more — each session starts its own in
+        // start_session_encoder(), over this same display capture. Audio stays shared
+        // because every peer gets the same Opus stream.
+        webrtc_capture.audio_thread = std::thread([mail, audio_config]() mutable {
+          audio::capture(mail, audio_config, nullptr);
+        });
       });
       keep_runtime_overrides = true;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
       acquire_webrtc_frame_limiter_locked(*webrtc_capture.stream_start_params);
 #endif
       stream::session::arm_shared_runtime_cleanup(
@@ -3783,6 +4138,7 @@ namespace webrtc_stream {
         teardown.feedback_thread = std::move(webrtc_capture.feedback_thread);
         teardown.video_thread = std::move(webrtc_capture.video_thread);
         teardown.audio_thread = std::move(webrtc_capture.audio_thread);
+        teardown.audio_context_guard = std::move(webrtc_capture.audio_context_guard);
 #ifdef SUNSHINE_ENABLE_WEBRTC
         teardown.media_thread = take_media_thread_for_stop();
 #endif
@@ -3790,28 +4146,23 @@ namespace webrtc_stream {
 
       lifecycle_lock.unlock();
 #ifdef SUNSHINE_ENABLE_WEBRTC
+      reset_input_context();
       if (teardown.media_thread.joinable()) {
         teardown.media_thread.join();
       }
-      reset_input_context();
 #endif
       if (teardown.feedback_thread.joinable()) {
         teardown.feedback_thread.join();
       }
-      if (teardown.video_thread.joinable()) {
-        teardown.video_thread.join();
-      }
-      if (teardown.audio_thread.joinable()) {
-        teardown.audio_thread.join();
-      }
+      teardown.join_capture();
 
       lifecycle_lock.lock();
       bool finalized_shared_runtime = false;
       {
         std::unique_lock<std::mutex> capture_lock(webrtc_capture.mutex);
+        webrtc_capture.normal_display_capture.reset();
         webrtc_capture.feedback_queue.reset();
         webrtc_capture.mail.reset();
-        webrtc_capture.launch_session.reset();
         webrtc_capture.app_id.reset();
         webrtc_capture.config_key.reset();
         webrtc_capture.active_video_config.reset();
@@ -3838,6 +4189,8 @@ namespace webrtc_stream {
             platf::frame_limiter_owner::webrtc,
             keep_rtss_running
           );
+#elif defined(__linux__)
+          platf::frame_limiter_streaming_stop(platf::frame_limiter_owner::webrtc);
 #endif
         }
 
@@ -3856,9 +4209,10 @@ namespace webrtc_stream {
           "webrtc_capture_stop",
           finalize_context
         );
+        webrtc_capture.launch_session.reset();
         if (finalized_shared_runtime) {
           // The centralized finalizer invalidates any output override lease.
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
           webrtc_capture.output_override_lease.reset();
 #endif
         }
@@ -3881,6 +4235,8 @@ namespace webrtc_stream {
     }
 
     void stop_webrtc_capture_if_idle(bool *teardown_reserved = nullptr) {
+    host_stream_control::activity_guard_t activity;
+    if (!activity) return;
       std::unique_lock<std::mutex> lifecycle_lock(nvhttp::stream_lifecycle_mutex());
       (void) stop_webrtc_capture_if_idle_with_lifecycle_lock(
         lifecycle_lock,
@@ -3889,6 +4245,8 @@ namespace webrtc_stream {
     }
 
     void cancel_pending_webrtc_session_creation() {
+    host_stream_control::activity_guard_t activity;
+    if (!activity) return;
       stream::session::cleanup_reservation_t cleanup_reservation;
       std::unique_lock<std::mutex> lifecycle_lock(nvhttp::stream_lifecycle_mutex());
       {
@@ -3907,6 +4265,8 @@ namespace webrtc_stream {
       int mline_index,
       const char *candidate
     ) {
+      host_stream_control::activity_guard_t activity;
+      if (!activity) return;
       auto *ctx = static_cast<SessionIceContext *>(user);
       if (!ctx || !ctx->active.load(std::memory_order_acquire)) {
         return;
@@ -3937,14 +4297,15 @@ namespace webrtc_stream {
         return;
       }
 
-      auto input_ctx = current_input_context();
-      if (!input_ctx) {
+      auto input_state = current_input_context(ctx->id);
+      if (!input_state) {
         return;
       }
       // Same grant as the JSON path. Without this a gamepad-only guest
       // could still move the host mouse by sending binary input, which
       // would defeat the permission entirely.
-      const auto input_permission = ctx ? session_input_grant(ctx->id).permission : crypto::PERM::_no;
+      const auto input_permission = session_input_grant(ctx->id).permission;
+      auto input_ctx = input_state->context;
 
       const auto type = buffer[0];
       if (type != kInputBinaryMouseMove || length < kInputBinaryMouseMoveSize) {
@@ -3985,6 +4346,8 @@ namespace webrtc_stream {
     }
 
     void on_data_channel_message(void *user, const char *buffer, int length, int binary) {
+      host_stream_control::activity_guard_t activity;
+      if (!activity) return;
       if (!buffer || length <= 0) {
         return;
       }
@@ -4015,7 +4378,30 @@ namespace webrtc_stream {
       );
     }
 
+    void on_peer_state(void *user, int state) {
+      host_stream_control::activity_guard_t activity;
+      if (!activity) return;
+      auto *ctx = static_cast<SessionDataChannelContext *>(user);
+      if (!ctx || !ctx->active.load(std::memory_order_acquire)) {
+        return;
+      }
+      if (state == LWRTC_PEER_DISCONNECTED) {
+        // ICE can recover without closing SCTP. Release held input now, then
+        // allocate a fresh context only after the connection recovers.
+        suspend_session_input(ctx->id);
+      } else if (state == LWRTC_PEER_CONNECTED) {
+        resume_session_input(ctx->id);
+      } else if (state == LWRTC_PEER_FAILED || state == LWRTC_PEER_CLOSED) {
+        reset_session_input(ctx->id);
+        task_pool.push([session_id = ctx->id]() {
+          close_session(session_id);
+        });
+      }
+    }
+
     void on_data_channel_state(void *user, int state) {
+      host_stream_control::activity_guard_t activity;
+      if (!activity) return;
       auto *ctx = static_cast<SessionDataChannelContext *>(user);
       if (!ctx || !ctx->active.load(std::memory_order_acquire) ||
           state != LWRTC_DATA_CHANNEL_CLOSED) {
@@ -4023,6 +4409,7 @@ namespace webrtc_stream {
       }
 
       auto session_id = ctx->id;
+      reset_session_input(session_id);
       BOOST_LOG(debug) << "WebRTC: input data channel closed; scheduling session teardown id=" << session_id;
       task_pool.push([session_id = std::move(session_id)]() {
         close_session(session_id);
@@ -4123,52 +4510,47 @@ namespace webrtc_stream {
     }
 
     void on_data_channel(void *user, lwrtc_data_channel_t *channel) {
+      host_stream_control::activity_guard_t activity;
+      if (!activity) { if (channel) lwrtc_data_channel_release(channel); return; }
+      auto incoming = make_lwrtc_ptr<lwrtc_data_channel_t, lwrtc_data_channel_release>(channel);
       auto *ctx = static_cast<SessionDataChannelContext *>(user);
-      if (!ctx || !ctx->active.load(std::memory_order_acquire) || !channel) {
-        if (channel) {
-          lwrtc_data_channel_release(channel);
-        }
-        return;
-      }
-
-      const char *label = lwrtc_data_channel_label(channel);
-      BOOST_LOG(debug) << "WebRTC: data channel opened label=" << (label ? label : "(null)");
-      if (!label || std::string_view {label} != "input") {
-        lwrtc_data_channel_release(channel);
-        return;
-      }
-
+      if (!ctx || !ctx->active.load(std::memory_order_acquire) || !incoming) return;
+      std::shared_ptr<SessionPeerLifetime> lifetime;
       {
         std::lock_guard lg {session_mutex};
         auto it = sessions.find(ctx->id);
-        if (it == sessions.end()) {
-          lwrtc_data_channel_release(channel);
-          return;
-        }
-
-        if (it->second.input_channel) {
-          lwrtc_data_channel_unregister_observer(it->second.input_channel);
-          lwrtc_data_channel_release(it->second.input_channel);
-        }
-        it->second.input_channel = channel;
-        if (it->second.data_channel_context) {
-          it->second.data_channel_context->mouse_move_seq_initialized.store(false, std::memory_order_release);
-          it->second.data_channel_context->last_mouse_move_seq.store(0, std::memory_order_release);
-          it->second.data_channel_context->last_mouse_move_at_ms.store(0, std::memory_order_release);
-        }
-        lwrtc_data_channel_register_observer(channel, &on_data_channel_state, &on_data_channel_message, ctx);
+        if (it == sessions.end() || it->second.data_channel_context.get() != ctx) return;
+        lifetime = it->second.peer_lifetime;
       }
+      SessionPeerLifetime::call_t peer_call {lifetime};
+      if (!peer_call) return;
+      const char *label = lwrtc_data_channel_label(channel);
+      if (!label || std::string_view {label} != "input") return;
+      std::shared_ptr<lwrtc_data_channel_t> previous;
+      {
+        std::lock_guard lg {session_mutex};
+        auto it = sessions.find(ctx->id);
+        if (it == sessions.end() || it->second.peer_lifetime != lifetime) return;
+        previous = std::exchange(lifetime->input_channel, incoming);
+        it->second.input_channel = channel;
+        ctx->mouse_move_seq_initialized.store(false, std::memory_order_release);
+        ctx->last_mouse_move_seq.store(0, std::memory_order_release);
+        ctx->last_mouse_move_at_ms.store(0, std::memory_order_release);
+      }
+      if (previous) lwrtc_data_channel_unregister_observer(previous.get());
+      lwrtc_data_channel_register_observer(channel, &on_data_channel_state, &on_data_channel_message, ctx);
     }
 
     void on_set_local_success(void *user) {
-      auto *ctx = static_cast<LocalDescriptionContext *>(user);
-      if (!ctx) {
-        return;
-      }
+      auto *incoming = static_cast<LocalDescriptionContext *>(user);
+      if (!incoming) return;
+      SessionSdpCallbackScope<LocalDescriptionContext> callback {incoming};
+      auto &ctx = callback.context;
+      [[maybe_unused]] auto &lifetime = callback.lifetime;
+      if (!callback.peer_call) return;
       if (!set_local_answer(ctx->session_id, ctx->sdp, ctx->type)) {
         BOOST_LOG(error) << "WebRTC: failed to store local description for " << ctx->session_id;
       }
-      delete ctx;
     }
 
     void store_negotiation_error(const std::string &session_id, std::string message) {
@@ -4186,24 +4568,26 @@ namespace webrtc_stream {
     }
 
     void on_set_local_failure(void *user, const char *err) {
-      auto *ctx = static_cast<LocalDescriptionContext *>(user);
-      if (!ctx) {
-        return;
-      }
+      auto *incoming = static_cast<LocalDescriptionContext *>(user);
+      if (!incoming) return;
+      SessionSdpCallbackScope<LocalDescriptionContext> callback {incoming};
+      auto &ctx = callback.context;
+      [[maybe_unused]] auto &lifetime = callback.lifetime;
+      if (!callback.peer_call) return;
       BOOST_LOG(error) << "WebRTC: failed to set local description for " << ctx->session_id
                        << ": " << (err ? err : "unknown");
       store_negotiation_error(ctx->session_id, std::string {"Failed to set local description: "} + (err ? err : "unknown"));
-      delete ctx;
     }
 
     void on_create_answer_success(void *user, const char *sdp, const char *type) {
-      auto *ctx = static_cast<SessionPeerContext *>(user);
-      if (!ctx) {
-        return;
-      }
-      if (!ctx->peer) {
+      auto *incoming = static_cast<SessionPeerContext *>(user);
+      if (!incoming) return;
+      SessionSdpCallbackScope<SessionPeerContext> callback {incoming};
+      auto &ctx = callback.context;
+      [[maybe_unused]] auto &lifetime = callback.lifetime;
+      if (!callback.peer_call) return;
+      if (!lifetime->peer) {
         BOOST_LOG(error) << "WebRTC: missing peer connection for " << ctx->session_id;
-        delete ctx;
         return;
       }
       std::string sdp_copy = sdp ? sdp : "";
@@ -4217,63 +4601,66 @@ namespace webrtc_stream {
 
       auto *local_ctx = new LocalDescriptionContext {
         ctx->session_id,
-        ctx->peer,
+        ctx->operation,
+        lifetime,
         std::move(sdp_copy),
         std::move(type_copy)
       };
       lwrtc_peer_set_local_description(
-        ctx->peer,
+        lifetime->peer,
         local_ctx->sdp.c_str(),
         local_ctx->type.c_str(),
         &on_set_local_success,
         &on_set_local_failure,
         local_ctx
       );
-      delete ctx;
     }
 
     void on_create_answer_failure(void *user, const char *err) {
-      auto *ctx = static_cast<SessionPeerContext *>(user);
-      if (!ctx) {
-        return;
-      }
+      auto *incoming = static_cast<SessionPeerContext *>(user);
+      if (!incoming) return;
+      SessionSdpCallbackScope<SessionPeerContext> callback {incoming};
+      auto &ctx = callback.context;
+      [[maybe_unused]] auto &lifetime = callback.lifetime;
+      if (!callback.peer_call) return;
       BOOST_LOG(error) << "WebRTC: failed to create answer for " << ctx->session_id
                        << ": " << (err ? err : "unknown");
       store_negotiation_error(ctx->session_id, std::string {"Failed to create answer: "} + (err ? err : "unknown"));
-      delete ctx;
     }
 
     void on_set_remote_success(void *user) {
-      auto *ctx = static_cast<SessionPeerContext *>(user);
-      if (!ctx) {
-        return;
-      }
-      if (!ctx->peer) {
+      auto *incoming = static_cast<SessionPeerContext *>(user);
+      if (!incoming) return;
+      SessionSdpCallbackScope<SessionPeerContext> callback {incoming};
+      auto &ctx = callback.context;
+      [[maybe_unused]] auto &lifetime = callback.lifetime;
+      if (!callback.peer_call) return;
+      if (!lifetime->peer) {
         BOOST_LOG(error) << "WebRTC: missing peer connection for " << ctx->session_id;
-        delete ctx;
         return;
       }
       auto *constraints = create_constraints();
       if (!constraints) {
         BOOST_LOG(error) << "WebRTC: failed to create media constraints";
-        delete ctx;
         return;
       }
       lwrtc_peer_create_answer(
-        ctx->peer,
+        lifetime->peer,
         &on_create_answer_success,
         &on_create_answer_failure,
         constraints,
-        ctx
+        ctx.release()
       );
       lwrtc_constraints_release(constraints);
     }
 
     void on_set_remote_failure(void *user, const char *err) {
-      auto *ctx = static_cast<SessionPeerContext *>(user);
-      if (!ctx) {
-        return;
-      }
+      auto *incoming = static_cast<SessionPeerContext *>(user);
+      if (!incoming) return;
+      SessionSdpCallbackScope<SessionPeerContext> callback {incoming};
+      auto &ctx = callback.context;
+      [[maybe_unused]] auto &lifetime = callback.lifetime;
+      if (!callback.peer_call) return;
       BOOST_LOG(error) << "WebRTC: failed to set remote description for " << ctx->session_id
                        << ": " << (err ? err : "unknown");
       std::string offer_sdp;
@@ -4290,7 +4677,6 @@ namespace webrtc_stream {
                          << offer_sdp;
       }
       store_negotiation_error(ctx->session_id, std::string {"Failed to set remote description: "} + (err ? err : "unknown"));
-      delete ctx;
     }
 
     std::mutex webrtc_media_mutex;
@@ -5699,6 +6085,8 @@ namespace webrtc_stream {
         lwrtc_encoded_video_source_set_keyframe_callback(
           session.encoded_video_source.get(),
           [](void *user) {
+            host_stream_control::activity_guard_t activity;
+            if (!activity) return;
             auto *ctx = static_cast<SessionKeyframeContext *>(user);
             if (!ctx || !ctx->active.load(std::memory_order_acquire)) {
               return;
@@ -5998,6 +6386,7 @@ namespace webrtc_stream {
       std::chrono::duration_cast<std::chrono::milliseconds>(session.video_pacing.max_frame_age).count()
     );
 
+    const auto guide_button = guide_button_config_for_client(options);
     SessionState snapshot = session.state;
     bool first_session = false;
     {
@@ -6012,8 +6401,10 @@ namespace webrtc_stream {
       }
       {
         std::lock_guard lg {session_mutex};
+        register_session_input(snapshot.id, guide_button);
         const auto inserted = sessions.emplace(snapshot.id, std::move(session)).first;
         first_session = active_sessions.fetch_add(1, std::memory_order_relaxed) == 0;
+        host_stats::webrtc_session_started();
         // After insertion, so the first packets this encoder produces have somewhere to go.
         start_session_encoder(inserted->second);
       }
@@ -6054,6 +6445,11 @@ namespace webrtc_stream {
   }
 
   bool close_session(std::string_view id) {
+    host_stream_control::activity_guard_t activity;
+    if (!activity) return false;
+    // Input release must not wait for the lifecycle gate, peer teardown or
+    // the last browser viewer to disconnect.
+    reset_session_input(id);
     bool teardown_reserved = false;
     auto teardown_reservation = util::fail_guard([&]() {
       if (!teardown_reserved) {
@@ -6077,21 +6473,14 @@ namespace webrtc_stream {
 
 #ifdef SUNSHINE_ENABLE_WEBRTC
     BOOST_LOG(debug) << "WebRTC: close_session enter id=" << id;
-    std::shared_ptr<lwrtc_factory_t> factory;
-    lwrtc_peer_t *peer = nullptr;
+    std::shared_ptr<SessionPeerLifetime> peer_lifetime;
     std::shared_ptr<SessionIceContext> ice_context;
-    lwrtc_audio_track_t *audio_track = nullptr;
-    lwrtc_video_track_t *video_track = nullptr;
-    std::shared_ptr<lwrtc_audio_source_t> audio_source;
-    std::shared_ptr<lwrtc_video_source_t> video_source;
-    std::shared_ptr<lwrtc_encoded_video_source_t> encoded_video_source;
-    lwrtc_data_channel_t *input_channel = nullptr;
     std::shared_ptr<SessionDataChannelContext> data_channel_context;
     std::shared_ptr<SessionKeyframeContext> keyframe_context;
     std::shared_ptr<SessionRateContext> rate_context;
 #endif
     bool removed = false;
-    bool last_session = false;
+    [[maybe_unused]] bool last_session = false;
     {
       std::unique_lock<std::mutex> lifecycle_lock(nvhttp::stream_lifecycle_mutex());
       {
@@ -6103,15 +6492,8 @@ namespace webrtc_stream {
         teardown_sessions.fetch_add(1, std::memory_order_acq_rel);
         teardown_reserved = true;
 #ifdef SUNSHINE_ENABLE_WEBRTC
-        factory = std::move(it->second.factory);
-        peer = it->second.peer;
+        peer_lifetime = it->second.peer_lifetime;
         ice_context = it->second.ice_context;
-        audio_track = it->second.audio_track;
-        video_track = it->second.video_track;
-        audio_source = std::move(it->second.audio_source);
-        video_source = std::move(it->second.video_source);
-        encoded_video_source = std::move(it->second.encoded_video_source);
-        input_channel = it->second.input_channel;
         data_channel_context = it->second.data_channel_context;
         keyframe_context = it->second.keyframe_context;
         rate_context = it->second.rate_context;
@@ -6126,6 +6508,7 @@ namespace webrtc_stream {
         // An HTTP observer that acquires active_sessions == 0 must also observe
         // the preceding teardown_sessions increment.
         last_session = active_sessions.fetch_sub(1, std::memory_order_acq_rel) == 1;
+        host_stats::webrtc_session_ended();
       }
     }
     if (removed) {
@@ -6138,27 +6521,9 @@ namespace webrtc_stream {
     // arrival packet was dropped as a duplicate — their pad was never allocated and every
     // input they sent was discarded.
     if (claimed_gamepad_slots.any()) {
-      // Tell the host the pads are gone. Releasing the slot bits below only frees them
-      // for the NEXT session; the virtual controllers themselves stay plugged in until
-      // a state packet with the slot's bit clear reaches input.cpp. Without this a
-      // guest who closed the tab left a ghost pad the game still saw, and the next
-      // guest given that slot was refused as "already allocated".
-      std::shared_ptr<input::input_t> input_ctx;
-      {
-        std::lock_guard lg {input_mutex};
-        input_ctx = input_context;
-      }
-      if (input_ctx) {
-        for (std::size_t slot = 0; slot < claimed_gamepad_slots.size(); ++slot) {
-          if (claimed_gamepad_slots.test(slot)) {
-            input::passthrough(
-              input_ctx,
-              make_gamepad_state_packet(static_cast<int>(slot), 0, 0, 0, 0, 0, 0, 0, 0),
-              crypto::PERM::input_controller
-            );
-          }
-        }
-      }
+      // The pads themselves were unplugged by reset_session_input() above, which
+      // frees every controller on this session's own input context. Releasing the
+      // slot bits here only makes the numbers available to the NEXT session.
       std::lock_guard lg {gamepad_mutex};
       for (std::size_t slot = 0; slot < claimed_gamepad_slots.size(); ++slot) {
         if (claimed_gamepad_slots.test(slot)) {
@@ -6175,18 +6540,10 @@ namespace webrtc_stream {
     // milliseconds — so no input, ICE or rate callback runs for a session that has
     // already left the registry. Even if peer construction failed partway through
     // track setup, deactivating is harmless.
-    if (ice_context) {
-      ice_context->active.store(false, std::memory_order_release);
-    }
-    if (data_channel_context) {
-      data_channel_context->active.store(false, std::memory_order_release);
-    }
-    if (keyframe_context) {
-      keyframe_context->active.store(false, std::memory_order_release);
-    }
-    if (rate_context) {
-      rate_context->active.store(false, std::memory_order_release);
-    }
+    if (ice_context) ice_context->active.store(false, std::memory_order_release);
+    if (data_channel_context) data_channel_context->active.store(false, std::memory_order_release);
+    if (keyframe_context) keyframe_context->active.store(false, std::memory_order_release);
+    if (rate_context) rate_context->active.store(false, std::memory_order_release);
 #endif
 
     // Stop this peer's encoder. Joined only after the session lock is released: the
@@ -6206,39 +6563,12 @@ namespace webrtc_stream {
       encoder_tokens.erase(channel_token.get());
     }
 #ifdef SUNSHINE_ENABLE_WEBRTC
-    if (encoded_video_source) {
-      // Quiesce callbacks before releasing their raw session contexts. The
-      // rate bridge waits for SetRates() invocations already in progress.
-      lwrtc_encoded_video_source_set_keyframe_callback(
-        encoded_video_source.get(),
-        nullptr,
-        nullptr
-      );
-      lwrtc_encoded_video_source_set_rate_callback(
-        encoded_video_source.get(),
-        nullptr,
-        nullptr
-      );
-    }
-    if (peer) {
-      lwrtc_peer_close(peer);
-      lwrtc_peer_release(peer);
-    }
-    if (input_channel) {
-      lwrtc_data_channel_unregister_observer(input_channel);
-      lwrtc_data_channel_close(input_channel);
-      lwrtc_data_channel_release(input_channel);
-    }
-    if (audio_track) {
-      lwrtc_audio_track_release(audio_track);
-    }
-    if (video_track) {
-      lwrtc_video_track_release(video_track);
-    }
-    encoded_video_source.reset();
-    video_source.reset();
-    audio_source.reset();
-    factory.reset();
+    // Removal makes new requests fail. Retirement rejects new call_t guards;
+    // an already-admitted callback may still invoke its next SDP SDK stage.
+    // Close waits for admitted calls, and wrapper/resource release waits
+    // for every already-running operation/callback to drop its shared owner.
+    peer_lifetime->retire();
+    peer_lifetime.reset();
 #endif
     BOOST_LOG(debug) << "WebRTC: close_session exit id=" << id;
 
@@ -6291,6 +6621,8 @@ namespace webrtc_stream {
   }
 
   void shutdown_all_sessions() {
+    host_stream_control::activity_guard_t activity;
+    if (!activity) return;
     stream::session::cleanup_reservation_t cleanup_reservation;
     std::vector<std::string> ids;
     {
@@ -6572,25 +6904,40 @@ namespace webrtc_stream {
   }
 
   bool set_remote_offer(std::string_view id, const std::string &sdp, const std::string &type) {
+    host_stream_control::callback_guard_t operation;
+    if (!operation) return false;
     std::string session_id {id};
 #ifdef SUNSHINE_ENABLE_WEBRTC
     BOOST_LOG(debug) << "WebRTC: set_remote_offer enter id=" << session_id;
-    lwrtc_peer_t *peer = nullptr;
+    std::shared_ptr<SessionPeerLifetime> lifetime;
+    {
+      std::lock_guard lg {session_mutex};
+      auto it = sessions.find(session_id);
+      if (it == sessions.end()) return false;
+      lifetime = it->second.peer_lifetime;
+    }
+    // Only offer setup is serialized. Neither close nor SDK callbacks acquire
+    // this mutex. Retirement cancels publication without waiting for the SDK.
+    std::unique_lock setup_lock {lifetime->setup_mutex};
+    SessionPeerLifetime::call_t peer_call {lifetime};
+    if (!peer_call) return false;
+    Session staged;
+    bool created_peer = false;
     int audio_channels = kDefaultAudioChannels;
     std::vector<Session::IceCandidate> queued_remote_candidates;
+    RawAudioFrame latest_audio;
 #endif
     {
       std::lock_guard lg {session_mutex};
       auto it = sessions.find(session_id);
-      if (it == sessions.end()) {
-        return false;
-      }
-
+      if (it == sessions.end()) return false;
+#ifdef SUNSHINE_ENABLE_WEBRTC
+      if (it->second.peer_lifetime != lifetime) return false;
+#endif
       it->second.remote_offer_sdp = sdp;
       it->second.remote_offer_type = type;
       it->second.state.has_remote_offer = true;
       it->second.negotiation_error.clear();
-
 #ifdef SUNSHINE_ENABLE_WEBRTC
       if (it->second.state.codec && boost::iequals(*it->second.state.codec, "av1")) {
         const auto av1_offer = parse_av1_offer(sdp);
@@ -6637,77 +6984,110 @@ namespace webrtc_stream {
         }
       }
 
-      bool created_peer = false;
-      if (!it->second.peer) {
-        if (!it->second.ice_context) {
-          auto ice_context = std::make_shared<SessionIceContext>();
-          ice_context->id = session_id;
-          it->second.ice_context = std::move(ice_context);
-        }
-        BOOST_LOG(debug) << "WebRTC: creating peer id=" << session_id;
-        auto new_peer = create_peer_connection(it->second, it->second.ice_context.get());
-        if (!new_peer) {
-          BOOST_LOG(error) << "WebRTC: failed to create peer id=" << session_id;
-          return false;
-        }
-        it->second.peer = new_peer;
-        created_peer = true;
-      }
-      if (!it->second.data_channel_context) {
-        auto data_context = std::make_shared<SessionDataChannelContext>();
-        data_context->id = session_id;
-        it->second.data_channel_context = std::move(data_context);
-      }
-      BOOST_LOG(debug) << "WebRTC: registering data channel id=" << session_id;
-      lwrtc_peer_register_data_channel(
-        it->second.peer,
-        &on_data_channel,
-        it->second.data_channel_context.get()
-      );
-      BOOST_LOG(debug) << "WebRTC: attaching media tracks id=" << session_id;
-      if (!attach_media_tracks(it->second)) {
-        BOOST_LOG(error) << "WebRTC: failed to attach media tracks id=" << session_id;
-        if (created_peer && it->second.peer) {
-          lwrtc_peer_close(it->second.peer);
-          lwrtc_peer_release(it->second.peer);
-          it->second.peer = nullptr;
-        }
-        return false;
-      }
-      peer = it->second.peer;
       audio_channels = it->second.state.audio_channels.value_or(kDefaultAudioChannels);
-      if (created_peer) {
-        queued_remote_candidates = it->second.candidates;
+      if (!it->second.peer) {
+        staged.state = it->second.state;
+        staged.video_config = it->second.video_config;
+        staged.av1_fmtp = it->second.av1_fmtp;
+        staged.hevc_fmtp = it->second.hevc_fmtp;
+        staged.keyframe_context = std::make_shared<SessionKeyframeContext>();
+        staged.keyframe_context->id = session_id;
+        staged.rate_context = std::make_shared<SessionRateContext>();
+        staged.rate_context->id = session_id;
+        staged.ice_context = std::make_shared<SessionIceContext>();
+        staged.ice_context->id = session_id;
+        staged.data_channel_context = std::make_shared<SessionDataChannelContext>();
+        staged.data_channel_context->id = session_id;
+        created_peer = true;
       }
 #endif
     }
-
 #ifdef SUNSHINE_ENABLE_WEBRTC
-    if (!peer) {
-      return false;
+    if (created_peer) {
+      auto abandon_setup = util::fail_guard([&]() {
+        lifetime->audio_source = staged.audio_source;
+        lifetime->video_source = staged.video_source;
+        lifetime->encoded_video_source = staged.encoded_video_source;
+        lifetime->audio_track = staged.audio_track;
+        lifetime->video_track = staged.video_track;
+        lifetime->retire();
+        std::lock_guard lg {session_mutex};
+        auto it = sessions.find(session_id);
+        if (it != sessions.end() && it->second.peer_lifetime == lifetime) {
+          it->second.peer_lifetime = std::make_shared<SessionPeerLifetime>();
+        }
+      });
+      // Build an unpublished native bundle. All SDK calls can reenter the
+      // session map; no partially attached source/track is visible to media.
+      staged.peer = create_peer_connection(staged, staged.ice_context.get());
+      lifetime->peer = staged.peer;
+      lifetime->factory = staged.factory;
+      lifetime->ice_context = staged.ice_context;
+      lifetime->data_channel_context = staged.data_channel_context;
+      lifetime->keyframe_context = staged.keyframe_context;
+      lifetime->rate_context = staged.rate_context;
+      bool attached = false;
+      if (staged.peer) {
+        lwrtc_peer_register_state_callback(staged.peer, &on_peer_state, staged.data_channel_context.get());
+        lwrtc_peer_register_data_channel(staged.peer, &on_data_channel, staged.data_channel_context.get());
+        attached = attach_media_tracks(staged);
+      }
+      // The owner also retains partial setup on failure, before retirement.
+      lifetime->audio_source = staged.audio_source;
+      lifetime->video_source = staged.video_source;
+      lifetime->encoded_video_source = staged.encoded_video_source;
+      lifetime->audio_track = staged.audio_track;
+      lifetime->video_track = staged.video_track;
+      if (!attached) return false;
+      {
+        std::lock_guard lg {session_mutex};
+        auto it = sessions.find(session_id);
+        if (it == sessions.end() || it->second.peer_lifetime != lifetime) return false;
+        auto &session = it->second;
+        session.peer = staged.peer;
+        session.factory = staged.factory;
+        session.ice_context = staged.ice_context;
+        session.data_channel_context = staged.data_channel_context;
+        session.keyframe_context = staged.keyframe_context;
+        session.rate_context = staged.rate_context;
+        session.audio_source = staged.audio_source;
+        session.video_source = staged.video_source;
+        session.encoded_video_source = staged.encoded_video_source;
+        session.audio_track = staged.audio_track;
+        session.video_track = staged.video_track;
+        // Drop pre-track backlog under the map lock, including frames queued
+        // while the SDK built the unpublished bundle.
+        const auto queued_audio = session.raw_audio_frames.size();
+        if (session.raw_audio_frames.pop_latest(latest_audio) && queued_audio > 1) {
+          session.state.audio_dropped += queued_audio - 1;
+        }
+        const auto queued_video = session.video_frames.size();
+        while (!session.video_frames.empty()) session.video_frames.drop_oldest();
+        session.state.video_dropped += queued_video;
+        session.video_pacing_state = staged.video_pacing_state;
+        session.last_video_push.reset();
+        session.startup_keyframe_until = staged.startup_keyframe_until;
+        session.startup_keyframe_deadline = staged.startup_keyframe_deadline;
+        session.needs_keyframe = staged.needs_keyframe;
+        session.last_keyframe_request = staged.last_keyframe_request;
+        queued_remote_candidates = session.candidates;
+      }
+      abandon_setup.disable();
+      if (staged.audio_source && latest_audio.samples && !latest_audio.samples->empty()) {
+        lwrtc_audio_source_push(staged.audio_source.get(), latest_audio.samples->data(),
+                               static_cast<int>(sizeof(int16_t) * 8), latest_audio.sample_rate,
+                               latest_audio.channels, latest_audio.frames);
+      }
     }
-
-    // ICE can arrive immediately after the browser sets its local offer. The
-    // HTTP route stores those candidates before this peer exists, so replay
-    // the stored set once the peer is ready instead of stranding the first
-    // candidate until a later trickle update happens to arrive.
+    // The call reservation keeps Close deferred even if DELETE removes the
+    // map owner here. The continuation owns the same wrapper and activity.
     for (const auto &candidate : queued_remote_candidates) {
-      lwrtc_peer_add_candidate(
-        peer,
-        candidate.mid.c_str(),
-        candidate.mline_index,
-        candidate.candidate.c_str()
-      );
+      lwrtc_peer_add_candidate(lifetime->peer, candidate.mid.c_str(), candidate.mline_index, candidate.candidate.c_str());
     }
-
-    auto *ctx = new SessionPeerContext {session_id, peer, audio_channels};
+    auto *ctx = new SessionPeerContext {session_id, operation, lifetime, audio_channels};
     lwrtc_peer_set_remote_description(
-      peer,
-      sdp.c_str(),
-      type.c_str(),
-      &on_set_remote_success,
-      &on_set_remote_failure,
-      ctx
+      lifetime->peer, sdp.c_str(), type.c_str(),
+      &on_set_remote_success, &on_set_remote_failure, ctx
     );
     BOOST_LOG(debug) << "WebRTC: set_remote_offer exit id=" << session_id;
     return true;
@@ -6718,7 +7098,10 @@ namespace webrtc_stream {
   }
 
   bool add_ice_candidate(std::string_view id, std::string mid, int mline_index, std::string candidate) {
+    host_stream_control::activity_guard_t activity;
+    if (!activity) return false;
 #ifdef SUNSHINE_ENABLE_WEBRTC
+    std::shared_ptr<SessionPeerLifetime> lifetime;
     lwrtc_peer_t *peer = nullptr;
     std::string stored_mid;
     std::string stored_candidate;
@@ -6738,6 +7121,7 @@ namespace webrtc_stream {
       it->second.candidates.emplace_back(std::move(entry));
       it->second.state.ice_candidates = it->second.candidates.size();
 #ifdef SUNSHINE_ENABLE_WEBRTC
+      lifetime = it->second.peer_lifetime;
       peer = it->second.peer;
       if (!it->second.candidates.empty()) {
         const auto &stored = it->second.candidates.back();
@@ -6748,6 +7132,8 @@ namespace webrtc_stream {
 #endif
     }
 #ifdef SUNSHINE_ENABLE_WEBRTC
+    SessionPeerLifetime::call_t peer_call {lifetime};
+    if (!peer_call) return false;
     if (peer && !stored_candidate.empty()) {
       lwrtc_peer_add_candidate(peer, stored_mid.c_str(), stored_mline_index, stored_candidate.c_str());
     }

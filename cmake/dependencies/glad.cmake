@@ -104,8 +104,11 @@ add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/glad/cmake" glad2-cmake)
 unset(CMAKE_POLICY_VERSION_MINIMUM)
 
 if(NOT GLAD_SKIP_PIP_INSTALL)
-    # GLAD uses importlib.metadata/resources on supported Python versions;
-    # pkg_resources is not a runtime requirement.
+    # Jinja is glad's only external runtime dependency on supported Python
+    # versions. Glad uses importlib.metadata and importlib.resources when they
+    # are available, with a filesystem fallback for resources, so requiring the
+    # removed pkg_resources compatibility module would reject modern
+    # setuptools releases even though generation works without it.
     execute_process(
             COMMAND "${Python_EXECUTABLE}" -c "import jinja2"
             RESULT_VARIABLE _glad_deps_import_result

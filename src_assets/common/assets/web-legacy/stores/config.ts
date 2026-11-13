@@ -5,6 +5,8 @@ import { http } from '@/http';
 // Metadata describing build/runtime info returned by /api/meta
 export interface MetaInfo {
   platform?: string;
+  architecture?: string;
+  linux?: { machine_host?: boolean };
   status?: boolean;
   version?: string;
   commit?: string;
@@ -69,7 +71,7 @@ const defaultGroups = [
       global_prep_cmd: [] as Array<{ do: string; undo: string; elevated?: boolean }>,
       global_state_cmd: [] as Array<{ do: string; undo: string; elevated?: boolean }>,
       server_cmd: [] as Array<{ name: string; cmd: string; elevated?: boolean }>,
-      notify_pre_releases: 'disabled',
+      notify_pre_releases: 'enabled',
       update_check_interval: 86400,
       session_token_ttl_seconds: 86400,
       remember_me_refresh_token_ttl_seconds: 604800,
@@ -103,9 +105,13 @@ const defaultGroups = [
       controller: 'enabled',
       gamepad: 'auto',
       ds4_back_as_touchpad_click: 'enabled',
+      proton_dualsense_compatibility: 'enabled',
+      dualsense_haptics_gain: 1,
       motion_as_ds4: 'enabled',
       touchpad_as_ds4: 'enabled',
       back_button_timeout: -1,
+      guide_button_key: 0,
+      guide_button_controller: 0,
       keyboard: 'enabled',
       key_repeat_delay: 500,
       key_repeat_frequency: 24.9,
@@ -125,6 +131,7 @@ const defaultGroups = [
     name: 'Audio/Video',
     options: {
       audio_sink: '',
+      audio_sink_capture_only: 'disabled',
       virtual_sink: '',
       install_steam_audio_drivers: 'enabled',
       stream_audio: 'enabled',
@@ -135,6 +142,12 @@ const defaultGroups = [
       output_name: '',
       virtual_display_mode: 'per_client',
       virtual_display_layout: 'exclusive',
+      virtual_display_max_clients: 4,
+      remote_monitor_mute_audio: false,
+      remote_monitor_disconnect_on_stream_end: false,
+      remote_monitor_disconnect_on_client_disconnect: false,
+      remote_monitor_terminate_on_first_request: false,
+      remote_monitor_confirm_app_replacement: true,
       dd_configuration_option: 'verify_only',
       dd_resolution_option: 'auto',
       dd_manual_resolution: '',
@@ -143,17 +156,21 @@ const defaultGroups = [
       dd_hdr_option: 'auto',
       dd_hdr_request_override: 'auto',
       dd_config_revert_delay: 3000,
+      dd_remove_virtual_display_after_restore: 'disabled',
       dd_config_revert_on_disconnect: 'disabled',
       dd_paused_virtual_display_timeout_secs: 0,
       dd_always_restore_from_golden: false,
       dd_display_helper_engine: 'auto',
       dd_snapshot_exclude_devices: [] as Array<string>,
+      end_stream_hotkey: '',
+      end_stream_hotkey_modifiers: 'ctrl+alt+shift',
       dd_snapshot_restore_hotkey: '',
       dd_snapshot_restore_hotkey_modifiers: 'ctrl+alt+shift',
       dd_use_sunshine_virtual_display_driver: true,
       vulkan_hdr_layer: true,
+      wayland_hdr_compatibility: false,
       dd_activate_virtual_display: false,
-      dd_virtual_display_scale: -1,
+      dd_virtual_display_scale: 0,
       dd_virtual_display_permanent_count: 0,
       dd_mode_remapping: {
         mixed: [] as Array<Record<string, string>>,
@@ -189,7 +206,9 @@ const defaultGroups = [
       lan_encryption_mode: 0,
       wan_encryption_mode: 1,
       ping_timeout: 10000,
+      control_peer_timeout: 0,
       video_max_batch_size_kb: 64,
+      pyrowave_critical_fec_percentage: 20,
     },
   },
   {
@@ -216,9 +235,9 @@ const defaultGroups = [
       playnite_autosync_delete_after_days: 0,
       playnite_autosync_require_replacement: true,
       playnite_autosync_remove_uninstalled: true,
-      playnite_focus_attempts: 3,
-      playnite_focus_timeout_secs: 15,
-      playnite_focus_exit_on_first: false,
+      app_focus_attempts: 3,
+      app_focus_timeout_secs: 15,
+      app_focus_exit_on_first: false,
       playnite_fullscreen_entry_enabled: false,
       playnite_sync_categories: [] as Array<{ id: string; name: string }>,
       playnite_sync_plugins: [] as Array<{ id: string; name: string }>,
@@ -226,7 +245,6 @@ const defaultGroups = [
       playnite_exclude_plugins: [] as Array<{ id: string; name: string }>,
       playnite_exclude_games: [] as Array<{ id: string; name: string }>,
       playnite_install_dir: '',
-      playnite_extensions_dir: '',
     },
   },
   {
@@ -239,6 +257,7 @@ const defaultGroups = [
       min_threads: 2,
       hevc_mode: 0,
       av1_mode: 0,
+      pyrowave: true,
       envvar_compatibility_mode: 'disabled',
       legacy_ordering: 'disabled',
       ignore_encoder_probe_failure: 'disabled',
@@ -253,6 +272,7 @@ const defaultGroups = [
       frame_limiter_enable: false,
       frame_limiter_provider: 'auto',
       frame_limiter_fps_limit: 0,
+      mangohud_limiter_method: 'late',
       frame_limiter_auto_virtual_framegen: 'enabled',
       rtss_install_path: '',
       rtss_frame_limit_type: 'async',
@@ -292,7 +312,7 @@ const defaultGroups = [
       amd_rc: 'vbr_latency',
       amd_qvbr_quality_level: 0,
       amd_enforce_hrd: 'disabled',
-      amd_quality: 'balanced',
+      amd_quality: 'speed',
       amd_preanalysis: 'disabled',
       amd_vbaq: 'enabled',
       amd_coder: 'auto',
@@ -447,6 +467,9 @@ export const useConfigStore = defineStore('config', () => {
     patchQueue.value = {
       ...patchQueue.value,
       [key]: patchValue(key, value),
+      ...(key.startsWith('app_focus_')
+        ? { [key.replace('app_focus_', 'playnite_focus_')]: null }
+        : {}),
     };
   }
 
@@ -571,6 +594,15 @@ export const useConfigStore = defineStore('config', () => {
       }
     }
 
+    // Preserve focus preferences saved by older Playnite-only versions.
+    if (data) {
+      for (const suffix of ['attempts', 'timeout_secs', 'exit_on_first']) {
+        const shared = `app_focus_${suffix}`;
+        const legacy = `playnite_focus_${suffix}`;
+        if (!(shared in data) && legacy in data) data[shared] = data[legacy];
+      }
+    }
+
     // Coerce primitive types based on defaults so UI widgets match options.
     // This fixes cases where server returns numeric fields as strings, causing
     // selects to show raw values instead of their friendly labels.
@@ -612,6 +644,9 @@ export const useConfigStore = defineStore('config', () => {
       if (!Object.prototype.hasOwnProperty.call(data, 'frame_limiter_provider')) {
         (data as Record<string, unknown>)['frame_limiter_provider'] = 'auto';
       }
+      if (!Object.prototype.hasOwnProperty.call(data, 'mangohud_limiter_method')) {
+        (data as Record<string, unknown>)['mangohud_limiter_method'] = 'late';
+      }
       const virtualCaptureKey = 'frame_limiter_auto_virtual_framegen';
       if (!Object.prototype.hasOwnProperty.call(data, virtualCaptureKey)) {
         (data as Record<string, unknown>)[virtualCaptureKey] = 'enabled';
@@ -621,7 +656,9 @@ export const useConfigStore = defineStore('config', () => {
           .toLowerCase()
           .trim();
         (data as Record<string, unknown>)[virtualCaptureKey] =
-          normalized === 'legacy' || normalized === '2x' || normalized === 'fixed-2x'
+          ['vrr', '1000hz', '1000', 'fixed-1000hz', 'fixed_1000hz'].includes(normalized)
+            ? 'vrr'
+            : normalized === 'legacy' || normalized === '2x' || normalized === 'fixed-2x'
             ? 'legacy'
             : raw === false ||
                 raw === 0 ||
@@ -648,7 +685,7 @@ export const useConfigStore = defineStore('config', () => {
       'playnite_sync_all_installed',
       'playnite_autosync_require_replacement',
       'playnite_autosync_remove_uninstalled',
-      'playnite_focus_exit_on_first',
+      'app_focus_exit_on_first',
       'playnite_fullscreen_entry_enabled',
     ];
     // Extend boolean normalization to cover RTSS enable flag
@@ -657,6 +694,7 @@ export const useConfigStore = defineStore('config', () => {
       'frame_limiter_disable_vsync',
       'dd_use_sunshine_virtual_display_driver',
       'vulkan_hdr_layer',
+      'wayland_hdr_compatibility',
       'dd_wa_dummy_plug_hdr10',
       'realtime_stats_enabled',
       'realtime_stats_pause_when_hidden',

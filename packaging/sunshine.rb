@@ -1,6 +1,9 @@
 class Sunshine < Formula
   include Language::Python::Virtualenv
 
+  # Linux exposes the fork product name; Homebrew macOS retains the target name.
+  HOST_BINARY = (OS.linux? ? "@PROJECT_NAME@".downcase : "sunshine").freeze
+
   CUDA_VERSION = "13.1".freeze
   CUDA_FORMULA = "cuda@#{CUDA_VERSION}".freeze
   GCC_VERSION = "14".freeze
@@ -169,9 +172,9 @@ class Sunshine < Formula
       -DOPENSSL_ROOT_DIR=#{Formula["openssl"].opt_prefix}
       -DSUNSHINE_ASSETS_DIR=sunshine/assets
       -DSUNSHINE_BUILD_HOMEBREW=ON
-      -DSUNSHINE_PUBLISHER_NAME='LizardByte'
-      -DSUNSHINE_PUBLISHER_WEBSITE='https://app.lizardbyte.dev'
-      -DSUNSHINE_PUBLISHER_ISSUE_URL='https://app.lizardbyte.dev/support'
+      -DSUNSHINE_PUBLISHER_NAME='Nonary'
+      -DSUNSHINE_PUBLISHER_WEBSITE='https://github.com/Nonary/Vibepollo'
+      -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/Nonary/Vibepollo/issues'
     ]
     # Point cmake at the venv Python that has jinja2 installed (set up in setup_build_environment)
     args << "-DPython_EXECUTABLE=#{@glad_python}" if @glad_python
@@ -261,7 +264,7 @@ class Sunshine < Formula
 
   def install_platform_specific_files
     # codesign the binary on intel macs
-    system "codesign", "-s", "-", "--force", "--deep", bin/"sunshine" if OS.mac? && Hardware::CPU.intel?
+    system "codesign", "-s", "-", "--force", "--deep", bin/HOST_BINARY if OS.mac? && Hardware::CPU.intel?
 
     bin.install "src_assets/linux/misc/postinst" if OS.linux?
   end
@@ -273,7 +276,7 @@ class Sunshine < Formula
   end
 
   service do
-    run [opt_bin/"sunshine", "~/.config/sunshine/sunshine.conf"]
+    run [opt_bin/HOST_BINARY, "~/.config/sunshine/sunshine.conf"]
   end
 
   def post_install
@@ -302,6 +305,6 @@ class Sunshine < Formula
 
   test do
     # test that the binary runs at all
-    system bin/"sunshine", "--version"
+    system bin/HOST_BINARY, "--version"
   end
 end

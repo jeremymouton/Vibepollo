@@ -1,6 +1,15 @@
+#ifdef _WIN32
+// MinGW's threading headers can import windows.h before the native helper header.
+#include <winsock2.h>
+#endif
+
 #include "src/platform/windows/display_helper_v2/async_dispatcher.h"
 
 #include "src/platform/windows/display_helper_v2/diagnostics.h"
+#include "src/platform/windows/display_helper_borrow_gate.h"
+#ifdef _WIN32
+#include "src/platform/windows/display_helper_borrow_native.h"
+#endif
 
 namespace display_helper::v2 {
   AsyncDispatcher::AsyncDispatcher(
@@ -16,17 +25,25 @@ namespace display_helper::v2 {
       recovery_validation_operation_(recovery_validation_operation),
       virtual_display_(virtual_display),
       clock_(clock),
-      worker_(&AsyncDispatcher::worker_loop, this),
-      timer_worker_(&AsyncDispatcher::timer_loop, this) {}
+      worker_([this](std::stop_token stop) { worker_loop(stop); }),
+      timer_worker_([this](std::stop_token stop) { timer_loop(stop); }) {}
 
   AsyncDispatcher::~AsyncDispatcher() {
     if (timer_worker_.joinable()) {
-      timer_worker_.request_stop();
+      {
+        // Serialize the stop predicate with the waiter to prevent a lost wake-up.
+        std::lock_guard lock(timer_mutex_);
+        timer_worker_.request_stop();
+      }
       timer_cv_.notify_all();
       timer_worker_.join();
     }
     if (worker_.joinable()) {
-      worker_.request_stop();
+      {
+        // Serialize the stop predicate with the waiter to prevent a lost wake-up.
+        std::lock_guard lock(mutex_);
+        worker_.request_stop();
+      }
       cv_.notify_all();
       worker_.join();
     }
@@ -38,7 +55,8 @@ namespace display_helper::v2 {
     std::chrono::milliseconds delay,
     bool reset_virtual_display,
     std::function<void(const ApplyOutcome &)> completion) {
-    enqueue_task([
+    const auto report_failure = completion;
+    enqueue_operation([
       this,
       request,
       token,
@@ -72,6 +90,7 @@ namespace display_helper::v2 {
         // display stack before ApplyOperation can reach its topology boundary.
         // Use the same durable guard first, then carry that fact through every
         // early return so the state machine cannot discard recovery too soon.
+        virtual_reset_outcome.durable_recovery_attempted = true;
         virtual_reset_outcome.durable_recovery_armed =
           apply_operation_.arm_durable_recovery_boundary();
         if (token.is_cancelled()) {
@@ -133,15 +152,18 @@ namespace display_helper::v2 {
       auto outcome = apply_operation_.run(
         request,
         token,
-        virtual_reset_outcome.durable_recovery_armed);
+        virtual_reset_outcome.durable_recovery_armed,
+        virtual_reset_outcome.durable_recovery_attempted);
       outcome.virtual_display_requested = outcome.virtual_display_requested ||
                                          virtual_reset_outcome.virtual_display_requested;
       outcome.display_may_have_changed = outcome.display_may_have_changed ||
                                            virtual_reset_outcome.display_may_have_changed;
       outcome.durable_recovery_armed = outcome.durable_recovery_armed ||
                                         virtual_reset_outcome.durable_recovery_armed;
+      outcome.durable_recovery_attempted = outcome.durable_recovery_attempted ||
+                                            virtual_reset_outcome.durable_recovery_attempted;
       completion(outcome);
-    });
+    }, [completion = report_failure] { completion(ApplyOutcome {}); });
   }
 
   void AsyncDispatcher::dispatch_verification(
@@ -220,7 +242,8 @@ namespace display_helper::v2 {
     const CancellationToken &token,
     std::chrono::milliseconds delay,
     std::function<void(const RecoveryOutcome &)> completion) {
-    enqueue_task([
+    const auto report_failure = completion;
+    enqueue_operation([
       this,
       token,
       delay,
@@ -241,7 +264,7 @@ namespace display_helper::v2 {
       }
 
       completion(recovery_operation_.run(token));
-    });
+    }, [completion = report_failure] { completion(RecoveryOutcome {}); });
   }
 
   void AsyncDispatcher::dispatch_recovery_validation(
@@ -265,7 +288,8 @@ namespace display_helper::v2 {
     const CancellationToken &token,
     std::function<void(bool)> completion
   ) {
-    enqueue_task([
+    const auto report_failure = completion;
+    enqueue_operation([
       this,
       device_id = std::move(device_id),
       numerator,
@@ -278,6 +302,12 @@ namespace display_helper::v2 {
         return;
       }
       completion(apply_operation_.set_refresh_rate(device_id, numerator, denominator));
+    }, [completion = report_failure] { completion(false); });
+  }
+
+  void AsyncDispatcher::enqueue_operation(std::function<void()> task, std::function<void()> report_failure) {
+    enqueue_task([task = std::move(task), report_failure = std::move(report_failure)] {
+      try { task(); } catch (...) { report_failure(); }
     });
   }
 
@@ -311,6 +341,17 @@ namespace display_helper::v2 {
       }
 
       if (task) {
+        auto borrow_scope = display_helper::borrow::process_gate().wait_enter([&] { return st.stop_requested(); });
+        if (!borrow_scope) break;
+#ifdef _WIN32
+        auto native_scope = display_helper::borrow::native_mutation_scope_t::enter(true, [&] { return st.stop_requested(); });
+        if (!native_scope) {
+          if (st.stop_requested()) break;
+          std::lock_guard lock(mutex_);
+          tasks_.push_front(std::move(task));
+          continue;
+        }
+#endif
         task();
       }
     }

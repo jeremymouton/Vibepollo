@@ -5,9 +5,11 @@
 #pragma once
 
 #include <boost/property_tree/ptree_fwd.hpp>
-
+#include <cstddef>
 #include <functional>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace statefile::policy {
   enum class read_status_e {
@@ -43,6 +45,111 @@ namespace statefile::policy {
     boost::property_tree::ptree &tree,
     const read_file_t &read_file,
     const quarantine_file_t &quarantine_file);
+
+  /**
+   * @brief Reads JSON without changing the source file. An existing blank file is
+   *        reported as corrupt so startup cannot mint a new identity for a
+   *        truncated state file.
+   *
+   * This is the startup path: recovery must be selected before a damaged
+   * primary is moved aside, otherwise a retry could mistake the missing
+   * primary for a new installation.
+   */
+  load_result_e load_json_for_read(
+    const std::string &path,
+    boost::property_tree::ptree &tree,
+    const read_file_t &read_file);
+
+  /** Read the auxiliary state, recovering and restoring a validated .bak snapshot.
+   * Both files missing means a new profile. Unrecoverable or inaccessible state
+   * fails closed so a metadata update cannot erase authentication state.
+   */
+  load_result_e load_vibeshine_state(
+    const std::string &path,
+    boost::property_tree::ptree &tree,
+    const read_file_t &read_file,
+    const write_file_t &write_file
+  );
+
+  using validate_primary_t = std::function<bool(const boost::property_tree::ptree &, bool allow_bootstrap)>;
+  using primary_diagnostic_t = std::function<std::string(const boost::property_tree::ptree &)>;
+
+  using certificate_identity_t = std::function<std::optional<std::string>(const std::string &)>;
+
+  /** A named record removed because an earlier record has the same certificate. */
+  struct collapsed_pairing_record_t {
+    std::size_t kept_index;
+    std::string kept_uuid;
+    std::size_t dropped_index;
+    std::string dropped_uuid;
+  };
+
+  /** Older writers retained root.devices after importing its certificates into
+   * named_devices. Remove only those legacy aliases from an in-memory snapshot;
+   * the named record retains its UUID, enabled policy and all client settings.
+   *
+   * 1.x appended a new named record whenever a client re-paired and looked up
+   * clients by certificate, stopping at the first match. Later records with the
+   * same certificate were therefore never used for authorization, identity or
+   * settings. Collapse them into that first record, which stays disabled if any
+   * of its duplicates was disabled. Repeated legacy certificates are collapsed
+   * the same way. Optional `collapsed` lists every removed named record.
+   *
+   * Invalid certificates still fail closed. Failure leaves the supplied snapshot
+   * unchanged. Optional diagnostics contain fixed field paths and record
+   * indices, never certificate or credential data.
+   */
+  bool normalize_legacy_pairing_state(
+    boost::property_tree::ptree &tree,
+    const certificate_identity_t &certificate_identity,
+    std::string *failure_reason = nullptr,
+    std::vector<collapsed_pairing_record_t> *collapsed = nullptr
+  );
+
+  /** Structural validation shared by primary reads and writes. */
+  bool valid_primary_state(const boost::property_tree::ptree &tree, bool allow_bootstrap);
+
+  /** Read/modify/write recovery must retain host identity even with shared paths.
+   * An optional JSON validator checks original scalar types before either
+   * snapshot is selected; property_tree validation alone cannot retain them.
+   * A readable but rejected primary is never replaced with older authorization.
+   * The optional diagnostic only explains validation; it cannot permit recovery.
+   */
+  load_result_e load_primary_state_for_update(
+    const std::string &path,
+    boost::property_tree::ptree &tree,
+    const read_file_t &read_file,
+    const write_file_t &write_file,
+    const validate_primary_t &validate,
+    const std::function<bool(const std::string &)> &validate_json = {},
+    std::string *failure_reason = nullptr,
+    const primary_diagnostic_t &diagnostic = {}
+  );
+
+  /** Never let an incomplete metadata/bootstrap write replace an existing identity. */
+  bool primary_write_allowed(
+    const boost::property_tree::ptree &tree,
+    load_result_e backup_status,
+    const boost::property_tree::ptree &backup,
+    const validate_primary_t &validate);
+
+  /** Recover the configured credential file before startup inspects credentials.
+   * A valid primary always wins, including an explicit empty credential state.
+   * Recovery requires a complete credential snapshot and restores its exact bytes.
+   */
+  load_result_e recover_credentials(
+    const std::string &path,
+    const read_file_t &read_file,
+    const write_file_t &write_file,
+    bool refresh_backup = true);
+
+  /** Validate auxiliary state before publishing it and refreshing its backup. */
+  void write_vibeshine_state(
+    const std::string &path,
+    const boost::property_tree::ptree &tree,
+    const write_file_t &write_file,
+    const read_file_t &read_file
+  );
 
   /**
    * @brief Serializes, writes, and re-parses JSON through injected storage operations.

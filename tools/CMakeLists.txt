@@ -113,6 +113,13 @@ target_link_libraries(sunshine_wgc_capture
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshine_wgc_capture PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
+# Owns a global shortcut in the interactive user's session; the machine host
+# validates the exact child and console session before accepting its IPC.
+add_executable(sunshine_end_stream_hotkey end_stream_hotkey.cpp)
+target_link_libraries(sunshine_end_stream_hotkey PRIVATE user32 wtsapi32)
+target_compile_definitions(sunshine_end_stream_hotkey PRIVATE _WIN32_WINNT=0x0602)
+target_compile_options(sunshine_end_stream_hotkey PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
 # Display settings helper: detached helper that applies/reverts display settings via IPC.
 # One exe hosts both engines (legacy + v2), selected by --engine= or persisted state.
 add_executable(sunshine_display_helper
@@ -133,6 +140,7 @@ add_executable(sunshine_display_helper
         ${CMAKE_SOURCE_DIR}/src/platform/windows/display_helper_v2/win_display_settings.cpp
         ${CMAKE_SOURCE_DIR}/src/platform/windows/display_helper_v2/win_event_pump.cpp
         ${CMAKE_SOURCE_DIR}/src/platform/windows/display_helper_v2/win_platform_workarounds.cpp
+        ${CMAKE_SOURCE_DIR}/src/platform/windows/display_helper_shell_refresh_policy.cpp
         ${CMAKE_SOURCE_DIR}/src/platform/windows/display_helper_v2/win_scheduled_task_manager.cpp
         ${CMAKE_SOURCE_DIR}/src/platform/windows/ipc/pipes.cpp
         ${CMAKE_SOURCE_DIR}/src/platform/windows/ipc/misc_utils.cpp

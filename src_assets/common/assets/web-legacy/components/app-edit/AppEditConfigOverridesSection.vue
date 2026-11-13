@@ -845,7 +845,9 @@ function normalizeOverrideRecord(value: unknown): Record<string, unknown> {
         .toLowerCase()
         .trim();
       normalized[key] =
-        mode === 'legacy' || mode === '2x' || mode === 'fixed-2x'
+        ['vrr', '1000hz', '1000', 'fixed-1000hz', 'fixed_1000hz'].includes(mode)
+          ? 'vrr'
+          : mode === 'legacy' || mode === '2x' || mode === 'fixed-2x'
           ? 'legacy'
           : rawValue === false ||
               rawValue === 0 ||
@@ -921,6 +923,8 @@ const ALLOWED_OVERRIDE_KEYS = new Set<string>([
   'motion_as_ds4',
   'touchpad_as_ds4',
   'back_button_timeout',
+  'guide_button_key',
+  'guide_button_controller',
   'keyboard',
   'key_repeat_delay',
   'key_repeat_frequency',
@@ -934,6 +938,7 @@ const ALLOWED_OVERRIDE_KEYS = new Set<string>([
 
   // Stream audio/video and display automation
   'audio_sink',
+  'audio_sink_capture_only',
   'virtual_sink',
   'stream_audio',
   'adapter_name',

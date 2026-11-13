@@ -37,10 +37,16 @@ namespace http {
 
   extern std::string unique_id;
   extern uuid_util::uuid_t uuid;
+  // Set only when this process had to create both host credential files. It
+  // lets state startup distinguish first-run initialization from an existing
+  // profile whose pairing snapshots have disappeared.
+  extern bool credentials_created_this_run;
   extern net::net_e origin_web_ui_allowed;
 
 #ifdef _WIN32
-  extern std::string shared_virtual_display_guid;
+  std::string shared_virtual_display_guid_snapshot();
+  // False preserves the existing owner while exact borrowers/probes drain.
+  bool set_shared_virtual_display_guid(std::string value);
 #endif
 
   // Update origin ACL from current config
