@@ -40,9 +40,9 @@ index 1510e3f..55b1012 100644
 +      if (!server.uri || !*server.uri) {
 +        continue;
 +      }
-+      rtc_config.ice_servers[used].uri = server.uri;
-+      rtc_config.ice_servers[used].username = server.username ? server.username : "";
-+      rtc_config.ice_servers[used].password = server.password ? server.password : "";
++      rtc_config.ice_servers[used].uri = libwebrtc::string(server.uri);
++      rtc_config.ice_servers[used].username = libwebrtc::string(server.username ? server.username : "");
++      rtc_config.ice_servers[used].password = libwebrtc::string(server.password ? server.password : "");
 +      ++used;
 +    }
    }
