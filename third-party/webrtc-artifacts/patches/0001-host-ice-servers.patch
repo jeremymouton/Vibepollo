@@ -1,0 +1,50 @@
+diff --git a/include/libwebrtc_c.h b/include/libwebrtc_c.h
+index c7a01c1..3c57b74 100644
+--- a/include/libwebrtc_c.h
++++ b/include/libwebrtc_c.h
+@@ -27,12 +27,23 @@ typedef enum lwrtc_video_codec {
+   LWRTC_VIDEO_CODEC_AV1 = 2,
+ } lwrtc_video_codec_t;
+ 
++typedef struct lwrtc_ice_server {
++  const char* uri;
++  const char* username;
++  const char* password;
++} lwrtc_ice_server_t;
++
+ typedef struct lwrtc_config {
+   int offer_to_receive_audio;
+   int offer_to_receive_video;
+   // Optional bandwidth cap for the video m-section, in kbps. A zero value
+   // preserves the remote offer's negotiated value.
+   uint32_t local_video_bandwidth_kbps;
++  // Optional ICE servers for this peer's own candidate gathering. Without a STUN
++  // server a host behind NAT offers only host candidates, so every off-LAN
++  // client must relay. At most 8 are used; null entries are skipped.
++  const lwrtc_ice_server_t* ice_servers;
++  size_t ice_server_count;
+ } lwrtc_config_t;
+ 
+ typedef void (*lwrtc_ice_cb)(
+diff --git a/src/libwebrtc_c.cc b/src/libwebrtc_c.cc
+index 1510e3f..55b1012 100644
+--- a/src/libwebrtc_c.cc
++++ b/src/libwebrtc_c.cc
+@@ -497,6 +497,17 @@ lwrtc_peer_t* lwrtc_factory_create_peer(
+     rtc_config.offer_to_receive_audio = config->offer_to_receive_audio != 0;
+     rtc_config.offer_to_receive_video = config->offer_to_receive_video != 0;
+     rtc_config.local_video_bandwidth = config->local_video_bandwidth_kbps;
++    int used = 0;
++    for (size_t i = 0; config->ice_servers && i < config->ice_server_count && used < libwebrtc::kMaxIceServerSize; ++i) {
++      const auto& server = config->ice_servers[i];
++      if (!server.uri || !*server.uri) {
++        continue;
++      }
++      rtc_config.ice_servers[used].uri = server.uri;
++      rtc_config.ice_servers[used].username = server.username ? server.username : "";
++      rtc_config.ice_servers[used].password = server.password ? server.password : "";
++      ++used;
++    }
+   }
+ 
+   libwebrtc::scoped_refptr<libwebrtc::RTCMediaConstraints> constraints_ref =
