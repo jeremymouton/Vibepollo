@@ -88,7 +88,9 @@ function Set-SunshineConfigOption {
         1
     )
 
-    if ($updated -ceq $original) {
+    # An unchanged result can mean the option already holds this value; only a
+    # missing option is appended, or every upgrade adds another duplicate line.
+    if ($updated -ceq $original -and -not [System.Text.RegularExpressions.Regex]::IsMatch($original, $pattern)) {
         $separator = if ($original.EndsWith("`n") -or $original.EndsWith("`r")) { '' } else { [Environment]::NewLine }
         $updated = $original + $separator + $line + [Environment]::NewLine
     }
