@@ -36,8 +36,11 @@ namespace config {
   // when a stream is active, we defer some settings until all sessions end
   inline std::unordered_map<std::string, std::string> pending_config_settings;
 
+  // Log bundles are exported and shared, so anything secret is kept out of the
+  // startup dump of every config value.
   inline constexpr std::array redacted_config = {
-    "csrf_allowed_origins"
+    "csrf_allowed_origins",
+    "webrtc_turn_secret"
   };
 
   void log_config_settings(const std::unordered_map<std::string, std::string> &vars, bool save);
