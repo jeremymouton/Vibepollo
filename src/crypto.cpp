@@ -416,7 +416,12 @@ namespace crypto {
       return {};
     }
 
-    return {(const char *) ASN1_STRING_get0_data(asn1), (std::size_t) ASN1_STRING_length(asn1)};
+#if OPENSSL_VERSION_NUMBER >= 0x40100000L
+    const std::size_t length = ASN1_STRING_get_length(asn1);
+#else
+    const std::size_t length = ASN1_STRING_length(asn1);
+#endif
+    return {(const char *) ASN1_STRING_get0_data(asn1), length};
   }
 
   std::string_view signature(const x509_t &x) {
