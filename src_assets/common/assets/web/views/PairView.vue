@@ -19,14 +19,16 @@ const pairedName = ref('');
 const windowOpen = ref<boolean | null>(null);
 
 // Moonlight can only start pairing while this page holds the window open.
-onMounted(async () => {
+async function openPairingWindow(): Promise<void> {
   try {
     await apiPost('/api/pairing/window', {});
     windowOpen.value = true;
   } catch {
     windowOpen.value = false;
   }
-});
+}
+
+onMounted(openPairingWindow);
 
 const normalizedPin = computed(() => pin.value.padStart(4, '0'));
 const pinIsValid = computed(() => /^\d{1,4}$/.test(pin.value));
@@ -62,6 +64,8 @@ async function submit(): Promise<void> {
     }
     pairedName.value = friendlyName;
     pin.value = '';
+    // A finished pairing closes the window; reopen it for the next device.
+    void openPairingWindow();
   } catch (cause) {
     error.value =
       cause instanceof ApiError

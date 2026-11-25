@@ -3819,6 +3819,7 @@ namespace nvhttp {
           remove_session(sess);
           return;
         }
+        pairing_window_until = {};
       } else {
         tree.put("root.paired", 0);
         BOOST_LOG(warning) << "Pair attempt failed due to same_hash: " << same_hash << ", verify: " << verify;

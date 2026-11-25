@@ -1847,6 +1847,8 @@ async function registerDevice(): Promise<void> {
       (r.data?.status === true || r.data?.status === 'true' || r.data?.status === 1);
     pairStatus.value = !!ok;
     if (ok) {
+      // A finished pairing closes the window; reopen it for the next device.
+      void http.post('./api/pairing/window', {}, { validateStatus: () => true });
       const prevCount = clients.value?.length || 0;
       await refreshClients({ manual: true });
       const deadline = Date.now() + 5000;
