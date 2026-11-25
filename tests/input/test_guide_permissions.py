@@ -29,6 +29,8 @@ using PSS_PEN_PACKET = unused_packet<5> *;
 using PSS_CONTROLLER_TOUCH_PACKET = unused_packet<6> *;
 using PSS_CONTROLLER_MOTION_PACKET = unused_packet<7> *;
 using PSS_CONTROLLER_BATTERY_PACKET = unused_packet<8> *;
+using PSS_STEAM_CONTROLLER_ATTRIBUTES_PACKET = unused_packet<9> *;
+namespace controller_speaker_pcm { constexpr int binding_magic = 0x55000100; }
 void passthrough(std::shared_ptr<input_t> &, PNV_REL_MOUSE_MOVE_PACKET) {}
 void passthrough(std::shared_ptr<input_t> &, PNV_MOUSE_BUTTON_PACKET) {}
 void passthrough(std::shared_ptr<input_t> &, PSS_CONTROLLER_ARRIVAL_PACKET) {}
@@ -71,6 +73,12 @@ bool guide(const std::shared_ptr<input_t> &input) {
   for (auto it = platf::gamepad_events.rbegin(); it != platf::gamepad_events.rend(); ++it)
     if (it->first == id) return bool(it->second.buttonFlags & platf::HOME);
   std::abort();
+}
+void admit(stream::session_t &session) {
+  passthrough(session.input, packet_bytes(SS_CONTROLLER_BATTERY_MAGIC), session.permission); task_pool.drain();
+}
+crypto::PERM controller_and(crypto::PERM other) {
+  return static_cast<crypto::PERM>(static_cast<uint32_t>(crypto::PERM::input_controller) | static_cast<uint32_t>(other));
 }
 void allowed_press(stream::session_t &session) {
   packet(session); task_pool.drain(); assert(guide(session.input));
@@ -123,6 +131,20 @@ int main(int argc, char **argv) {
     assert(!input->gamepads[0].guide_key_down && guide(input));
     assert(task_pool.timers.size() == timer_count);
     assert(input->gamepads[0].gamepad_state.buttonFlags & platf::BACK);
+  } else if (test == "controller_only_grant_drops_native_home") {
+    change(session, crypto::PERM::input_controller); admit(session);
+    arrival.buttonFlags = platf::HOME; passthrough(input, &arrival); assert(!guide(input));
+  } else if (test == "controller_only_grant_never_emulates_home_from_back") {
+    change(session, crypto::PERM::input_controller); admit(session);
+    const auto timers = task_pool.timers.size();
+    arrival.buttonFlags = platf::BACK; passthrough(input, &arrival); assert(task_pool.timers.size() == timers);
+  } else if (test == "desktop_grant_keeps_native_home") {
+    change(session, controller_and(crypto::PERM::input_mouse)); admit(session);
+    arrival.buttonFlags = platf::HOME; passthrough(input, &arrival); assert(guide(input));
+  } else if (test == "regrant_restores_native_home") {
+    change(session, crypto::PERM::input_controller); admit(session);
+    change(session, crypto::PERM::_all_inputs); admit(session);
+    arrival.buttonFlags = platf::HOME; passthrough(input, &arrival); assert(guide(input));
   } else if (test == "ordinary_keyboard_still_allowed") {
     change(session, crypto::PERM::input_kbd); task_pool.drain();
     packet(session, 65); packet(session, 65, true); task_pool.drain();
@@ -141,6 +163,8 @@ def main():
     source = args.input_source.read_text()
     code = input_harness(source).replace('void passthrough_next_message(std::shared_ptr<input_t>) {}',
                                          'void passthrough_next_message(std::shared_ptr<input_t>);')
+    code = code.replace('struct { std::uint64_t take(std::uint8_t) { return 0; } } speaker_bindings;',
+                        'struct { std::uint64_t take(std::uint8_t) { return 0; } template<class F> void bind(const std::vector<uint8_t> &, F &&) {} } speaker_bindings;')
     code = code.replace('if (data.size() != sizeof(uint32_t)) return std::nullopt;',
                         'if (data.size() < sizeof(uint32_t)) return std::nullopt;')
     if 'void update_guide_button_permissions(' not in source:

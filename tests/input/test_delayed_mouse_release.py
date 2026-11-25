@@ -194,7 +194,7 @@ def production_prelude(source):
         start = source.index('  struct queued_input_packet_t {')
         end = source.index('\n  struct input_t {', start)
         prelude = prelude.replace('struct input_t {', source[start:end] + '\nstruct input_t {')
-        prelude = prelude.replace('  std::list<int> input_queue;', '  std::list<queued_input_packet_t> input_queue;\n  std::atomic_uint64_t guide_permission_state {1};\n  std::atomic_bool input_queue_task_scheduled {false};\n  int feedback_queue = 0;\n  bool persist_gamepads = false;')
+        prelude = prelude.replace('  std::list<int> input_queue;', '  std::list<queued_input_packet_t> input_queue;\n  std::atomic_uint64_t guide_permission_state {1};\n  std::atomic_bool desktop_input_granted {true};\n  std::atomic_bool input_queue_task_scheduled {false};\n  int feedback_queue = 0;\n  bool persist_gamepads = false;')
     for name in ('mouse_press', 'mouse_press_owner'):
         pattern = rf'(?:static )?std::array<[^;]+> {name} {{}};'
         declaration = re.search(pattern, source)

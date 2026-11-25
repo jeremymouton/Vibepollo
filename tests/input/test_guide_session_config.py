@@ -31,12 +31,15 @@ def config_code(source):
 MAIL = r'''
 using input::guide_button_config_t;
 namespace input { struct touch_port_t {}; }
-namespace platf { using gamepad_feedback_msg_t = int; }
+namespace platf {
+  using gamepad_feedback_msg_t = int;
+  inline constexpr std::uint32_t GAMEPAD_FEEDBACK_QUEUE_CAPACITY = 256;
+}
 namespace mail { constexpr int touch_port = 0, gamepad_feedback = 1; }
 namespace safe {
   struct mail_raw_t {
     template<class T> int event(int) { return 0; }
-    template<class T> int queue(int) { return 0; }
+    template<class T, class... A> int queue(int, A...) { return 0; }
   };
   using mail_t = std::shared_ptr<mail_raw_t>;
 }
@@ -148,11 +151,6 @@ def input_harness(source):
     permissions = crypto_source[crypto_source.index('  enum class PERM :'):crypto_source.index('  struct command_entry_t')]
     prelude += '\nnamespace crypto {\n' + permissions + '\n}\n'
     geometry_support = r'''
-namespace geometry {
-  inline bool request_serialized_worker_wake(std::atomic_bool &scheduled) noexcept {
-    return !scheduled.exchange(true, std::memory_order_acq_rel);
-  }
-}
 void refresh_input_geometry(const std::shared_ptr<input_t> &) {}
 void start_input_geometry_refresh(const std::shared_ptr<input_t> &) {}
 '''

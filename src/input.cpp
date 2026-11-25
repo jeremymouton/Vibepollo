@@ -276,6 +276,9 @@ namespace input {
 
     // Low bit permits synthetic Guide; upper bits identify permission changes.
     std::atomic_uint64_t guide_permission_state {1};
+    // Whether the latest admitted packet's grant had keyboard or mouse. Guide opens
+    // Game Bar or Steam, and from either the desktop, so a pad-only grant cannot press it.
+    std::atomic_bool desktop_input_granted {true};
     std::list<queued_input_packet_t> input_queue;
     std::mutex input_queue_lock;
     std::atomic_bool input_queue_task_scheduled;
@@ -1700,6 +1703,10 @@ namespace input {
       packet->rightStickX,
       packet->rightStickY
     };
+    const bool guide_allowed = input->desktop_input_granted.load(std::memory_order_relaxed);
+    if (!guide_allowed) {
+      gamepad_state.buttonFlags &= ~platf::HOME;
+    }
 
     auto bf_new = gamepad_state.buttonFlags;
     switch (gamepad.back_button_state) {
@@ -1725,7 +1732,7 @@ namespace input {
     if (platf::BACK & bf) {
       if (platf::BACK & bf_new) {
         // Don't emulate home button if timeout < 0
-        if (config::input.back_button_timeout >= 0ms) {
+        if (config::input.back_button_timeout >= 0ms && guide_allowed) {
           auto f = [input, controller = packet->controllerNumber]() {
             auto &gamepad = input->gamepads[controller];
 
@@ -2320,6 +2327,10 @@ namespace input {
           return;
       }
     }
+    input->desktop_input_granted.store(
+      (permission & crypto::PERM::input_kbd) != crypto::PERM::_no || (permission & crypto::PERM::input_mouse) != crypto::PERM::_no,
+      std::memory_order_relaxed
+    );
     {
       std::lock_guard<std::mutex> lg(input->input_queue_lock);
       if (input->input_closed) {
