@@ -71,6 +71,7 @@
 #include "logging.h"
 #include "log_export.h"
 #include "network.h"
+#include "http_pairing_policy.h"
 #include "nvhttp.h"
 #include "remote_display_topology.h"
 #include "remote_session.h"
@@ -777,6 +778,13 @@ namespace confighttp {
     const auto now = invite::policy::clock_t::now();
     const auto invite = invite::find(guest->invite_id);
     return invite::policy::turn_credential_lifetime(guest->expires_at, invite ? invite->expires_at : now, now, turn_credential_cap);
+  }
+
+  nlohmann::json pairing_window_json() {
+    nlohmann::json output;
+    output["status"] = true;
+    output["seconds"] = std::chrono::seconds {nvhttp::pairing_policy::pairing_window}.count();
+    return output;
   }
 
   nlohmann::json load_webrtc_ice_servers(std::chrono::seconds turn_lifetime) {
@@ -3030,6 +3038,26 @@ namespace confighttp {
     BOOST_LOG(info) << "Invites: '"sv << outcome.invite.label << "' paired a Moonlight client from "sv
                     << request->remote_endpoint().address().to_string();
     send_response(response, body);
+  }
+
+  /**
+   * @brief Open the native pairing window from an invite's pairing step.
+   *
+   * The link alone is enough: opening the window grants nothing, and the guest still
+   * needs the invite PIN and their Moonlight PIN to finish. Unauthenticated by design.
+   */
+  void openInvitePairingWindow(resp_https_t response, req_https_t request) {
+    if (request->path_match.size() < 2) {
+      join_api::refuse(response, invite::policy::result_e::unknown, 0);
+      return;
+    }
+    const auto found = invite::find_by_token(std::string(request->path_match[1]));
+    if (!found || !invite::policy::is_live(*found, invite::policy::clock_t::now()) || !found->allow_pairing) {
+      join_api::refuse(response, invite::policy::result_e::unknown, 0);
+      return;
+    }
+    nvhttp::open_pairing_window();
+    send_response(response, pairing_window_json());
   }
 
   /**
@@ -6112,6 +6140,18 @@ namespace confighttp {
    *
    * @api_examples{/api/pin| POST| {"pin":"1234","name":"My PC"}}
    */
+  /**
+   * @brief Let a new Moonlight device start pairing for the next few minutes.
+   * @details The pairing page calls this when it opens.
+   */
+  void openPairingWindow(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    nvhttp::open_pairing_window();
+    send_response(response, pairing_window_json());
+  }
+
   void savePin(resp_https_t response, req_https_t request) {
     if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
       return;
@@ -7553,6 +7593,7 @@ namespace confighttp {
       };
 
     register_api_route("^/api/pin$", "POST", savePin);
+    register_api_route("^/api/pairing/window$", "POST", openPairingWindow);
     register_api_route("^/api/otp$", "POST", getOTP);
     register_api_route("^/api/apps$", "GET", getApps);
     register_api_route("^/api/logs$", "GET", getLogs);
@@ -7579,6 +7620,7 @@ namespace confighttp {
     register_api_route("^/api/join/([^/]+)$", "GET", getJoinInfo);
     register_api_route("^/api/join/([^/]+)/redeem$", "POST", redeemInvite);
     register_api_route("^/api/join/([^/]+)/pair$", "POST", pairInvite);
+    register_api_route("^/api/join/([^/]+)/pair/window$", "POST", openInvitePairingWindow);
     register_api_route("^/api/config$", "GET", getConfig);
     register_api_route("^/api/config$", "POST", saveConfig);
     // Partial updates for config settings; merges with existing file and

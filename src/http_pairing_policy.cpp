@@ -166,8 +166,12 @@ namespace nvhttp::pairing_policy {
     const std::string_view salt_hex,
     const std::size_t pending_sessions,
     const bool replacing_existing,
-    const bool same_identity
+    const bool same_identity,
+    const bool window_open
   ) {
+    if (!window_open) {
+      return {false, window_closed_message};
+    }
     // Pairing is accepted at the login screen too. Completing it still
     // requires the Web UI login to submit the PIN, so the greeter gains no
     // unauthenticated path; refusing here was a GameStream habit only.

@@ -243,6 +243,13 @@ namespace nvhttp {
   std::string request_otp(const std::string &passphrase, const std::string &deviceName);
 
   /**
+   * @brief Let new Moonlight devices start pairing for the next few minutes.
+   * @details Called when the owner opens the pairing page or a guest opens their invite's
+   *   pairing step. Outside the window, unpaired clients cannot occupy the pending slot.
+   */
+  void open_pairing_window();
+
+  /**
    * @brief Remove single client.
    * @param uuid The UUID of the client to remove.
    * @examples

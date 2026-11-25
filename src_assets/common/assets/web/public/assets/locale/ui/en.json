@@ -1445,6 +1445,10 @@
         "start_pairing_description": "Keep Artemis open while its numeric PIN is visible.",
         "start_pairing_title": "Start pairing",
         "title": "Before you enter the PIN"
+      },
+      "window": {
+        "failed": "Pairing could not be opened. Reload this page.",
+        "open": "New devices can start pairing for the next 5 minutes. Reload this page if that runs out."
       }
     },
     "sessions": {

@@ -2246,6 +2246,8 @@ namespace nvhttp {
     // HTTP, HTTPS and the configuration API share pending handshakes and OTP state.
     // Acquire before invite access; release before unpairing active clients.
     std::mutex pairing_sessions_mutex;
+    // Guarded by pairing_sessions_mutex.
+    std::chrono::steady_clock::time_point pairing_window_until {};
     constexpr auto pairing_session_expiry = std::chrono::minutes(10);
 
     template<class Request>
@@ -3817,6 +3819,7 @@ namespace nvhttp {
           remove_session(sess);
           return;
         }
+        pairing_window_until = {};
       } else {
         tree.put("root.paired", 0);
         BOOST_LOG(warning) << "Pair attempt failed due to same_hash: " << same_hash << ", verify: " << verify;
@@ -4133,9 +4136,16 @@ namespace nvhttp {
           const bool replacing = existing != map_id_sess.end();
           const bool same_identity = replacing && pairing_policy::valid_hex_field(client_certificate, 2) &&
                                      existing->second.client.cert == util::from_hex_vec(client_certificate, true);
-          const auto admission = pairing_policy::admit_pending_session(uniqID, client_certificate, salt, map_id_sess.size(), replacing, same_identity);
+          const bool window_open = config::sunshine.flags[config::flag::PIN_STDIN] ||
+                                   std::chrono::steady_clock::now() < pairing_window_until;
+          const auto admission = pairing_policy::admit_pending_session(uniqID, client_certificate, salt, map_id_sess.size(), replacing, same_identity, window_open);
           if (!admission.accepted) {
-            tree.put("root.<xmlattr>.status_code", admission.failure_message == "Too many pending pairing sessions"sv ? 429 : 400);
+            tree.put(
+              "root.<xmlattr>.status_code",
+              admission.failure_message == pairing_policy::window_closed_message ? 403 :
+              admission.failure_message == "Too many pending pairing sessions"sv ? 429 :
+                                                                                     400
+            );
             tree.put("root.<xmlattr>.status_message", admission.failure_message);
             return;
           }
@@ -7903,8 +7913,14 @@ launch_session->exact_target_hold.reset();
     otp_passphrase = passphrase;
     otp_device_name = deviceName;
     otp_creation_time = std::chrono::steady_clock::now();
+    pairing_window_until = otp_creation_time + pairing_policy::pairing_window;
 
     return one_time_pin;
+  }
+
+  void open_pairing_window() {
+    std::lock_guard pairing_lock {pairing_sessions_mutex};
+    pairing_window_until = std::chrono::steady_clock::now() + pairing_policy::pairing_window;
   }
 
   bool erase_all_clients() {

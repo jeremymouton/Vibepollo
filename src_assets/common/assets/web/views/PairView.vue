@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 
 import { ApiError, apiPost } from '@/api/client';
@@ -16,6 +16,17 @@ const pin = ref('');
 const submitting = ref(false);
 const error = ref('');
 const pairedName = ref('');
+const windowOpen = ref<boolean | null>(null);
+
+// Moonlight can only start pairing while this page holds the window open.
+onMounted(async () => {
+  try {
+    await apiPost('/api/pairing/window', {});
+    windowOpen.value = true;
+  } catch {
+    windowOpen.value = false;
+  }
+});
 
 const normalizedPin = computed(() => pin.value.padStart(4, '0'));
 const pinIsValid = computed(() => /^\d{1,4}$/.test(pin.value));
@@ -114,6 +125,8 @@ function resetForm(): void {
             </div>
           </li>
         </ol>
+        <p v-if="windowOpen" class="pair-window">{{ t('ui.pair.window.open') }}</p>
+        <InlineAlert v-else-if="windowOpen === false" tone="danger" :title="t('ui.pair.window.failed')" />
       </section>
 
       <section class="pair-panel vs-surface" aria-labelledby="pair-form-title">

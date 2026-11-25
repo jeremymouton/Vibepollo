@@ -29,14 +29,26 @@ TEST(HttpPairingAdmission, BoundsPendingState) {
   constexpr std::string_view certificate = "AABB";
   constexpr std::string_view salt = "00112233445566778899AABBCCDDEEFF";
 
-  ASSERT_TRUE(pairing_policy::admit_pending_session(unique_id, certificate, salt, 0, false, false).accepted);
-  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, certificate, salt, pairing_policy::max_pending_sessions, false, false).accepted);
-  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, certificate, salt, pairing_policy::max_pending_sessions, true, false).accepted);
+  ASSERT_TRUE(pairing_policy::admit_pending_session(unique_id, certificate, salt, 0, false, false, true).accepted);
+  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, certificate, salt, pairing_policy::max_pending_sessions, false, false, true).accepted);
+  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, certificate, salt, pairing_policy::max_pending_sessions, true, false, true).accepted);
   // The same certificate may retry its own pending request without waiting for expiry.
-  ASSERT_TRUE(pairing_policy::admit_pending_session(unique_id, certificate, salt, pairing_policy::max_pending_sessions, true, true).accepted);
+  ASSERT_TRUE(pairing_policy::admit_pending_session(unique_id, certificate, salt, pairing_policy::max_pending_sessions, true, true, true).accepted);
   // Identity alone never bypasses the bound when nothing is being replaced.
-  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, certificate, salt, pairing_policy::max_pending_sessions, false, true).accepted);
+  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, certificate, salt, pairing_policy::max_pending_sessions, false, true, true).accepted);
   ASSERT_EQ(pairing_policy::max_pending_sessions, 1);
+}
+
+TEST(HttpPairingAdmission, NewPairingNeedsAnOpenWindow) {
+  constexpr std::string_view unique_id = "ABCDEF01-2345-6789-ABCD-EF0123456789";
+  constexpr std::string_view certificate = "AABB";
+  constexpr std::string_view salt = "00112233445566778899AABBCCDDEEFF";
+
+  const auto refused = pairing_policy::admit_pending_session(unique_id, certificate, salt, 0, false, false, false);
+  ASSERT_FALSE(refused.accepted);
+  ASSERT_EQ(refused.failure_message, pairing_policy::window_closed_message);
+  // Not even its own retry: a pending session outlives the window that admitted it.
+  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, certificate, salt, 1, true, true, false).accepted);
 }
 
 TEST(HttpPairingAdmission, PendingIdentityIsImmutableUntilCompletion) {
@@ -45,8 +57,8 @@ TEST(HttpPairingAdmission, PendingIdentityIsImmutableUntilCompletion) {
   constexpr std::string_view certificate = "AABB";
   constexpr std::string_view salt = "00112233445566778899AABBCCDDEEFF";
 
-  ASSERT_FALSE(pairing_policy::admit_pending_session(second_id, certificate, salt, 1, false, false).accepted);
-  ASSERT_FALSE(pairing_policy::admit_pending_session(first_id, "CCDD", "FFEEDDCCBBAA99887766554433221100", 1, true, false).accepted);
+  ASSERT_FALSE(pairing_policy::admit_pending_session(second_id, certificate, salt, 1, false, false, true).accepted);
+  ASSERT_FALSE(pairing_policy::admit_pending_session(first_id, "CCDD", "FFEEDDCCBBAA99887766554433221100", 1, true, false, true).accepted);
 }
 
 TEST(HttpPairingAdmission, RejectsMalformedOrOversizedFields) {
@@ -54,9 +66,9 @@ TEST(HttpPairingAdmission, RejectsMalformedOrOversizedFields) {
   constexpr std::string_view certificate = "AABB";
   constexpr std::string_view salt = "00112233445566778899AABBCCDDEEFF";
 
-  ASSERT_FALSE(pairing_policy::admit_pending_session("../client", certificate, salt, 0, false, false).accepted);
-  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, "not-hex", salt, 0, false, false).accepted);
-  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, certificate, "00", 0, false, false).accepted);
+  ASSERT_FALSE(pairing_policy::admit_pending_session("../client", certificate, salt, 0, false, false, true).accepted);
+  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, "not-hex", salt, 0, false, false, true).accepted);
+  ASSERT_FALSE(pairing_policy::admit_pending_session(unique_id, certificate, "00", 0, false, false, true).accepted);
   ASSERT_FALSE(pairing_policy::valid_hex_field(std::string(pairing_policy::max_pairing_hex_field_length + 2, 'A'), 2));
 }
 

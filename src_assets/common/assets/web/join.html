@@ -293,6 +293,11 @@
       .ml-head b {
         font-size: 17px;
       }
+      .ml-window {
+        margin: 10px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
       .ml-steps {
         margin: 14px 0 0;
         padding-left: 18px;
@@ -456,6 +461,7 @@
           <li>Open it and choose <b>Add PC</b>, then enter <code id="pair-host">this host</code>.</li>
           <li>Moonlight shows a four-digit PIN. Type it below, with the PIN you were sent, to finish pairing.</li>
         </ol>
+        <p class="ml-window">This page lets your device pair for the next 5 minutes. Reload it if that runs out.</p>
 
         <a
           class="btn-like"
@@ -654,6 +660,19 @@
           el('pair-host').textContent = window.location.hostname;
           note('');
           el('invite-pin').focus();
+          void openPairingWindow();
+        }
+
+        // The host refuses new Moonlight devices unless a pairing page has opened the window.
+        async function openPairingWindow() {
+          await json('/api/join/' + encodeURIComponent(token) + '/pair/window', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-CSRF-Token': await csrfToken(),
+            },
+            body: '{}',
+          });
         }
 
         async function load() {

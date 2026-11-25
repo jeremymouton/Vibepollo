@@ -2190,6 +2190,8 @@ onMounted(async () => {
   const auth = useAuthStore();
   await configStore.fetchConfig().catch(() => {});
   await auth.waitForAuthentication();
+  // Moonlight can only start pairing while a pairing page holds the window open.
+  void http.post('./api/pairing/window', {}, { validateStatus: () => true });
   await refreshClients();
   if (route.query['sec'] === 'tokens') {
     await nextTick();

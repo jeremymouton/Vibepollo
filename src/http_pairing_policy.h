@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <optional>
 #include <span>
@@ -16,6 +17,11 @@ namespace nvhttp::pairing_policy {
   // identity into the administrator approval action. Exactly one immutable
   // pending session is therefore the only unambiguous safe admission model.
   inline constexpr std::size_t max_pending_sessions = 1;
+  // New devices may start pairing only for this long after the owner opens the pairing
+  // page or a guest opens their invite's pairing step. Otherwise anyone reaching port
+  // 47989 could hold the single pending slot.
+  inline constexpr std::chrono::minutes pairing_window {5};
+  inline constexpr std::string_view window_closed_message = "Pairing is not open. Open the pairing page first.";
   inline constexpr std::size_t max_unique_id_length = 128;
   inline constexpr std::size_t max_paired_clients = 256;
   inline constexpr std::size_t max_paired_client_name_length = 1024;
@@ -103,7 +109,8 @@ namespace nvhttp::pairing_policy {
     std::string_view salt_hex,
     std::size_t pending_sessions,
     bool replacing_existing,
-    bool same_identity
+    bool same_identity,
+    bool window_open
   );
 
   decision_t begin_get_server_certificate(session_state_t state, std::size_t salt_size);
