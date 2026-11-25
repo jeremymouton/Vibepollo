@@ -102,7 +102,7 @@ namespace platf {
     uint8_t lt = 0, rt = 0;
     int16_t lsX = 0, lsY = 0, rsX = 0, rsY = 0;
   };
-  constexpr int BACK = 0x20, HOME = 0x400;
+  constexpr int BACK = 0x20, HOME = 0x400, MISC_BUTTON = 0x200000;
   struct client_input_t { static inline int destroyed = 0; ~client_input_t() { ++destroyed; } };
   struct touch_input_t { int eventType = 0; };
   struct pen_input_t { int eventType = 0; };

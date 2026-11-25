@@ -1705,7 +1705,8 @@ namespace input {
     };
     const bool guide_allowed = input->desktop_input_granted.load(std::memory_order_relaxed);
     if (!guide_allowed) {
-      gamepad_state.buttonFlags &= ~platf::HOME;
+      // The X360 backend maps MISC to Guide as well.
+      gamepad_state.buttonFlags &= ~(platf::HOME | platf::MISC_BUTTON);
     }
 
     auto bf_new = gamepad_state.buttonFlags;
@@ -1735,6 +1736,10 @@ namespace input {
         if (config::input.back_button_timeout >= 0ms && guide_allowed) {
           auto f = [input, controller = packet->controllerNumber]() {
             auto &gamepad = input->gamepads[controller];
+            if (!input->desktop_input_granted.load(std::memory_order_relaxed)) {
+              gamepad.back_timeout_id = nullptr;
+              return;
+            }
 
             auto &state = gamepad.gamepad_state;
 

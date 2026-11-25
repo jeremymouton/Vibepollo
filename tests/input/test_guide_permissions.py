@@ -138,6 +138,19 @@ int main(int argc, char **argv) {
     change(session, crypto::PERM::input_controller); admit(session);
     const auto timers = task_pool.timers.size();
     arrival.buttonFlags = platf::BACK; passthrough(input, &arrival); assert(task_pool.timers.size() == timers);
+  } else if (test == "controller_only_grant_drops_misc") {
+    change(session, crypto::PERM::input_controller); admit(session);
+    arrival.buttonFlags2 = platf::MISC_BUTTON >> 16; passthrough(input, &arrival);
+    const auto id = input->gamepads[0].id;
+    for (auto it = platf::gamepad_events.rbegin(); it != platf::gamepad_events.rend(); ++it)
+      if (it->first == id) { assert(!(it->second.buttonFlags & platf::MISC_BUTTON)); break; }
+  } else if (test == "back_timer_rechecks_grant_when_it_fires") {
+    admit(session);
+    arrival.buttonFlags = platf::BACK; passthrough(input, &arrival); assert(!task_pool.timers.empty());
+    change(session, crypto::PERM::input_controller); admit(session);
+    const auto before = platf::gamepad_events.size();
+    std::prev(task_pool.timers.end())->second();
+    for (auto i = before; i < platf::gamepad_events.size(); ++i) assert(!(platf::gamepad_events[i].second.buttonFlags & platf::HOME));
   } else if (test == "desktop_grant_keeps_native_home") {
     change(session, controller_and(crypto::PERM::input_mouse)); admit(session);
     arrival.buttonFlags = platf::HOME; passthrough(input, &arrival); assert(guide(input));
