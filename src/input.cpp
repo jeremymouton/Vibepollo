@@ -2215,7 +2215,15 @@ namespace input {
   }
 
   void update_guide_button_permissions(const std::shared_ptr<input_t> &input, const crypto::PERM &permission) {
-    if (!input || input->guide_button_key == 0) {
+    if (!input) {
+      return;
+    }
+    // A Back press held across a narrowing must not fire Guide before the next packet arrives.
+    input->desktop_input_granted.store(
+      (permission & crypto::PERM::input_kbd) != crypto::PERM::_no || (permission & crypto::PERM::input_mouse) != crypto::PERM::_no,
+      std::memory_order_relaxed
+    );
+    if (input->guide_button_key == 0) {
       return;
     }
     const bool allowed = (permission & crypto::PERM::input_kbd) != crypto::PERM::_no &&

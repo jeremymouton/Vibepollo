@@ -3052,8 +3052,13 @@ namespace confighttp {
       return;
     }
     const auto found = invite::find_by_token(std::string(request->path_match[1]));
-    if (!found || !invite::policy::is_live(*found, invite::policy::clock_t::now()) || !found->allow_pairing) {
+    const auto now = invite::policy::clock_t::now();
+    if (!found || !invite::policy::is_live(*found, now) || !found->allow_pairing) {
       join_api::refuse(response, invite::policy::result_e::unknown, 0);
+      return;
+    }
+    if (const auto locked = invite::policy::lockout_remaining_seconds(*found, now); locked > 0) {
+      join_api::refuse(response, invite::policy::result_e::locked_out, locked);
       return;
     }
     nvhttp::open_pairing_window();
@@ -6126,6 +6131,18 @@ namespace confighttp {
   }
 
   /**
+   * @brief Let a new Moonlight device start pairing for the next few minutes.
+   * @details The pairing page calls this when it opens.
+   */
+  void openPairingWindow(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    nvhttp::open_pairing_window();
+    send_response(response, pairing_window_json());
+  }
+
+  /**
    * @brief Send a PIN code to the host.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -6140,18 +6157,6 @@ namespace confighttp {
    *
    * @api_examples{/api/pin| POST| {"pin":"1234","name":"My PC"}}
    */
-  /**
-   * @brief Let a new Moonlight device start pairing for the next few minutes.
-   * @details The pairing page calls this when it opens.
-   */
-  void openPairingWindow(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-    nvhttp::open_pairing_window();
-    send_response(response, pairing_window_json());
-  }
-
   void savePin(resp_https_t response, req_https_t request) {
     if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
       return;
