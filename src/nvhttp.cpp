@@ -4360,7 +4360,13 @@ namespace nvhttp {
       pt::ptree tree;
 
       tree.put("root.<xmlattr>.status_code", 200);
-      tree.put("root.hostname", config::nvhttp.sunshine_name);
+      // Plain HTTP means an unpaired client, which may be anyone on the internet relay.
+      // Moonlight picks up the real name and LocalIP over HTTPS once it is paired.
+      if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+        tree.put("root.hostname", config::nvhttp.sunshine_name);
+      } else {
+        tree.put("root.hostname", "Vibepollo"s);
+      }
 
       tree.put("root.appversion", VERSION);
       tree.put("root.GfeVersion", GFE_VERSION);
@@ -4460,7 +4466,8 @@ namespace nvhttp {
       // have that implemented. For now, we will emulate the behavior of GFE+GS-IPv6-Forwarder,
       // which returns 127.0.0.1 as LocalIP for IPv6 connections. Moonlight clients with IPv6
       // support know to ignore this bogus address.
-      if (local_endpoint.address().is_v6() && !local_endpoint.address().to_v6().is_v4_mapped()) {
+      if (!std::is_same_v<SunshineHTTPS, T> ||
+          (local_endpoint.address().is_v6() && !local_endpoint.address().to_v6().is_v4_mapped())) {
         tree.put("root.LocalIP", "127.0.0.1");
       } else {
         tree.put("root.LocalIP", net::addr_to_normalized_string(local_endpoint.address()));
