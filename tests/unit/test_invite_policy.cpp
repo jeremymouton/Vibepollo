@@ -364,6 +364,23 @@ namespace {
     );
   }
 
+  TEST(InvitePolicy, GuestTurnCredentialsEndWithTheInvite) {
+    const auto now = at(0);
+    EXPECT_EQ(policy::turn_credential_lifetime(now + std::chrono::hours {8}, now + std::chrono::hours {1}, now, std::chrono::hours {12}), std::chrono::hours {1});
+  }
+
+  TEST(InvitePolicy, GuestTurnCredentialsEndWithTheGuestSession) {
+    const auto now = at(0);
+    EXPECT_EQ(policy::turn_credential_lifetime(now + std::chrono::hours {8}, {}, now, std::chrono::hours {12}), std::chrono::hours {8});
+    EXPECT_EQ(policy::turn_credential_lifetime(now + std::chrono::hours {8}, now + std::chrono::hours {20}, now, std::chrono::hours {12}), std::chrono::hours {8});
+  }
+
+  TEST(InvitePolicy, TurnCredentialLifetimeIsCappedAndNeverNegative) {
+    const auto now = at(0);
+    EXPECT_EQ(policy::turn_credential_lifetime(now + std::chrono::hours {30}, {}, now, std::chrono::hours {12}), std::chrono::hours {12});
+    EXPECT_EQ(policy::turn_credential_lifetime(now + std::chrono::hours {8}, now - std::chrono::minutes {5}, now, std::chrono::hours {12}), std::chrono::seconds {0});
+  }
+
   TEST(InvitePolicy, ComparesEqualStringsAsEqual) {
     EXPECT_TRUE(policy::constant_time_equals("123456", "123456"));
     EXPECT_TRUE(policy::constant_time_equals("", ""));

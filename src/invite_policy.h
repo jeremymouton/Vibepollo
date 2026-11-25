@@ -96,6 +96,10 @@ namespace invite::policy {
   bool grant_valid(const invite_t &invite, mode_e mode, std::uint64_t generation, time_point_t now);
   bool app_allowed(int scope, int requested, int running, bool may_launch, bool capture_active = false);
 
+  /// How long TURN credentials handed to a guest may last: until their session or their
+  /// invite ends, whichever is first, and never past `cap`. coturn cannot revoke them.
+  std::chrono::seconds turn_credential_lifetime(time_point_t session_expires_at, time_point_t invite_expires_at, time_point_t now, std::chrono::seconds cap);
+
   /**
    * @brief Decide whether this invite admits a guest right now. Does not mutate.
    *

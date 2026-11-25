@@ -715,14 +715,14 @@ namespace confighttp {
    *
    * Twelve hours, not minutes: coturn re-checks the timestamp when a session refreshes
    * its allocation, so a TTL shorter than a plausible sitting would drop the stream
-   * mid-game. It still bounds how long a departed guest can relay through the host.
+   * mid-game. A guest's are cut to when their session or invite ends, since their
+   * streams close then anyway and coturn has no way to revoke them earlier.
    *
    * STUN entries are left alone — they take no credentials.
    */
-  void apply_ephemeral_turn_credentials(nlohmann::json &servers, const std::string &secret) {
+  void apply_ephemeral_turn_credentials(nlohmann::json &servers, const std::string &secret, std::chrono::seconds lifetime) {
     using namespace std::chrono;
-    const auto expiry = duration_cast<seconds>(system_clock::now().time_since_epoch()).count() +
-                        duration_cast<seconds>(hours {12}).count();
+    const auto expiry = duration_cast<seconds>(system_clock::now().time_since_epoch()).count() + lifetime.count();
     const std::string username = std::to_string(expiry) + ":vibepollo-guest";
 
     unsigned char digest[EVP_MAX_MD_SIZE] {};
@@ -768,7 +768,18 @@ namespace confighttp {
     }
   }
 
-  nlohmann::json load_webrtc_ice_servers() {
+  constexpr std::chrono::seconds turn_credential_cap = std::chrono::hours {12};
+
+  std::chrono::seconds turn_credential_lifetime(const std::optional<invite::guest::session_t> &guest) {
+    if (!guest) {
+      return turn_credential_cap;
+    }
+    const auto now = invite::policy::clock_t::now();
+    const auto invite = invite::find(guest->invite_id);
+    return invite::policy::turn_credential_lifetime(guest->expires_at, invite ? invite->expires_at : now, now, turn_credential_cap);
+  }
+
+  nlohmann::json load_webrtc_ice_servers(std::chrono::seconds turn_lifetime) {
     // The config file wins. This used to be reachable only through an environment
     // variable, which on Windows meant editing the service's registry key — an
     // absurd requirement for the one setting that decides whether a remote guest
@@ -790,9 +801,9 @@ namespace confighttp {
       return std::nullopt;
     };
 
-    const auto with_credentials = [](nlohmann::json servers) {
+    const auto with_credentials = [turn_lifetime](nlohmann::json servers) {
       if (!config::nvhttp.webrtc_turn_secret.empty()) {
-        apply_ephemeral_turn_credentials(servers, config::nvhttp.webrtc_turn_secret);
+        apply_ephemeral_turn_credentials(servers, config::nvhttp.webrtc_turn_secret, turn_lifetime);
       }
       return servers;
     };
@@ -4701,7 +4712,7 @@ namespace confighttp {
 
     nlohmann::json output;
     output["status"] = true;
-    output["ice_servers"] = load_webrtc_ice_servers();
+    output["ice_servers"] = load_webrtc_ice_servers(turn_credential_lifetime(guest));
     send_response(response, output);
   }
 
@@ -5120,7 +5131,7 @@ namespace confighttp {
     output["session"] = webrtc_session_to_json(*session);
     output["cert_fingerprint"] = webrtc_stream::get_server_cert_fingerprint();
     output["cert_pem"] = webrtc_stream::get_server_cert_pem();
-    output["ice_servers"] = load_webrtc_ice_servers();
+    output["ice_servers"] = load_webrtc_ice_servers(turn_credential_lifetime(guest));
     send_response(response, output);
   }
 

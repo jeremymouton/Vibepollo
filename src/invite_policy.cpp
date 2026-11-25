@@ -74,6 +74,11 @@ namespace invite::policy {
     return requested == scope && !(requested == 0 && running > 0) && (may_launch || joining);
   }
 
+  std::chrono::seconds turn_credential_lifetime(time_point_t session_expires_at, time_point_t invite_expires_at, time_point_t now, std::chrono::seconds cap) {
+    const auto end = is_unset(invite_expires_at) ? session_expires_at : std::min(session_expires_at, invite_expires_at);
+    return std::clamp(std::chrono::duration_cast<std::chrono::seconds>(end - now), std::chrono::seconds {0}, cap);
+  }
+
   int lockout_remaining_seconds(const invite_t &invite, time_point_t now) {
     if (is_unset(invite.locked_until) || now >= invite.locked_until) {
       return 0;
